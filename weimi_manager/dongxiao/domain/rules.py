@@ -23,6 +23,7 @@ SENSITIVE_KEY_PARTS = (
     "access_key",
     "private_key",
 )
+EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 class PermissionDenied(PermissionError):
@@ -73,6 +74,7 @@ class SkuLike(Protocol):
     purchase_max: int | None
     is_default: bool
     data_complete: bool
+    purchase_min_verified: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,29 @@ class ProductImportResult:
     accepted: tuple[str, ...] = ()
     duplicates: tuple[str, ...] = ()
     invalid: tuple[str, ...] = ()
+
+
+def csv_safe_text(value: object) -> str:
+    text = str(value if value is not None else "")
+    candidate = text
+    while candidate.startswith("'"):
+        candidate = candidate[1:]
+    if candidate.startswith(EXCEL_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
+def csv_restore_text(value: object) -> str:
+    text = str(value if value is not None else "")
+    if not text.startswith("'"):
+        return text
+    candidate = text[1:]
+    probe = candidate
+    while probe.startswith("'"):
+        probe = probe[1:]
+    if probe.startswith(EXCEL_FORMULA_PREFIXES):
+        return candidate
+    return text
 
 
 def normalize_product_ids(
@@ -308,12 +333,20 @@ def select_sku(
     below_limit = False
     above_limit = False
     incomplete = False
+    incomplete_reason = ""
     for candidate in sku_list:
         ensure_same_store(store_id, candidate.store_id, label="SKU")
         if str(candidate.product_id) != product_id:
             raise StoreIsolationError("SKU 不属于当前商品，禁止跨商品组合")
         if not bool(candidate.data_complete):
             incomplete = True
+            if not incomplete_reason:
+                incomplete_reason = "SKU 价格、库存或状态数据不完整"
+            continue
+        if not bool(candidate.purchase_min_verified):
+            incomplete = True
+            if not incomplete_reason:
+                incomplete_reason = "接口未提供可信起购数量，无法确定"
             continue
         if expected is not None and int(candidate.price_cents) != expected:
             price_changed = True
@@ -391,7 +424,7 @@ def select_sku(
             return _sku_failure(
                 SkuSelectionFailure.INCOMPLETE_DATA,
                 quantity,
-                "SKU 价格、库存或限购数据不完整，无法确定",
+                incomplete_reason or "SKU 价格、库存或限购数据不完整，无法确定",
             )
         return _sku_failure(SkuSelectionFailure.NO_SKU, quantity)
 
@@ -401,9 +434,9 @@ def select_sku(
             key=lambda item: (int(item.price_cents), str(item.sku_id)),
         )
     elif selection_mode is SkuSelectionMode.HIGHEST_PRICE:
-        selected = max(
+        selected = min(
             valid,
-            key=lambda item: (int(item.price_cents), str(item.sku_id)),
+            key=lambda item: (-int(item.price_cents), str(item.sku_id)),
         )
     elif selection_mode is SkuSelectionMode.PRODUCT_DEFAULT:
         defaults = [item for item in valid if bool(item.is_default)]
@@ -434,7 +467,10 @@ def select_sku(
             )
         selected = matches[0]
     else:
-        selected = valid[0]
+        selected = min(
+            valid,
+            key=lambda item: (int(item.price_cents), str(item.sku_id)),
+        )
     return SkuSelection(selected=selected, quantity=quantity)
 
 

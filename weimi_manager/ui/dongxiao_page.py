@@ -10,6 +10,10 @@ from ..dongxiao import DONGXIAO_SECTIONS
 from ..dongxiao.application.catalog_service import ProductCatalogService
 from ..dongxiao.application.import_service import ProductImportService
 from ..dongxiao.application.pool_service import ProductPoolService
+from ..dongxiao.domain.catalog import (
+    CatalogFreshness,
+    classify_catalog_freshness,
+)
 from ..dongxiao.domain.enums import (
     DataSource,
     ProductImportStatus,
@@ -33,9 +37,16 @@ from .theme import BLUE, BORDER, MUTED, PANEL, SOFT_TEAL, TEXT, button
 SOURCE_LABELS = {
     DataSource.OFFICIAL_API: "官方 API",
     DataSource.WEB_BACKEND: "网页后台（未确认官方授权）",
-    DataSource.LOCAL_CACHE: "本地缓存",
+    DataSource.LOCAL_CACHE: "本地缓存（非实时）",
     DataSource.MOCK: "模拟数据",
     DataSource.UNKNOWN: "来源未知",
+}
+FRESHNESS_LABELS = {
+    CatalogFreshness.LIVE_OFFICIAL: "官方实时",
+    CatalogFreshness.LOCAL_CACHE: "本地缓存（非实时）",
+    CatalogFreshness.STALE_CACHE: "缓存可能失效",
+    CatalogFreshness.MOCK: "模拟数据",
+    CatalogFreshness.UNKNOWN: "来源/时间未知",
 }
 STATE_LABELS = {
     ProductState.ACTIVE: "上架",
@@ -367,7 +378,12 @@ class DongxiaoPage(BasePage):
             "批量导入",
             self._open_import_dialog,
         )
-        self.import_products_button.pack(side="left")
+        self.import_products_button.pack(side="left", padx=(0, 6))
+        button(
+            actions,
+            "查看缓存",
+            self._show_cached_products,
+        ).pack(side="left")
 
         filters = ttk.Frame(view, style="Panel.TFrame")
         filters.grid(row=1, column=0, sticky="ew", pady=(12, 8))
@@ -552,9 +568,13 @@ class DongxiaoPage(BasePage):
             padx=5,
         )
         button(toolbar, "导出", self._export_pool).pack(side="left")
-        button(toolbar, "历史", self._show_pool_history).pack(
+        button(toolbar, "导入 CSV", self._import_pool).pack(
             side="left",
             padx=(5, 0),
+        )
+        button(toolbar, "历史", self._show_pool_history).pack(
+            side="left",
+            padx=5,
         )
 
         ttk.Label(
@@ -680,7 +700,7 @@ class DongxiaoPage(BasePage):
         self.section_title_var.set(section.label)
         self.section_description_var.set(section.description)
         self.section_stage_var.set(
-            "第 3 阶段：真实商品目录、筛选、SKU 规则和商品池。"
+            "第 3.5 阶段：商品目录专项验收、缓存状态和数据一致性补强。"
         )
         for view_key, view in self.section_views.items():
             view.grid_remove()
@@ -903,12 +923,9 @@ class DongxiaoPage(BasePage):
         self._page = page.page
         self._page_count = max(1, page.page_count)
         for product in page.items:
-            source = SOURCE_LABELS.get(
-                DataSource.LOCAL_CACHE
-                if product.from_cache
-                else product.data_source,
-                "来源未知",
-            )
+            source = FRESHNESS_LABELS[
+                classify_catalog_freshness(product)
+            ]
             self.product_tree.insert(
                 "",
                 "end",
@@ -948,7 +965,7 @@ class DongxiaoPage(BasePage):
             f"共 {page.total} 条{suffix}"
         )
         self.source_status_var.set(
-            "数据来源：" + (
+            "当前列表：本地缓存（非实时）；原始来源：" + (
                 "、".join(
                     SOURCE_LABELS.get(
                         DataSource(item),
@@ -1019,19 +1036,45 @@ class DongxiaoPage(BasePage):
 
         def done(result) -> None:
             self.sync_products_button.configure(state="normal")
+            current_store = self._current_store()
+            if current_store is None or current_store.id != store.id:
+                self.window.set_status(
+                    f"{store.name} 的后台商品同步已完成；"
+                    "当前已切换店铺，未覆盖当前页面数据。",
+                    busy=False,
+                )
+                self._load_products()
+                return
+            sync_state = (
+                "完整同步"
+                if result.complete
+                else "部分同步（未清理缺失商品）"
+            )
             self.source_status_var.set(
-                f"数据来源：官方 API · 最近同步 {result.last_synced_at}"
+                f"数据来源：官方 API · {sync_state} · "
+                f"最近同步 {result.last_synced_at}"
             )
             message = (
                 f"发现 {result.discovered} 件，保存 {result.products_saved} 件"
             )
             if result.failed:
                 message += f"，失败 {result.failed} 件"
+            if result.reconciled_products or result.reconciled_skus:
+                message += (
+                    f"，标记目录缺失 {result.reconciled_products} 件商品、"
+                    f"{result.reconciled_skus} 个 SKU"
+                )
             self.window.set_status(message)
-            if result.errors:
+            if result.failed or result.errors:
                 messagebox.showwarning(
                     "商品同步部分完成",
-                    message + "\n\n" + "\n".join(result.errors[:10]),
+                    message
+                    + "\n\n旧商品和 SKU 未被网络错误删除。"
+                    + (
+                        "\n" + "\n".join(result.errors[:10])
+                        if result.errors
+                        else ""
+                    ),
                     parent=self,
                 )
             elif result.discovered == 0:
@@ -1044,7 +1087,9 @@ class DongxiaoPage(BasePage):
 
         def failed(error: str) -> None:
             self.sync_products_button.configure(state="normal")
-            self.source_status_var.set("数据来源：同步失败")
+            self.source_status_var.set(
+                "官方 API 同步失败；可查看本地缓存（非实时）"
+            )
             messagebox.showerror("同步商品失败", error, parent=self)
 
         started = self.window.run_task(
@@ -1060,6 +1105,12 @@ class DongxiaoPage(BasePage):
         )
         if not started:
             self.sync_products_button.configure(state="normal")
+
+    def _show_cached_products(self) -> None:
+        self.source_status_var.set(
+            "当前列表：本地缓存（非实时），不是官方实时数据"
+        )
+        self._apply_filters()
 
     def _load_products(self) -> None:
         self._apply_filters()
@@ -1429,6 +1480,58 @@ class DongxiaoPage(BasePage):
             task_scope=f"dongxiao:pool-export:{pool.pool_id}",
         )
 
+    def _import_pool(self) -> None:
+        store = self._current_store()
+        pool = self._current_pool()
+        if store is None or pool is None:
+            messagebox.showinfo(
+                "导入商品池 CSV",
+                "请先选择店铺和商品池。",
+                parent=self,
+            )
+            return
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="导入商品池 CSV",
+            filetypes=(("CSV 文件", "*.csv"),),
+        )
+        if not path:
+            return
+        source = Path(path)
+        try:
+            content = source.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            messagebox.showerror(
+                "读取商品池 CSV 失败",
+                str(exc),
+                parent=self,
+            )
+            return
+        self.window.run_task(
+            lambda _progress: self.pool_service.import_csv(
+                store,
+                pool.pool_id,
+                content,
+            ),
+            self._pool_imported,
+            lambda error: messagebox.showerror(
+                "导入商品池 CSV 失败",
+                error,
+                parent=self,
+            ),
+            log_title="导入动销商品池 CSV",
+            task_scope=f"dongxiao:pool-import:{pool.pool_id}",
+        )
+
+    def _pool_imported(self, result: dict[str, int]) -> None:
+        messagebox.showinfo(
+            "导入商品池 CSV",
+            f"新增 {result['added']} 条，跳过 {result['skipped']} 条，"
+            f"无效 {result['invalid']} 条。",
+            parent=self,
+        )
+        self._load_pool_details()
+
     def _show_pool_history(self) -> None:
         store = self._current_store()
         pool = self._current_pool()
@@ -1642,6 +1745,11 @@ class ProductImportDialog(tk.Toplevel):
         actions = ttk.Frame(self)
         actions.grid(row=4, column=0, sticky="e", padx=12, pady=12)
         button(actions, "预览", self._preview).pack(side="left")
+        button(
+            actions,
+            "手动关联选中待解析行",
+            self._manually_associate,
+        ).pack(side="left", padx=(6, 0))
         self.save_button = button(
             actions,
             "保存导入结果",
@@ -1688,6 +1796,7 @@ class ProductImportDialog(tk.Toplevel):
             self.tree.insert(
                 "",
                 "end",
+                iid=str(item.line_number),
                 values=(
                     item.line_number,
                     labels[item.status],
@@ -1710,6 +1819,46 @@ class ProductImportDialog(tk.Toplevel):
                 if self.preview.items
                 else "disabled"
             )
+        )
+
+    def _manually_associate(self) -> None:
+        if self.preview is None:
+            messagebox.showinfo(
+                "手动关联",
+                "请先预览导入内容。",
+                parent=self,
+            )
+            return
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo(
+                "手动关联",
+                "请选择一条待解析行。",
+                parent=self,
+            )
+            return
+        product_id = simpledialog.askstring(
+            "手动关联商品",
+            "请输入当前店铺已授权商品目录中的商品 ID：",
+            parent=self,
+        )
+        if product_id is None:
+            return
+        self.window.run_task(
+            lambda _progress: self.service.associate(
+                self.store,
+                self.preview,
+                line_number=int(selected[0]),
+                product_id=product_id,
+            ),
+            self._render_preview,
+            lambda error: messagebox.showerror(
+                "手动关联失败",
+                error,
+                parent=self,
+            ),
+            log_title="手动关联微信小店分享文本",
+            task_scope=f"dongxiao:import-link:{self.store.id}",
         )
 
     def _save(self) -> None:

@@ -7,7 +7,11 @@ from datetime import UTC, datetime
 
 from ..domain.enums import ProductPoolStatus
 from ..domain.models import ProductPool
-from ..domain.rules import StoreIsolationError
+from ..domain.rules import (
+    StoreIsolationError,
+    csv_restore_text,
+    csv_safe_text,
+)
 from ..infrastructure.repository import (
     DongxiaoRepository,
     EntityNotFound,
@@ -153,16 +157,67 @@ class ProductPoolService:
         rows = self.details(store, pool_id)
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(("product_id", "sku_id", "position"))
+        writer.writerow(
+            (
+                "product_id",
+                "sku_id",
+                "position",
+                "title",
+                "store_name",
+                "state",
+                "min_price_cents",
+                "stock_total",
+                "presence_state",
+            )
+        )
         for row in rows:
             writer.writerow(
                 (
-                    row["product_id"],
-                    row["sku_id"],
+                    csv_safe_text(row["product_id"]),
+                    csv_safe_text(row["sku_id"]),
                     row["position"],
+                    csv_safe_text(row.get("title", "")),
+                    csv_safe_text(row.get("store_name", "")),
+                    csv_safe_text(row.get("state", "")),
+                    row.get("min_price_cents", ""),
+                    row.get("stock_total", ""),
+                    csv_safe_text(row.get("presence_state", "")),
                 )
             )
         return buffer.getvalue()
+
+    def import_csv(
+        self,
+        store,
+        pool_id: str,
+        content: str,
+    ) -> dict[str, int]:
+        self._require_pool(store, pool_id)
+        if not isinstance(content, str):
+            raise TypeError("商品池导入内容必须是字符串")
+        reader = csv.DictReader(io.StringIO(content.lstrip("\ufeff")))
+        if not reader.fieldnames or not {
+            "product_id",
+            "sku_id",
+        }.issubset(reader.fieldnames):
+            raise ValueError("CSV 缺少 product_id 或 sku_id 列")
+        entries: list[tuple[str, str]] = []
+        invalid = 0
+        for row in reader:
+            product_id = csv_restore_text(
+                row.get("product_id", "")
+            ).strip()
+            sku_id = csv_restore_text(row.get("sku_id", "")).strip()
+            if not product_id:
+                invalid += 1
+                continue
+            entries.append((product_id, sku_id))
+        result = self.add_products(store, pool_id, entries)
+        return {
+            "added": result["added"],
+            "skipped": result["skipped"],
+            "invalid": invalid,
+        }
 
     def ensure_exists(self, store, pool_id: str) -> None:
         try:

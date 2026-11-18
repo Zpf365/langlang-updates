@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -93,6 +94,18 @@ class WechatApiError(RuntimeError):
         self.rid = rid
 
 
+class WechatTransportError(WechatApiError):
+    pass
+
+
+class WechatNetworkError(WechatTransportError):
+    pass
+
+
+class WechatTimeoutError(WechatTransportError):
+    pass
+
+
 class Transport(Protocol):
     def post_json(self, url: str, payload: dict[str, Any], timeout: int = 25) -> dict[str, Any]: ...
 
@@ -137,8 +150,18 @@ class HttpTransport:
         except urllib.error.HTTPError as exc:
             detail = exc.read(300).decode("utf-8", "replace")
             raise WechatApiError(f"HTTP {exc.code}: {detail}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise WechatApiError(f"网络请求失败: {exc}") from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise WechatTimeoutError(
+                    f"网络请求超时: {exc}"
+                ) from exc
+            raise WechatNetworkError(
+                f"网络请求失败: {exc}"
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise WechatTimeoutError(
+                f"网络请求超时: {exc}"
+            ) from exc
         try:
             result = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
@@ -202,6 +225,11 @@ class WechatShopClient:
     def test_connection(self) -> str:
         self.get_access_token()
         return "连接成功"
+
+    def _invalidate_access_token(self) -> None:
+        with self._token_lock:
+            self._token = ""
+            self._token_expires_at = 0.0
 
     def fetch_order_ids(
         self,
@@ -281,8 +309,17 @@ class WechatShopClient:
             seen_keys.add(next_key)
         return _unique(ids)
 
-    def fetch_product_id_page(self, next_key: str = "", status: int | None = None) -> ApiListPage:
-        payload: dict[str, Any] = {"page_size": 30}
+    def fetch_product_id_page(
+        self,
+        next_key: str = "",
+        status: int | None = None,
+        page_size: int = 30,
+    ) -> ApiListPage:
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise ValueError("商品分页大小必须是整数")
+        if not 1 <= page_size <= 30:
+            raise ValueError("商品分页大小必须在 1 到 30 之间")
+        payload: dict[str, Any] = {"page_size": page_size}
         if status is not None:
             payload["status"] = status
         if next_key:
@@ -1083,6 +1120,7 @@ class WechatShopClient:
         token = self.get_access_token()
         url = f"{API_ROOT}{path}?access_token={token}"
         last_error: WechatApiError | None = None
+        token_refreshed = False
         for attempt in range(3):
             self._wait_for_rate_limit()
             result = self.transport.post_json(url, payload)
@@ -1091,6 +1129,12 @@ class WechatShopClient:
                 return result
             except WechatApiError as exc:
                 last_error = exc
+                if exc.code in {40001, 42001} and not token_refreshed:
+                    self._invalidate_access_token()
+                    token = self.get_access_token()
+                    url = f"{API_ROOT}{path}?access_token={token}"
+                    token_refreshed = True
+                    continue
                 if exc.code not in {-1, 45011} or attempt == 2:
                     raise
                 self.sleeper(1.5 * (attempt + 1))
@@ -1100,6 +1144,7 @@ class WechatShopClient:
         token = self.get_access_token()
         url = f"{API_ROOT}{path}?access_token={token}"
         last_error: WechatApiError | None = None
+        token_refreshed = False
         for attempt in range(3):
             self._wait_for_rate_limit()
             result = self.transport.get_json(url)
@@ -1108,6 +1153,12 @@ class WechatShopClient:
                 return result
             except WechatApiError as exc:
                 last_error = exc
+                if exc.code in {40001, 42001} and not token_refreshed:
+                    self._invalidate_access_token()
+                    token = self.get_access_token()
+                    url = f"{API_ROOT}{path}?access_token={token}"
+                    token_refreshed = True
+                    continue
                 if exc.code not in {-1, 45011} or attempt == 2:
                     raise
                 self.sleeper(1.5 * (attempt + 1))

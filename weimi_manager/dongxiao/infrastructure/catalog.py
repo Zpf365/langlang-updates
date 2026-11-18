@@ -8,7 +8,11 @@ from typing import Any, Sequence
 
 import requests
 
-from ...wechat_api import WechatApiError
+from ...wechat_api import (
+    WechatApiError,
+    WechatNetworkError,
+    WechatTimeoutError,
+)
 from ..domain.catalog import (
     CatalogIssue,
     CatalogPageData,
@@ -93,13 +97,19 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
         cursor: str = "",
         page_size: int = 30,
     ) -> CatalogPageData:
-        del page_size
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise ValueError("商品分页大小必须是整数")
+        if not 1 <= page_size <= 30:
+            raise ValueError("商品分页大小必须在 1 到 30 之间")
         try:
             client = self.sync_service.client_for(store)
-            api_page = client.fetch_product_id_page(cursor)
-        except requests.Timeout as exc:
+            api_page = client.fetch_product_id_page(
+                cursor,
+                page_size=page_size,
+            )
+        except (requests.Timeout, WechatTimeoutError) as exc:
             raise CatalogTimeoutError("获取商品目录请求超时") from exc
-        except requests.ConnectionError as exc:
+        except (requests.ConnectionError, WechatNetworkError) as exc:
             raise CatalogOfflineError("网络不可用，无法获取商品目录") from exc
         except (PermissionError, ValueError) as exc:
             raise CatalogAccessError(str(exc) or "店铺没有官方商品接口权限") from exc
@@ -142,9 +152,9 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
         try:
             client = self.sync_service.client_for(store)
             legacy = client.fetch_product(store, str(product_id))
-        except requests.Timeout as exc:
+        except (requests.Timeout, WechatTimeoutError) as exc:
             raise CatalogTimeoutError("获取商品详情请求超时") from exc
-        except requests.ConnectionError as exc:
+        except (requests.ConnectionError, WechatNetworkError) as exc:
             raise CatalogOfflineError("网络不可用，无法获取商品详情") from exc
         except (PermissionError, ValueError) as exc:
             raise CatalogAccessError(str(exc) or "店铺没有官方商品接口权限") from exc
@@ -166,6 +176,14 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
             raise CatalogDataError("官方商品详情缺少商品 ID")
         if not str(legacy.title or "").strip():
             raise CatalogDataError("官方商品详情缺少标题")
+        raw_sales = legacy.raw.get("total_sold_num")
+        sales_count = (
+            int(raw_sales)
+            if isinstance(raw_sales, int)
+            and not isinstance(raw_sales, bool)
+            and raw_sales >= 0
+            else None
+        )
         product = Product(
             store_id=int(store.id),
             store_app_id=str(store.app_id),
@@ -175,6 +193,12 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
             min_price_cents=int(legacy.min_price or 0),
             stock_total=int(legacy.stock_total or 0),
             observed_at=observed_at,
+            sales_count=sales_count,
+            sales_source=(
+                DataSource.OFFICIAL_API
+                if sales_count is not None
+                else None
+            ),
             data_source=self.source,
             last_synced_at=observed_at,
         )
@@ -194,6 +218,19 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
         observed_at: datetime,
     ) -> tuple[Sku, ...]:
         result: list[Sku] = []
+        limited_info = raw.get("limited_info")
+        limited_buy_num = (
+            limited_info.get("limited_buy_num")
+            if isinstance(limited_info, dict)
+            else None
+        )
+        purchase_max = (
+            int(limited_buy_num)
+            if isinstance(limited_buy_num, int)
+            and not isinstance(limited_buy_num, bool)
+            and limited_buy_num > 0
+            else None
+        )
         for item in raw.get("skus") or []:
             if not isinstance(item, dict):
                 continue
@@ -202,11 +239,14 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
                 continue
             price_value = item.get("sale_price")
             stock_value = item.get("stock_num")
+            status_value = item.get("status")
             complete = (
                 isinstance(price_value, int)
                 and not isinstance(price_value, bool)
                 and isinstance(stock_value, int)
                 and not isinstance(stock_value, bool)
+                and isinstance(status_value, int)
+                and not isinstance(status_value, bool)
             )
             price = int(price_value) if complete else 0
             stock = int(stock_value) if complete else 0
@@ -218,9 +258,7 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
                 for attr in item.get("sku_attrs") or []
                 if isinstance(attr, dict)
             )
-            available = complete and stock > 0
-            purchase_min = item.get("min_purchase_num")
-            purchase_max = item.get("max_purchase_num")
+            available = complete and stock > 0 and status_value == 5
             result.append(
                 Sku(
                     store_id=int(store.id),
@@ -231,26 +269,12 @@ class OfficialProductCatalogAdapter(ProductCatalogAdapter):
                     price_cents=max(0, price),
                     stock=max(0, stock),
                     available=available,
-                    purchase_min=(
-                        int(purchase_min)
-                        if isinstance(purchase_min, int)
-                        and not isinstance(purchase_min, bool)
-                        and purchase_min > 0
-                        else 1
-                    ),
-                    purchase_max=(
-                        int(purchase_max)
-                        if isinstance(purchase_max, int)
-                        and not isinstance(purchase_max, bool)
-                        and purchase_max > 0
-                        else None
-                    ),
-                    is_default=bool(
-                        item.get("is_default")
-                        or item.get("default")
-                    ),
+                    purchase_min=1,
+                    purchase_max=purchase_max,
+                    is_default=False,
                     observed_at=observed_at,
                     data_complete=complete,
+                    purchase_min_verified=False,
                 )
             )
         return tuple(result)

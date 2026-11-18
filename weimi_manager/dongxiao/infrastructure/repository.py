@@ -14,6 +14,7 @@ from ..domain.catalog import CatalogProductData
 from ..domain.enums import (
     AuditResult,
     DataSource,
+    PresenceState,
     ProductPoolStatus,
     ProductState,
     TaskEvent,
@@ -83,6 +84,14 @@ def _load_json(value: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _load_list(value: str) -> list[Any]:
+    try:
+        payload = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
 def _row_time(value: str | None) -> datetime | None:
     return parse_utc_iso(value) if value else None
 
@@ -137,8 +146,11 @@ class DongxiaoRepository:
                     min_price_cents, stock_total, observed_at,
                     created_at, updated_at, sales_count, sales_source,
                     listing_time, listing_source, data_source,
-                    from_cache, last_synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    from_cache, last_synced_at, presence_state, missing_since
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'present', NULL
+                )
                 ON CONFLICT(store_app_id, product_id) DO UPDATE SET
                     store_id=excluded.store_id,
                     title=excluded.title,
@@ -153,7 +165,9 @@ class DongxiaoRepository:
                     listing_source=excluded.listing_source,
                     data_source=excluded.data_source,
                     from_cache=excluded.from_cache,
-                    last_synced_at=excluded.last_synced_at
+                    last_synced_at=excluded.last_synced_at,
+                    presence_state='present',
+                    missing_since=NULL
                 """,
                 (
                     product.store_id,
@@ -473,8 +487,12 @@ class DongxiaoRepository:
                     store_id, store_app_id, product_id, sku_id, specs_json,
                     price_cents, stock, available, purchase_min, purchase_max,
                     is_default, observed_at, created_at, updated_at,
-                    data_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    data_complete, presence_state, missing_since,
+                    purchase_min_verified
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'present', NULL, ?
+                )
                 ON CONFLICT(store_app_id, product_id, sku_id) DO UPDATE SET
                     store_id=excluded.store_id,
                     specs_json=excluded.specs_json,
@@ -486,7 +504,10 @@ class DongxiaoRepository:
                     is_default=excluded.is_default,
                     observed_at=excluded.observed_at,
                     updated_at=excluded.updated_at,
-                    data_complete=excluded.data_complete
+                    data_complete=excluded.data_complete,
+                    presence_state='present',
+                    missing_since=NULL,
+                    purchase_min_verified=excluded.purchase_min_verified
                 """,
                 (
                     sku.store_id,
@@ -504,6 +525,7 @@ class DongxiaoRepository:
                     now,
                     now,
                     1 if sku.data_complete else 0,
+                    1 if sku.purchase_min_verified else 0,
                 ),
             )
         saved = self.get_sku(sku.store_id, sku.product_id, sku.sku_id)
@@ -514,9 +536,11 @@ class DongxiaoRepository:
     def upsert_catalog_items(
         self,
         items: list[CatalogProductData],
-    ) -> int:
+        *,
+        return_reconciled: bool = False,
+    ) -> int | tuple[int, int]:
         if not items:
-            return 0
+            return (0, 0) if return_reconciled else 0
         now = to_utc_iso(datetime.now(UTC))
         product_rows: list[tuple[Any, ...]] = []
         sku_rows: list[tuple[Any, ...]] = []
@@ -560,6 +584,8 @@ class DongxiaoRepository:
                         if product.last_synced_at is not None
                         else None
                     ),
+                    PresenceState.PRESENT.value,
+                    None,
                 )
             )
             snapshot_rows.append(
@@ -612,6 +638,9 @@ class DongxiaoRepository:
                         now,
                         now,
                         1 if sku.data_complete else 0,
+                        PresenceState.PRESENT.value,
+                        None,
+                        1 if sku.purchase_min_verified else 0,
                     )
                 )
                 snapshot_rows.append(
@@ -647,8 +676,10 @@ class DongxiaoRepository:
                     min_price_cents, stock_total, observed_at,
                     created_at, updated_at, sales_count, sales_source,
                     listing_time, listing_source, data_source,
-                    from_cache, last_synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    from_cache, last_synced_at, presence_state, missing_since
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 ON CONFLICT(store_app_id, product_id) DO UPDATE SET
                     store_id=excluded.store_id,
                     title=excluded.title,
@@ -663,7 +694,9 @@ class DongxiaoRepository:
                     listing_source=excluded.listing_source,
                     data_source=excluded.data_source,
                     from_cache=excluded.from_cache,
-                    last_synced_at=excluded.last_synced_at
+                    last_synced_at=excluded.last_synced_at,
+                    presence_state=excluded.presence_state,
+                    missing_since=excluded.missing_since
                 """,
                 product_rows,
             )
@@ -673,8 +706,11 @@ class DongxiaoRepository:
                     store_id, store_app_id, product_id, sku_id, specs_json,
                     price_cents, stock, available, purchase_min, purchase_max,
                     is_default, observed_at, created_at, updated_at,
-                    data_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    data_complete, presence_state, missing_since,
+                    purchase_min_verified
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 ON CONFLICT(store_app_id, product_id, sku_id) DO UPDATE SET
                     store_id=excluded.store_id,
                     specs_json=excluded.specs_json,
@@ -686,7 +722,10 @@ class DongxiaoRepository:
                     is_default=excluded.is_default,
                     observed_at=excluded.observed_at,
                     updated_at=excluded.updated_at,
-                    data_complete=excluded.data_complete
+                    data_complete=excluded.data_complete,
+                    presence_state=excluded.presence_state,
+                    missing_since=excluded.missing_since,
+                    purchase_min_verified=excluded.purchase_min_verified
                 """,
                 sku_rows,
             )
@@ -700,6 +739,79 @@ class DongxiaoRepository:
                 """,
                 snapshot_rows,
             )
+            conn.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS dongxiao_seen_products_v3 (
+                    store_app_id TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    PRIMARY KEY (store_app_id, product_id)
+                )
+                """
+            )
+            conn.execute("DELETE FROM dongxiao_seen_products_v3")
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO dongxiao_seen_products_v3(
+                    store_app_id, product_id
+                ) VALUES (?, ?)
+                """,
+                [
+                    (item.product.store_app_id, item.product.product_id)
+                    for item in items
+                ],
+            )
+            conn.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS dongxiao_seen_skus_v3 (
+                    store_app_id TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    sku_id TEXT NOT NULL,
+                    PRIMARY KEY (store_app_id, product_id, sku_id)
+                )
+                """
+            )
+            conn.execute("DELETE FROM dongxiao_seen_skus_v3")
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO dongxiao_seen_skus_v3(
+                    store_app_id, product_id, sku_id
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (sku.store_app_id, sku.product_id, sku.sku_id)
+                    for item in items
+                    for sku in item.skus
+                ],
+            )
+            conn.execute(
+                """
+                UPDATE dongxiao_skus AS sku
+                SET presence_state='missing',
+                    missing_since=COALESCE(sku.missing_since, ?),
+                    available=0,
+                    updated_at=?
+                WHERE sku.presence_state!='missing'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM dongxiao_seen_products_v3 AS product
+                      WHERE product.store_app_id=sku.store_app_id
+                        AND product.product_id=sku.product_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dongxiao_seen_skus_v3 AS seen
+                      WHERE seen.store_app_id=sku.store_app_id
+                        AND seen.product_id=sku.product_id
+                        AND seen.sku_id=sku.sku_id
+                  )
+                """,
+                (now, now),
+            )
+            sku_reconcile_count = int(
+                conn.execute("SELECT changes()").fetchone()[0]
+            )
+        if return_reconciled:
+            return len(product_rows), sku_reconcile_count
         return len(product_rows)
 
     def get_sku(
@@ -718,17 +830,178 @@ class DongxiaoRepository:
             ).fetchone()
         return self._sku_from_row(row) if row else None
 
-    def list_skus(self, store_id: int, product_id: str) -> list[Sku]:
+    def list_skus(
+        self,
+        store_id: int,
+        product_id: str,
+        *,
+        include_missing: bool = False,
+    ) -> list[Sku]:
+        presence_clause = (
+            ""
+            if include_missing
+            else " AND presence_state='present'"
+        )
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT * FROM dongxiao_skus
                 WHERE store_id=? AND product_id=?
+                {presence_clause}
                 ORDER BY price_cents, sku_id
                 """,
                 (int(store_id), str(product_id)),
             ).fetchall()
         return [self._sku_from_row(row) for row in rows]
+
+    def reconcile_catalog_missing(
+        self,
+        *,
+        store_id: int,
+        store_app_id: str,
+        seen_product_ids: set[str] | frozenset[str],
+        observed_at: datetime | None = None,
+    ) -> tuple[int, int]:
+        now = to_utc_iso(observed_at or datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, store_id, store_app_id)
+            conn.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS dongxiao_full_catalog_seen_v3 (
+                    product_id TEXT PRIMARY KEY
+                )
+                """
+            )
+            conn.execute("DELETE FROM dongxiao_full_catalog_seen_v3")
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO dongxiao_full_catalog_seen_v3(
+                    product_id
+                ) VALUES (?)
+                """,
+                [
+                    (str(product_id),)
+                    for product_id in sorted(seen_product_ids)
+                    if str(product_id)
+                ],
+            )
+            product_cursor = conn.execute(
+                """
+                UPDATE dongxiao_products AS product
+                SET presence_state='missing',
+                    missing_since=COALESCE(product.missing_since, ?),
+                    updated_at=?
+                WHERE product.store_id=?
+                  AND product.store_app_id=?
+                  AND product.presence_state!='missing'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dongxiao_full_catalog_seen_v3 AS seen
+                      WHERE seen.product_id=product.product_id
+                  )
+                """,
+                (
+                    now,
+                    now,
+                    int(store_id),
+                    str(store_app_id),
+                ),
+            )
+            sku_cursor = conn.execute(
+                """
+                UPDATE dongxiao_skus AS sku
+                SET presence_state='missing',
+                    missing_since=COALESCE(sku.missing_since, ?),
+                    available=0,
+                    updated_at=?
+                WHERE sku.store_id=?
+                  AND sku.store_app_id=?
+                  AND sku.presence_state!='missing'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dongxiao_full_catalog_seen_v3 AS seen
+                      WHERE seen.product_id=sku.product_id
+                  )
+                """,
+                (
+                    now,
+                    now,
+                    int(store_id),
+                    str(store_app_id),
+                ),
+            )
+        return int(product_cursor.rowcount), int(sku_cursor.rowcount)
+
+    def record_catalog_sync_run(
+        self,
+        *,
+        run_id: str,
+        store_id: int,
+        store_app_id: str,
+        source: DataSource | str,
+        status: str,
+        discovered: int,
+        saved: int,
+        failed: int,
+        reconciled_products: int,
+        reconciled_skus: int,
+        errors: list[str] | tuple[str, ...],
+        started_at: datetime,
+        finished_at: datetime,
+    ) -> None:
+        allowed_statuses = {"complete", "partial", "failed", "cancelled"}
+        normalized_status = str(status)
+        if normalized_status not in allowed_statuses:
+            raise ValueError("商品同步运行状态不受支持")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, store_id, store_app_id)
+            conn.execute(
+                """
+                INSERT INTO dongxiao_catalog_sync_runs(
+                    run_id, store_id, store_app_id, source, status,
+                    discovered, saved, failed, reconciled_products,
+                    reconciled_skus, errors_json, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    int(store_id),
+                    str(store_app_id),
+                    DataSource(source).value,
+                    normalized_status,
+                    int(discovered),
+                    int(saved),
+                    int(failed),
+                    int(reconciled_products),
+                    int(reconciled_skus),
+                    _json(list(errors)),
+                    to_utc_iso(started_at),
+                    to_utc_iso(finished_at),
+                ),
+            )
+
+    def latest_catalog_sync_run(
+        self,
+        store_id: int,
+        *,
+        store_app_id: str = "",
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM dongxiao_catalog_sync_runs
+                WHERE store_id=?
+                  AND (?='' OR store_app_id=?)
+                ORDER BY finished_at DESC, run_id DESC
+                LIMIT 1
+                """,
+                (int(store_id), str(store_app_id), str(store_app_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["errors"] = _load_list(result.pop("errors_json", "[]"))
+        return result
 
     def record_product_snapshot(self, snapshot: ProductSnapshot) -> None:
         with self.connect() as conn:
@@ -1124,11 +1397,22 @@ class DongxiaoRepository:
             self._ensure_store(conn, store_id, store_app_id)
             rows = conn.execute(
                 """
-                SELECT item_id, pool_id, product_id, sku_id, position,
-                       created_at
-                FROM dongxiao_product_pool_items
-                WHERE pool_id=? AND store_id=? AND store_app_id=?
-                ORDER BY position, item_id
+                SELECT item.item_id, item.pool_id, item.product_id,
+                       item.sku_id, item.position, item.created_at,
+                       product.title, product.state,
+                       product.min_price_cents, product.stock_total,
+                       product.presence_state,
+                       store.name AS store_name
+                FROM dongxiao_product_pool_items AS item
+                LEFT JOIN dongxiao_products AS product
+                  ON product.store_app_id=item.store_app_id
+                 AND product.store_id=item.store_id
+                 AND product.product_id=item.product_id
+                LEFT JOIN stores AS store ON store.id=item.store_id
+                WHERE item.pool_id=?
+                  AND item.store_id=?
+                  AND item.store_app_id=?
+                ORDER BY item.position, item.item_id
                 """,
                 (str(pool_id), int(store_id), str(store_app_id)),
             ).fetchall()
@@ -1852,6 +2136,12 @@ class DongxiaoRepository:
                 if row["last_synced_at"]
                 else None
             ),
+            presence_state=PresenceState(row["presence_state"]),
+            missing_since=(
+                parse_utc_iso(row["missing_since"])
+                if row["missing_since"]
+                else None
+            ),
         )
 
     @staticmethod
@@ -1879,6 +2169,13 @@ class DongxiaoRepository:
             is_default=bool(row["is_default"]),
             observed_at=parse_utc_iso(row["observed_at"]),
             data_complete=bool(row["data_complete"]),
+            presence_state=PresenceState(row["presence_state"]),
+            missing_since=(
+                parse_utc_iso(row["missing_since"])
+                if row["missing_since"]
+                else None
+            ),
+            purchase_min_verified=bool(row["purchase_min_verified"]),
         )
 
     @staticmethod

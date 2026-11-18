@@ -12,6 +12,7 @@ from .enums import (
     DataSource,
     OrderStatus,
     OrderVerificationSource,
+    PresenceState,
     ProductPoolStatus,
     ProductState,
     TaskAttemptStatus,
@@ -85,6 +86,8 @@ class Product:
     data_source: DataSource = DataSource.UNKNOWN
     from_cache: bool = False
     last_synced_at: datetime | None = None
+    presence_state: PresenceState = PresenceState.PRESENT
+    missing_since: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_id", _store_id(self.store_id))
@@ -151,6 +154,18 @@ class Product:
             "last_synced_at",
             ensure_utc(synced_at, field="商品最后同步时间"),
         )
+        presence_state = PresenceState(self.presence_state)
+        missing_since = (
+            ensure_utc(self.missing_since, field="商品缺失时间")
+            if self.missing_since is not None
+            else None
+        )
+        if presence_state is PresenceState.MISSING and missing_since is None:
+            raise ValueError("目录缺失商品必须记录缺失时间")
+        if presence_state is PresenceState.PRESENT and missing_since is not None:
+            raise ValueError("目录存在商品不能设置缺失时间")
+        object.__setattr__(self, "presence_state", presence_state)
+        object.__setattr__(self, "missing_since", missing_since)
 
     @property
     def trusted_sales(self) -> bool:
@@ -182,6 +197,9 @@ class Sku:
     is_default: bool = False
     observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     data_complete: bool = True
+    presence_state: PresenceState = PresenceState.PRESENT
+    missing_since: datetime | None = None
+    purchase_min_verified: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_id", _store_id(self.store_id))
@@ -232,6 +250,23 @@ class Sku:
             self,
             "observed_at",
             ensure_utc(self.observed_at, field="SKU 观测时间"),
+        )
+        presence_state = PresenceState(self.presence_state)
+        missing_since = (
+            ensure_utc(self.missing_since, field="SKU 缺失时间")
+            if self.missing_since is not None
+            else None
+        )
+        if presence_state is PresenceState.MISSING and missing_since is None:
+            raise ValueError("目录缺失 SKU 必须记录缺失时间")
+        if presence_state is PresenceState.PRESENT and missing_since is not None:
+            raise ValueError("目录存在 SKU 不能设置缺失时间")
+        object.__setattr__(self, "presence_state", presence_state)
+        object.__setattr__(self, "missing_since", missing_since)
+        object.__setattr__(
+            self,
+            "purchase_min_verified",
+            bool(self.purchase_min_verified),
         )
 
 

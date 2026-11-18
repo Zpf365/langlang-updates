@@ -313,3 +313,68 @@ def test_sku_selection_checks_stock_price_and_limits() -> None:
         quantity=1,
         product_state=ProductState.INACTIVE,
     ).failure is SkuSelectionFailure.PRODUCT_INACTIVE
+
+
+def test_sku_selection_is_deterministic_for_equal_prices() -> None:
+    observed_at = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
+    candidates = (
+        Sku(
+            store_id=11,
+            store_app_id="wx-store-11",
+            product_id="prod-1",
+            sku_id="sku-z",
+            price_cents=500,
+            stock=10,
+            observed_at=observed_at,
+        ),
+        Sku(
+            store_id=11,
+            store_app_id="wx-store-11",
+            product_id="prod-1",
+            sku_id="sku-a",
+            price_cents=500,
+            stock=10,
+            observed_at=observed_at,
+        ),
+    )
+
+    for mode in (
+        SkuSelectionMode.ANY,
+        SkuSelectionMode.LOWEST_PRICE,
+        SkuSelectionMode.HIGHEST_PRICE,
+    ):
+        selected = {
+            select_sku(
+                store_id=11,
+                product_id="prod-1",
+                candidates=candidates,
+                quantity=1,
+                mode=mode,
+            ).selected.sku_id
+            for _index in range(5)
+        }
+        assert selected == {"sku-a"}
+
+
+def test_sku_selection_rejects_unverified_purchase_minimum() -> None:
+    observed_at = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
+    sku = Sku(
+        store_id=11,
+        store_app_id="wx-store-11",
+        product_id="prod-1",
+        sku_id="sku-1",
+        price_cents=500,
+        stock=10,
+        observed_at=observed_at,
+        purchase_min_verified=False,
+    )
+
+    selection = select_sku(
+        store_id=11,
+        product_id="prod-1",
+        candidates=(sku,),
+        quantity=1,
+    )
+
+    assert selection.failure is SkuSelectionFailure.INCOMPLETE_DATA
+    assert "起购数量" in selection.reason

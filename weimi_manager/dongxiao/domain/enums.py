@@ -17,6 +17,11 @@ class DataSource(StrEnum):
     UNKNOWN = "unknown"
 
 
+class PresenceState(StrEnum):
+    PRESENT = "present"
+    MISSING = "missing"
+
+
 class ProductPoolStatus(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"

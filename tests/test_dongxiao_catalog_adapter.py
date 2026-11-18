@@ -23,7 +23,13 @@ from weimi_manager.dongxiao.infrastructure.repository import (
 
 
 class _FakeClient:
-    def fetch_product_id_page(self, cursor: str = "", status=None):
+    def fetch_product_id_page(
+        self,
+        cursor: str = "",
+        status=None,
+        page_size: int = 30,
+    ):
+        del status, page_size
         assert cursor == ""
         return SimpleNamespace(
             ids=["100001"],
@@ -52,6 +58,7 @@ class _FakeClient:
                         "sku_id": "sku-1",
                         "sale_price": 1200,
                         "stock_num": 8,
+                        "status": 5,
                         "sku_attrs": [
                             {"attr_key": "颜色", "attr_value": "黑色"}
                         ],
@@ -88,9 +95,89 @@ def test_official_adapter_maps_only_fields_with_official_provenance() -> None:
     assert sku.specs == (("颜色", "黑色"),)
 
 
+def test_official_adapter_maps_sales_and_sku_status_from_documented_fields() -> None:
+    class SalesAndStatusClient(_FakeClient):
+        def fetch_product(self, store, product_id: str):
+            product = super().fetch_product(store, product_id)
+            product.raw["total_sold_num"] = 17
+            product.raw["skus"] = [
+                {
+                    "sku_id": "sku-active",
+                    "sale_price": 1200,
+                    "stock_num": 8,
+                    "status": 5,
+                },
+                {
+                    "sku_id": "sku-inactive",
+                    "sale_price": 1300,
+                    "stock_num": 8,
+                    "status": 11,
+                },
+            ]
+            return product
+
+    service = SimpleNamespace(client_for=lambda _store: SalesAndStatusClient())
+    adapter = OfficialProductCatalogAdapter(service)
+    store = SimpleNamespace(
+        id=11,
+        name="官方接口店铺",
+        app_id="wx-catalog",
+    )
+
+    detail = adapter.get_product_detail(store, "100001")
+
+    assert detail.product.sales_count == 17
+    assert detail.product.sales_source is DataSource.OFFICIAL_API
+    assert detail.product.listing_time is None
+    assert [sku.available for sku in detail.skus] == [True, False]
+
+
+def test_official_adapter_rejects_undocumented_sku_limit_and_default_guesses() -> None:
+    class LimitClient(_FakeClient):
+        def fetch_product(self, store, product_id: str):
+            product = super().fetch_product(store, product_id)
+            product.raw["limited_info"] = {
+                "period_type": 1,
+                "limited_buy_num": 3,
+            }
+            product.raw["skus"] = [
+                {
+                    "sku_id": "sku-1",
+                    "sale_price": 1200,
+                    "stock_num": 8,
+                    "status": 5,
+                    "min_purchase_num": 7,
+                    "max_purchase_num": 9,
+                    "is_default": True,
+                }
+            ]
+            return product
+
+    service = SimpleNamespace(client_for=lambda _store: LimitClient())
+    adapter = OfficialProductCatalogAdapter(service)
+    store = SimpleNamespace(
+        id=11,
+        name="官方接口店铺",
+        app_id="wx-catalog",
+    )
+
+    sku = adapter.get_product_detail(store, "100001").skus[0]
+
+    assert sku.purchase_min == 1
+    assert sku.purchase_min_verified is False
+    assert sku.purchase_max == 3
+    assert sku.is_default is False
+
+
 def test_official_adapter_returns_partial_results_on_detail_timeout() -> None:
     class PartialClient(_FakeClient):
-        def fetch_product_id_page(self, cursor: str = "", status=None):
+        def fetch_product_id_page(
+            self,
+            cursor: str = "",
+            status=None,
+            page_size: int = 30,
+        ):
+            del status, page_size
             return SimpleNamespace(
                 ids=["100001", "100002"],
                 next_key="",
@@ -119,7 +206,13 @@ def test_official_adapter_returns_partial_results_on_detail_timeout() -> None:
 
 def test_official_adapter_maps_catalog_timeout() -> None:
     class TimeoutClient:
-        def fetch_product_id_page(self, cursor: str = "", status=None):
+        def fetch_product_id_page(
+            self,
+            cursor: str = "",
+            status=None,
+            page_size: int = 30,
+        ):
+            del status, page_size
             raise requests.Timeout("timeout")
 
     service = SimpleNamespace(client_for=lambda _store: TimeoutClient())

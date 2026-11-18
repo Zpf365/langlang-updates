@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from weimi_manager.db import Database
-from weimi_manager.dongxiao.domain.enums import ProductImportStatus
+from weimi_manager.dongxiao.application.import_service import (
+    ProductImportService,
+)
+from weimi_manager.dongxiao.domain.enums import DataSource, ProductImportStatus, ProductState
 from weimi_manager.dongxiao.domain.imports import parse_product_import
+from weimi_manager.dongxiao.domain.models import Product
 from weimi_manager.dongxiao.infrastructure.repository import (
     DongxiaoRepository,
 )
@@ -98,3 +103,57 @@ def test_import_preview_persists_pending_and_reports_duplicates(
         ProductImportStatus.DUPLICATE.value,
         ProductImportStatus.PENDING_RESOLUTION.value,
     }
+
+
+def test_pending_share_text_can_be_manually_linked_to_authorized_product(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "manual-link.db")
+    store_id = db.add_store("手动关联店铺", "wx-manual-link", "x" * 32)
+    other_id = db.add_store("其他店铺", "wx-manual-other", "y" * 32)
+    store = db.get_store(store_id)
+    other = db.get_store(other_id)
+    assert store is not None and other is not None
+    repo = DongxiaoRepository(db.path)
+    now = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
+    repo.upsert_product(
+        Product(
+            store_id=store.id,
+            store_app_id=store.app_id,
+            product_id="123456789",
+            title="授权商品",
+            state=ProductState.ACTIVE,
+            min_price_cents=1000,
+            stock_total=5,
+            observed_at=now,
+            data_source=DataSource.OFFICIAL_API,
+            last_synced_at=now,
+        )
+    )
+    service = ProductImportService(repo)
+    preview = parse_product_import(
+        "#微信小店://示例店铺/无法由官方反向解析"
+    )
+
+    linked = service.associate(
+        store,
+        preview,
+        line_number=1,
+        product_id="123456789",
+    )
+
+    assert linked.items[0].status is ProductImportStatus.READY
+    assert linked.items[0].product_id == "123456789"
+    assert linked.items[0].raw_text.startswith("#微信小店://")
+    assert "手动关联" in linked.items[0].reason
+    try:
+        service.associate(
+            other,
+            preview,
+            line_number=1,
+            product_id="123456789",
+        )
+    except ValueError as exc:
+        assert "当前店铺" in str(exc)
+    else:
+        raise AssertionError("manual link must reject another store's product")

@@ -23,10 +23,13 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 2
-DONGXIAO_MIGRATION_NAME = "dongxiao_product_catalog_v2"
+DONGXIAO_MIGRATION_VERSION = 3
+DONGXIAO_MIGRATION_NAME = "dongxiao_catalog_consistency_v3"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
+)
+DONGXIAO_V2_CHECKSUM = (
+    "9553158b15347f6c19d334091246348105f65e1547f714c7083effd065adc86f"
 )
 
 
@@ -570,10 +573,78 @@ END;
     return "\n".join(statements)
 
 
+def _migration_v3_sql() -> str:
+    sources = _values(
+        item.value
+        for item in (
+            DataSource.OFFICIAL_API,
+            DataSource.WEB_BACKEND,
+            DataSource.LOCAL_CACHE,
+            DataSource.MOCK,
+            DataSource.UNKNOWN,
+        )
+    )
+    return f"""
+ALTER TABLE dongxiao_products
+    ADD COLUMN presence_state TEXT NOT NULL DEFAULT 'present'
+        CHECK (presence_state IN ('present', 'missing'));
+ALTER TABLE dongxiao_products ADD COLUMN missing_since TEXT;
+ALTER TABLE dongxiao_skus
+    ADD COLUMN presence_state TEXT NOT NULL DEFAULT 'present'
+        CHECK (presence_state IN ('present', 'missing'));
+ALTER TABLE dongxiao_skus ADD COLUMN missing_since TEXT;
+ALTER TABLE dongxiao_skus
+    ADD COLUMN purchase_min_verified INTEGER NOT NULL DEFAULT 1
+        CHECK (purchase_min_verified IN (0, 1));
+
+CREATE INDEX IF NOT EXISTS idx_dongxiao_products_presence_v3
+    ON dongxiao_products(store_app_id, presence_state, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_skus_presence_v3
+    ON dongxiao_skus(
+        store_app_id, product_id, presence_state, price_cents, sku_id
+    );
+
+CREATE TABLE IF NOT EXISTS dongxiao_catalog_sync_runs (
+    run_id TEXT PRIMARY KEY,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ({sources})),
+    status TEXT NOT NULL
+        CHECK (status IN ('complete', 'partial', 'failed', 'cancelled')),
+    discovered INTEGER NOT NULL DEFAULT 0 CHECK (discovered >= 0),
+    saved INTEGER NOT NULL DEFAULT 0 CHECK (saved >= 0),
+    failed INTEGER NOT NULL DEFAULT 0 CHECK (failed >= 0),
+    reconciled_products INTEGER NOT NULL DEFAULT 0
+        CHECK (reconciled_products >= 0),
+    reconciled_skus INTEGER NOT NULL DEFAULT 0
+        CHECK (reconciled_skus >= 0),
+    errors_json TEXT NOT NULL DEFAULT '[]',
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    CHECK (finished_at >= started_at)
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_catalog_sync_runs_latest_v3
+    ON dongxiao_catalog_sync_runs(
+        store_app_id, finished_at DESC, run_id DESC
+    );
+CREATE TRIGGER IF NOT EXISTS catalog_sync_runs_store_identity_insert_v3
+BEFORE INSERT ON dongxiao_catalog_sync_runs
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+     WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'catalog_sync_runs 店铺 ID 与 AppID 不一致');
+END;
+"""
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
         (2, "dongxiao_product_catalog_v2", _migration_v2_sql),
+        (3, "dongxiao_catalog_consistency_v3", _migration_v3_sql),
     )
 
 
@@ -644,6 +715,10 @@ def migrate_dongxiao_schema(
             raise sqlite3.IntegrityError(
                 "动销中心 v1 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
+        if version == 2 and current_checksum != DONGXIAO_V2_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v2 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
             conn.executescript(
@@ -706,6 +781,7 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_audit_events",
         "dongxiao_product_imports",
         "dongxiao_product_pool_events",
+        "dongxiao_catalog_sync_runs",
     }
     tables = {
         str(row[0])
