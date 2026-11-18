@@ -2776,6 +2776,7 @@ class CoreTests(unittest.TestCase):
                 "no_traffic",
                 "hosted",
                 "team",
+                "sales_related",
             }
             self.assertIn("stores", window._pages)
             self.assertLess(len(window._pages), len(expected_pages))
@@ -2844,6 +2845,13 @@ class CoreTests(unittest.TestCase):
             window.update_idletasks()
             self.assertEqual(window.title_var.get(), "动销建议")
             self.assertTrue(window.dynamic_page.empty_label.winfo_exists())
+            window.show_page("sales_related")
+            window.update_idletasks()
+            self.assertEqual(window.title_var.get(), "动销中心")
+            self.assertEqual(
+                type(window.sales_related_page).__name__,
+                "DongxiaoPage",
+            )
             window.show_page("operations")
             window.update_idletasks()
             self.assertTrue(window.operations_page._action_buttons)

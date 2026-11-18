@@ -42,6 +42,7 @@ from .activity_center import ActivityCenterPage
 from .business_tools import (
     StoreGroupsPage,
 )
+from .dongxiao_page import DongxiaoPage
 from .hosted_center import HostedCenterPage
 from .pages import (
     ExtractPage,
@@ -51,7 +52,6 @@ from .pages import (
     SettingsPage,
     StorePage,
 )
-from .sales_related_page import SalesRelatedPage
 from .skeletons import (
     AccountPage,
     AnalyticsPage,
@@ -631,9 +631,9 @@ class MainWindow(tk.Tk):
             ("double11", "活动中心", "marketing"),
             ("dashboard", "数据大屏", "analytics"),
         ]
-        # 用“动销相关”替换原团队账号侧边栏位置；团队账号本身仍保留，移入“更多”。
+        # 用“动销中心”替换原团队账号侧边栏位置；团队账号本身仍保留，移入“更多”。
         if self._can_sales_related():
-            nav.append(("sales_related", "动销相关", "procurement"))
+            nav.append(("sales_related", "动销中心", "procurement"))
         nav = [
             item
             for item in nav
@@ -883,7 +883,7 @@ class MainWindow(tk.Tk):
         if key == "team":
             return TeamPage(self.page_host, self)
         if key == "sales_related":
-            return SalesRelatedPage(self.page_host, self)
+            return DongxiaoPage(self.page_host, self)
         return None
 
     def _ensure_page(self, key: str) -> ttk.Frame | None:

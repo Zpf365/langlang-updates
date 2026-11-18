@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .dongxiao.infrastructure.migrations import migrate_dongxiao_schema
 from .models import (
     ORDER_STATUS,
     PRODUCT_STATUS,
@@ -849,6 +850,11 @@ class Database:
             )
             conn.commit()
             migrate_sales_related_schema(
+                conn,
+                self.path,
+                self._create_migration_backup,
+            )
+            migrate_dongxiao_schema(
                 conn,
                 self.path,
                 self._create_migration_backup,

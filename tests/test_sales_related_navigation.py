@@ -34,7 +34,7 @@ def test_team_page_remains_in_more_menu_and_new_module_has_requested_label() -> 
     source = APP_SOURCE.read_text(encoding="utf-8")
     assert '("团队账号", "team", "team_manage")' in source
     assert '("team", "团队账号"' not in source
-    assert '("sales_related", "动销相关", "procurement")' in source
+    assert '("sales_related", "动销中心", "procurement")' in source
     page_source = PAGE_SOURCE.read_text(encoding="utf-8")
     assert 'title = "动销相关"' in page_source
     ast.parse(page_source)
