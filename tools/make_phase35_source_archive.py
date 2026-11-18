@@ -21,6 +21,7 @@ EXCLUDED_DIRS = {
     ".venv",
     ".venv311",
     "__pycache__",
+    "browser_runtime",
     "build",
     "data",
     "dist",
