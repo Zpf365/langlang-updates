@@ -68,6 +68,8 @@ AUDIT_ACTION_LABELS = {
     "task_created": "创建任务",
     "task_status_changed": "任务状态变更",
     "aftersale_status_changed": "售后状态变更",
+    "aftersale_amount_changed": "售后金额变化",
+    "aftersale_platform_status_unknown": "售后平台状态未知",
     "approval_decided": "审批决定",
     "order_synced": "同步真实订单",
     "aftersale_synced": "同步真实售后",
@@ -193,6 +195,13 @@ class DongxiaoPage(BasePage):
         self.section_stage_var = tk.StringVar()
         self.store_var = tk.StringVar()
         self.source_status_var = tk.StringVar(value="数据来源：尚未同步")
+        runtime_error = str(
+            getattr(window, "dongxiao_runtime_error", "") or ""
+        )
+        if runtime_error:
+            self.source_status_var.set(
+                f"动销中心初始化异常：{runtime_error}"
+            )
         self.product_page_var = tk.StringVar(value="商品 0 条")
         self.pool_stats_var = tk.StringVar(value="商品池尚未选择")
         self.sku_result_var = tk.StringVar(value="请选择商品后核验 SKU")
@@ -960,12 +969,20 @@ class DongxiaoPage(BasePage):
         ).pack(side="left")
         workflow = ttk.Frame(view, style="Panel.TFrame")
         workflow.grid(row=2, column=0, sticky="ew", pady=5)
-        ttk.Label(workflow, text="审批金额").pack(side="left")
+        ttk.Label(workflow, text="本地审批金额").pack(side="left")
         ttk.Entry(
             workflow,
             textvariable=self.aftersale_amount_var,
             width=12,
         ).pack(side="left", padx=(4, 8))
+        ttk.Label(
+            workflow,
+            text=(
+                "平台实际执行金额以官方售后申请金额为准；"
+                "当前同意接口不支持部分金额"
+            ),
+            style="Subtitle.TLabel",
+        ).pack(side="left", padx=(0, 8))
         button(
             workflow,
             "申请审批",
@@ -1007,6 +1024,7 @@ class DongxiaoPage(BasePage):
                 "case_id",
                 "order_id",
                 "status",
+                "platform_status",
                 "requested",
                 "approved",
                 "paid",
@@ -1021,6 +1039,7 @@ class DongxiaoPage(BasePage):
             ("case_id", "售后单号", 150),
             ("order_id", "订单号", 150),
             ("status", "状态", 95),
+            ("platform_status", "平台原始状态", 170),
             ("requested", "申请金额", 90),
             ("approved", "审批金额", 90),
             ("paid", "订单实付", 90),
@@ -2282,8 +2301,30 @@ class DongxiaoPage(BasePage):
         )
 
     def _start_task_scheduler(self) -> None:
-        if self.runtime is not None and not self.runtime.started:
+        if self._ensure_task_runtime() and not self.runtime.started:
             self.runtime.start()
+
+    def _ensure_task_runtime(self) -> bool:
+        if self.runtime is not None and self.task_scheduler is not None:
+            return True
+        ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
+        if not callable(ensure):
+            return False
+        runtime = ensure()
+        if runtime is None:
+            error = str(
+                getattr(self.window, "dongxiao_runtime_error", "") or "未知错误"
+            )
+            self.source_status_var.set(f"动销中心初始化异常：{error}")
+            return False
+        self.runtime = runtime
+        self.repository = runtime.repository
+        self.task_service = runtime.task_service
+        self.order_service = runtime.order_service
+        self.aftersale_service = runtime.aftersale_service
+        self.task_scheduler = runtime.scheduler
+        self.source_status_var.set("动销中心运行时已恢复")
+        return True
 
     def _create_pool_task(self) -> None:
         store = self._current_store()
@@ -2292,6 +2333,17 @@ class DongxiaoPage(BasePage):
             messagebox.showinfo(
                 "创建批量任务",
                 "请先选择店铺和商品池。",
+                parent=self,
+            )
+            return
+        if not self._ensure_task_runtime():
+            messagebox.showerror(
+                "创建批量任务失败",
+                "动销中心运行时初始化失败，未创建任务。\n\n"
+                + str(
+                    getattr(self.window, "dongxiao_runtime_error", "")
+                    or "未知错误"
+                ),
                 parent=self,
             )
             return
@@ -2364,6 +2416,13 @@ class DongxiaoPage(BasePage):
             "retry": self.task_service.retry_failed,
         }
         method = methods[action]
+        if action in {"resume", "retry"} and not self._ensure_task_runtime():
+            messagebox.showerror(
+                "任务恢复失败",
+                "动销中心运行时不可用，任务未恢复。",
+                parent=self,
+            )
+            return
 
         def done(task) -> None:
             if action in {"resume", "retry"}:
@@ -2480,6 +2539,7 @@ class DongxiaoPage(BasePage):
                 task_id,
                 store_app_id=store.app_id,
                 actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
             ),
             done,
             lambda error: messagebox.showerror(
@@ -2613,6 +2673,13 @@ class DongxiaoPage(BasePage):
             messagebox.showinfo(
                 "订单核验任务",
                 "请选择至少一个订单。",
+                parent=self,
+            )
+            return
+        if not self._ensure_task_runtime():
+            messagebox.showerror(
+                "订单核验任务",
+                "动销中心运行时不可用，任务未创建。",
                 parent=self,
             )
             return
@@ -2763,6 +2830,7 @@ class DongxiaoPage(BasePage):
                     case.platform_case_id,
                     case.platform_order_id or "—",
                     self._aftersale_status_label(case.status),
+                    case.platform_status or "—",
                     _money(case.requested_amount_cents),
                     _money(case.approved_amount_cents),
                     _money(case.paid_amount_cents),
@@ -2887,6 +2955,13 @@ class DongxiaoPage(BasePage):
         case = self._selected_aftersale()
         if store is None or case is None:
             return
+        if not self._ensure_task_runtime():
+            messagebox.showerror(
+                "售后执行任务",
+                "动销中心运行时不可用，任务未创建。",
+                parent=self,
+            )
+            return
         approvals = self.aftersale_service.list_approvals(
             store,
             case_id=case.case_id,
@@ -2949,6 +3024,13 @@ class DongxiaoPage(BasePage):
         store = self._current_store()
         case = self._selected_aftersale()
         if store is None or case is None:
+            return
+        if not self._ensure_task_runtime():
+            messagebox.showerror(
+                "售后核验任务",
+                "动销中心运行时不可用，任务未创建。",
+                parent=self,
+            )
             return
         if not messagebox.askyesno(
             "提交售后平台操作",

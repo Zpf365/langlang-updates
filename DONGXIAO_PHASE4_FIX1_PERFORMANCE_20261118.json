@@ -1,0 +1,57 @@
+{
+  "tested_at": "2026-11-18T15:03:57+00:00",
+  "timezone": "UTC",
+  "database": "temporary isolated SQLite",
+  "tasks": [
+    {
+      "products_and_items": 1000,
+      "batch_task_create_ms": 303.03,
+      "task_execute_1000_items_ms": 610.79,
+      "executed_items": 1000,
+      "peak_python_bytes": 2313613,
+      "peak_rss_delta_bytes": 5226496,
+      "rss_after_minus_before_bytes": 1466368,
+      "errors": 0
+    },
+    {
+      "products_and_items": 10000,
+      "batch_task_create_ms": 3135.73,
+      "task_execute_1000_items_ms": null,
+      "executed_items": 0,
+      "peak_python_bytes": 21770787,
+      "peak_rss_delta_bytes": 45297664,
+      "rss_after_minus_before_bytes": 11411456,
+      "errors": 0
+    }
+  ],
+  "orders": {
+    "orders": 1000,
+    "order_sync_ms": 444.69,
+    "saved": 1000,
+    "order_page_query_500_ms": 45.62,
+    "returned": 500,
+    "errors": 0
+  },
+  "aftersales": {
+    "calls": 10000,
+    "amount_preview_total_ms": 15.63,
+    "amount_preview_per_call_us": 1.56,
+    "errors": 0
+  },
+  "ui": {
+    "measured": true,
+    "task_items": 500,
+    "background_execute_ms": 316.87,
+    "event_loop_ticks": 12,
+    "max_gap_ms": 19.01,
+    "errors": 0
+  },
+  "restart_recovery": {
+    "interrupted_tasks": 200,
+    "recovery_ms": 20.09,
+    "recovered_tasks": 200,
+    "preparing_tasks": 200,
+    "pending_items": 200,
+    "errors": 0
+  }
+}

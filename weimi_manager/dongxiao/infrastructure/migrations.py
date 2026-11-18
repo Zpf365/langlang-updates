@@ -23,8 +23,8 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 4
-DONGXIAO_MIGRATION_NAME = "dongxiao_operations_v4"
+DONGXIAO_MIGRATION_VERSION = 5
+DONGXIAO_MIGRATION_NAME = "dongxiao_fix1_integrity_v5"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
 )
@@ -36,6 +36,9 @@ DONGXIAO_V3_CHECKSUM = (
 )
 DONGXIAO_V4_CHECKSUM = (
     "e55a03bd7d8141579f33606961242e4756b242af2aabf7f13e828873038292d5"
+)
+DONGXIAO_V5_CHECKSUM = (
+    "d74be519cddb09bc4afe0f4893e0c91f9cf3a3b303d9c8250fb8a54f6c7eed90"
 )
 
 
@@ -864,12 +867,119 @@ END;
     return "\n".join(statements)
 
 
+def _migration_v5_sql() -> str:
+    aftersale_states = _values(item.value for item in AftersaleStatus)
+    return f"""
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN platform_state TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (platform_state IN ({aftersale_states}));
+ALTER TABLE dongxiao_aftersale_cases ADD COLUMN platform_state_updated_at TEXT;
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN platform_reason TEXT NOT NULL DEFAULT '';
+
+UPDATE dongxiao_aftersale_cases
+SET platform_state=status,
+    platform_state_updated_at=COALESCE(last_synced_at, updated_at)
+WHERE source='platform_api'
+  AND platform_state='unknown';
+
+CREATE TABLE IF NOT EXISTS dongxiao_aftersale_status_history (
+    history_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    previous_workflow_status TEXT,
+    new_workflow_status TEXT NOT NULL,
+    previous_platform_state TEXT,
+    new_platform_state TEXT NOT NULL,
+    platform_status TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL,
+    actor_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    FOREIGN KEY (case_id, store_app_id)
+        REFERENCES dongxiao_aftersale_cases(case_id, store_app_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_aftersale_history_v5
+    ON dongxiao_aftersale_status_history(
+        store_app_id, case_id, observed_at DESC
+    );
+INSERT INTO dongxiao_aftersale_status_history(
+    history_id, case_id, store_id, store_app_id,
+    previous_workflow_status, new_workflow_status,
+    previous_platform_state, new_platform_state,
+    platform_status, source, actor_id, reason, observed_at
+)
+SELECT
+    lower(hex(randomblob(16))), case_id, store_id, store_app_id,
+    NULL, status, NULL, platform_state,
+    platform_status, 'migration', 'migration-v5',
+    '升级时记录已有状态基线',
+    COALESCE(platform_state_updated_at, last_synced_at, updated_at)
+FROM dongxiao_aftersale_cases;
+
+UPDATE dongxiao_approvals
+SET status='cancelled',
+    decided_by='migration-v5',
+    decision_reason='迁移发现重复待审批，保留历史并取消较新记录',
+    decided_at=COALESCE(decided_at, requested_at)
+WHERE subject_type='aftersale'
+  AND status='pending'
+  AND rowid NOT IN (
+      SELECT MIN(rowid)
+      FROM dongxiao_approvals
+      WHERE subject_type='aftersale' AND status='pending'
+      GROUP BY store_app_id, subject_id
+  );
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dongxiao_approvals_pending_aftersale_v5
+    ON dongxiao_approvals(store_app_id, subject_id)
+    WHERE subject_type='aftersale' AND status='pending';
+
+CREATE INDEX IF NOT EXISTS idx_dongxiao_tasks_lease_expiry_v5
+    ON dongxiao_tasks(status, lease_expires_at, store_app_id);
+
+DROP TRIGGER IF EXISTS prevent_dongxiao_audit_update;
+CREATE TRIGGER prevent_dongxiao_audit_update_v5
+BEFORE UPDATE ON dongxiao_audit_events
+WHEN NOT (
+    OLD.store_id IS NOT NULL
+    AND NEW.store_id IS NULL
+    AND OLD.store_app_id=NEW.store_app_id
+    AND OLD.actor_id=NEW.actor_id
+    AND OLD.action=NEW.action
+    AND OLD.entity_type=NEW.entity_type
+    AND OLD.entity_id=NEW.entity_id
+    AND OLD.request_id=NEW.request_id
+    AND OLD.result=NEW.result
+    AND OLD.detail_json=NEW.detail_json
+    AND OLD.created_at=NEW.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, '动销审计事件不可修改');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_store_delete_with_active_dongxiao_task_v5
+BEFORE DELETE ON stores
+WHEN EXISTS (
+    SELECT 1 FROM dongxiao_tasks
+    WHERE store_id=OLD.id
+      AND status IN ('pending', 'preparing', 'running', 'paused', 'unknown')
+)
+BEGIN
+    SELECT RAISE(ABORT, '店铺存在未完成的动销任务，禁止删除');
+END;
+"""
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
         (2, "dongxiao_product_catalog_v2", _migration_v2_sql),
         (3, "dongxiao_catalog_consistency_v3", _migration_v3_sql),
         (4, "dongxiao_operations_v4", _migration_v4_sql),
+        (5, "dongxiao_fix1_integrity_v5", _migration_v5_sql),
     )
 
 
@@ -952,6 +1062,10 @@ def migrate_dongxiao_schema(
             raise sqlite3.IntegrityError(
                 "动销中心 v4 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
+        if version == 5 and current_checksum != DONGXIAO_V5_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v5 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
             conn.executescript(
@@ -1018,6 +1132,7 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_task_execution_items",
         "dongxiao_execution_attempts",
         "dongxiao_order_details",
+        "dongxiao_aftersale_status_history",
     }
     tables = {
         str(row[0])

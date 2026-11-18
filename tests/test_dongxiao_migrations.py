@@ -14,6 +14,7 @@ from weimi_manager.dongxiao.infrastructure.migrations import (
     DONGXIAO_V2_CHECKSUM,
     DONGXIAO_V3_CHECKSUM,
     DONGXIAO_V4_CHECKSUM,
+    DONGXIAO_V5_CHECKSUM,
     migrate_dongxiao_schema,
 )
 from weimi_manager.sales_related.migrations import (
@@ -41,6 +42,7 @@ REQUIRED_TABLES = {
     "dongxiao_task_execution_items",
     "dongxiao_execution_attempts",
     "dongxiao_order_details",
+    "dongxiao_aftersale_status_history",
 }
 
 
@@ -77,10 +79,10 @@ def test_dongxiao_migration_creates_isolated_schema(
         }
         assert changed is True
         assert REQUIRED_TABLES.issubset(tables)
-        assert backups == ["pre-dongxiao-v4"]
+        assert backups == ["pre-dongxiao-v5"]
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations"
-        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]
         product_columns = {
             str(row[1])
             for row in conn.execute(
@@ -166,7 +168,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
             lambda label: backups.append(label) or backup,
         )
 
-        assert backups == ["pre-dongxiao-v4"]
+        assert backups == ["pre-dongxiao-v5"]
         assert conn.execute(
             "SELECT COUNT(*) FROM sales_audit_logs"
         ).fetchone()[0] == 1
@@ -178,7 +180,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
         ).fetchone()[0] == old_checksum
         assert conn.execute(
             "SELECT COUNT(*) FROM dongxiao_schema_migrations"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
     finally:
         conn.close()
 
@@ -260,6 +262,12 @@ def test_v4_checksum_is_frozen_for_published_migration() -> None:
     assert hashlib.sha256(
         migration_module._migration_v4_sql().encode("utf-8")
     ).hexdigest() == DONGXIAO_V4_CHECKSUM
+
+
+def test_v5_checksum_is_frozen_for_published_migration() -> None:
+    assert hashlib.sha256(
+        migration_module._migration_v5_sql().encode("utf-8")
+    ).hexdigest() == DONGXIAO_V5_CHECKSUM
 
 
 def test_failed_v3_migration_rolls_back_only_v3_and_keeps_v2_complete(
@@ -404,6 +412,185 @@ def test_failed_v4_migration_rolls_back_only_v4_and_keeps_v3_complete(
             "SELECT version FROM dongxiao_schema_migrations"
         ).fetchall() == [(1,), (2,), (3,)]
         assert "dongxiao_task_execution_items" not in tables
+    finally:
+        conn.close()
+
+
+def test_failed_v5_migration_rolls_back_only_v5_and_keeps_v4_complete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "rollback-v5.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE stores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id TEXT NOT NULL UNIQUE
+            );
+            INSERT INTO stores(app_id) VALUES('wx-store-11');
+            """
+        )
+        conn.commit()
+        migrations = list(migration_module._migrations())
+        monkeypatch.setattr(
+            migration_module,
+            "_migrations",
+            lambda: migrations[:4],
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "_verify_required_tables",
+            lambda _conn: None,
+        )
+        migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".backup"),
+        )
+        monkeypatch.undo()
+        failing_v5 = """
+            CREATE TABLE dongxiao_failure_probe_v5 (id INTEGER);
+            INSERT INTO table_that_does_not_exist(id) VALUES(1);
+        """
+        monkeypatch.setattr(
+            migration_module,
+            "_migration_v5_sql",
+            lambda: failing_v5,
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "DONGXIAO_V5_CHECKSUM",
+            hashlib.sha256(failing_v5.encode("utf-8")).hexdigest(),
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            migrate_dongxiao_schema(
+                conn,
+                path,
+                lambda _label: path.with_suffix(".backup"),
+            )
+
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "dongxiao_failure_probe_v5" not in tables
+        assert conn.execute(
+            "SELECT version FROM dongxiao_schema_migrations"
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        assert "dongxiao_aftersale_status_history" not in tables
+    finally:
+        conn.close()
+
+
+def test_v5_upgrades_v4_history_and_deduplicates_pending_approvals(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "upgrade-v5.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE stores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id TEXT NOT NULL UNIQUE
+            );
+            INSERT INTO stores(app_id) VALUES('wx-store-11');
+            """
+        )
+        conn.commit()
+        migrations = list(migration_module._migrations())
+        monkeypatch.setattr(
+            migration_module,
+            "_migrations",
+            lambda: migrations[:4],
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "_verify_required_tables",
+            lambda _conn: None,
+        )
+        migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".backup"),
+        )
+        monkeypatch.undo()
+        now = "2026-11-18T10:00:00+00:00"
+        conn.execute(
+            """
+            INSERT INTO dongxiao_aftersale_cases(
+                case_id, store_id, store_app_id, platform_case_id,
+                order_ref_id, status, requested_amount_cents,
+                approved_amount_cents, idempotency_key, source, reason,
+                created_at, updated_at, platform_status, after_sale_type,
+                paid_amount_cents, refunded_amount_cents,
+                inflight_amount_cents, details_json, last_synced_at
+            ) VALUES(
+                'case-v4', 1, 'wx-store-11', 'platform-case-v4',
+                NULL, 'approved', 3000, 3000, 'case-v4',
+                'platform_api', '历史审批', ?, ?, 'MERCHANT_PROCESSING',
+                'REFUND', 10000, 0, 0, '{}', ?
+            )
+            """,
+            (now, now, now),
+        )
+        for index in (1, 2):
+            conn.execute(
+                """
+                INSERT INTO dongxiao_approvals(
+                    approval_id, store_id, store_app_id, subject_type,
+                    subject_id, status, requested_by, requested_at,
+                    decided_by, decision_reason, decided_at, expires_at
+                ) VALUES(
+                    ?, 1, 'wx-store-11', 'aftersale', 'case-v4',
+                    'pending', 'operator', ?, '', '', NULL, NULL
+                )
+                """,
+                (f"approval-v4-{index}", now),
+            )
+        conn.commit()
+
+        assert migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".v5.backup"),
+        )
+
+        row = conn.execute(
+            """
+            SELECT status, platform_state, platform_state_updated_at
+            FROM dongxiao_aftersale_cases
+            WHERE case_id='case-v4'
+            """
+        ).fetchone()
+        assert row == ("approved", "approved", now)
+        statuses = [
+            str(item[0])
+            for item in conn.execute(
+                """
+                SELECT status FROM dongxiao_approvals
+                WHERE subject_id='case-v4'
+                ORDER BY approval_id
+                """
+            ).fetchall()
+        ]
+        assert statuses.count("pending") == 1
+        assert statuses.count("cancelled") == 1
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM dongxiao_aftersale_status_history
+            WHERE case_id='case-v4'
+            """
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]
     finally:
         conn.close()
 

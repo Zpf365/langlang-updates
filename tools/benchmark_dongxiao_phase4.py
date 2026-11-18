@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -31,11 +32,15 @@ from weimi_manager.dongxiao.domain.enums import (
     AftersaleStatus,
     DataSource,
     ProductState,
+    TaskItemStatus,
+    TaskStatus,
 )
 from weimi_manager.dongxiao.domain.models import (
     AftersaleCase,
     Product,
     Sku,
+    Task,
+    TaskExecutionItem,
 )
 from weimi_manager.dongxiao.infrastructure.executors import (
     LocalSkuValidationExecutor,
@@ -374,6 +379,79 @@ def benchmark_ui_responsiveness() -> dict[str, object]:
             pass
 
 
+def benchmark_restart_recovery(task_count: int = 200) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(Path(tmp) / "phase4-restart.db")
+        store_id = db.add_store(
+            "重启恢复店铺",
+            "wx-phase4-restart-benchmark",
+            "x" * 32,
+        )
+        store = db.get_store(store_id)
+        assert store is not None
+        repo = DongxiaoRepository(db.path)
+        now = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
+        for index in range(task_count):
+            task = Task(
+                task_id=f"restart-task-{index}",
+                store_id=store.id,
+                store_app_id=store.app_id,
+                task_type="restart_probe",
+                idempotency_key=f"restart-task-{index}",
+                status=TaskStatus.RUNNING,
+                total_items=1,
+                succeeded_items=0,
+                failed_items=0,
+                created_at=now,
+                updated_at=now,
+                execution_mode="local_safe",
+            )
+            repo.create_task_with_execution_items(
+                task,
+                [
+                    TaskExecutionItem(
+                        item_id=f"restart-item-{index}",
+                        task_id=task.task_id,
+                        store_id=store.id,
+                        store_app_id=store.app_id,
+                        subject_type="order",
+                        subject_id=f"order-{index}",
+                        status=TaskItemStatus.RUNNING,
+                        attempt_count=1,
+                        max_attempts=3,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                ],
+            )
+        recovery_ms, recovered = _elapsed_ms(
+            repo.recover_interrupted_tasks
+        )
+        tasks = repo.list_tasks(store.id, limit=1000)
+        conn = sqlite3.connect(db.path)
+        try:
+            pending_items = int(
+                conn.execute(
+                """
+                SELECT COUNT(*) FROM dongxiao_task_execution_items
+                WHERE status='pending'
+                """
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        return {
+            "interrupted_tasks": task_count,
+            "recovery_ms": recovery_ms,
+            "recovered_tasks": recovered,
+            "preparing_tasks": sum(
+                task.status is TaskStatus.PREPARING for task in tasks
+            ),
+            "pending_items": pending_items,
+            "errors": 0,
+        }
+
+
 def main() -> int:
     print(
         json.dumps(
@@ -387,6 +465,7 @@ def main() -> int:
                 "orders": benchmark_orders(),
                 "aftersales": benchmark_aftersale_rules(),
                 "ui": benchmark_ui_responsiveness(),
+                "restart_recovery": benchmark_restart_recovery(),
             },
             ensure_ascii=False,
             indent=2,

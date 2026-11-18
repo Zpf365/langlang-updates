@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
@@ -642,3 +643,262 @@ def test_runtime_starts_only_for_recoverable_tasks_and_resumes_after_restart(
         assert idle_runtime.start_if_needed() is False
     finally:
         idle_runtime.stop()
+
+
+def test_batch_executor_exception_leaves_no_running_items(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "phase4-batch-exception.db")
+    store = _store(db)
+    repo, pool_id = _seed_pool(db, store)
+    task, _created = DongxiaoTaskService(
+        repo
+    ).create_pool_validation_task(
+        store,
+        pool_id,
+        idempotency_key="batch-exception",
+        actor_id="operator",
+        max_attempts=2,
+    )
+
+    class BrokenBatchExecutor:
+        def execute_batch(self, items):
+            del items
+            raise RuntimeError("batch failed before per-item result")
+
+    scheduler = DongxiaoTaskScheduler(
+        repo,
+        BrokenBatchExecutor(),
+        retry_policy=RetryPolicy(base_delay_seconds=0, max_delay_seconds=0),
+        poll_interval_seconds=0.02,
+    )
+
+    assert scheduler.run_until_idle(timeout=5) is True
+
+    saved = repo.get_task(task.task_id, store_app_id=store.app_id)
+    assert saved is not None
+    assert saved.status is TaskStatus.FAILED
+    items = repo.list_task_execution_items(
+        task.task_id,
+        store_app_id=store.app_id,
+    )
+    assert all(item.status is TaskItemStatus.FAILED for item in items)
+    assert all(item.attempt_count == 2 for item in items)
+
+
+def test_platform_write_batch_exception_becomes_unknown(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "phase4-batch-write-unknown.db")
+    store = _store(db)
+    now = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
+    repo = DongxiaoRepository(db.path)
+    task = Task(
+        task_id="write-batch-task",
+        store_id=store.id,
+        store_app_id=store.app_id,
+        task_type="platform_write",
+        idempotency_key="write-batch-task",
+        status=TaskStatus.PENDING,
+        total_items=1,
+        succeeded_items=0,
+        failed_items=0,
+        created_at=now,
+        updated_at=now,
+        execution_mode="platform_write",
+    )
+    repo.create_task_with_execution_items(
+        task,
+        [
+            TaskExecutionItem(
+                item_id="write-batch-item",
+                task_id=task.task_id,
+                store_id=store.id,
+                store_app_id=store.app_id,
+                subject_type="aftersale",
+                subject_id="case-write",
+                status=TaskItemStatus.PENDING,
+                attempt_count=0,
+                max_attempts=1,
+                created_at=now,
+                updated_at=now,
+            )
+        ],
+    )
+
+    class BrokenBatchExecutor:
+        def execute_batch(self, items):
+            del items
+            raise TimeoutError("write status unknown")
+
+    scheduler = DongxiaoTaskScheduler(
+        repo,
+        BrokenBatchExecutor(),
+        poll_interval_seconds=0.02,
+    )
+    assert scheduler.run_until_idle(timeout=5) is True
+
+    saved = repo.get_task(task.task_id, store_app_id=store.app_id)
+    assert saved is not None
+    assert saved.status is TaskStatus.UNKNOWN
+    item = repo.list_task_execution_items(
+        task.task_id,
+        store_app_id=store.app_id,
+    )[0]
+    assert item.status is TaskItemStatus.UNKNOWN
+
+
+def test_task_and_items_creation_rolls_back_on_midway_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = Database(tmp_path / "phase4-task-atomic-create.db")
+    store = _store(db)
+    repo, pool_id = _seed_pool(db, store)
+    service = DongxiaoTaskService(repo)
+    original = repo._insert_task_execution_items_in_connection
+
+    def fail_after_first(conn, items):
+        original(conn, items[:1])
+        raise RuntimeError("simulated crash while inserting task items")
+
+    monkeypatch.setattr(
+        repo,
+        "_insert_task_execution_items_in_connection",
+        fail_after_first,
+    )
+    with pytest.raises(RuntimeError):
+        service.create_pool_validation_task(
+            store,
+            pool_id,
+            idempotency_key="atomic-task",
+            actor_id="operator",
+        )
+
+    with sqlite3.connect(db.path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dongxiao_tasks"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dongxiao_task_execution_items"
+        ).fetchone()[0] == 0
+
+
+def test_expired_task_lease_recovers_without_losing_completed_items(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "phase4-task-lease-recovery.db")
+    store = _store(db)
+    repo, pool_id = _seed_pool(db, store)
+    task, _created = DongxiaoTaskService(
+        repo
+    ).create_pool_validation_task(
+        store,
+        pool_id,
+        idempotency_key="lease-recovery",
+        actor_id="operator",
+    )
+    repo.transition_task(
+        task.task_id,
+        store_id=store.id,
+        store_app_id=store.app_id,
+        event="start_preparing",
+    )
+    repo.transition_task(
+        task.task_id,
+        store_id=store.id,
+        store_app_id=store.app_id,
+        event="start_running",
+    )
+    claimed = repo.claim_next_execution_item(
+        task.task_id,
+        store_app_id=store.app_id,
+        owner="worker-1",
+    )
+    assert claimed is not None
+    repo.finish_task_execution_item(
+        claimed.item_id,
+        store_app_id=store.app_id,
+        status=TaskItemStatus.SUCCEEDED,
+        result={"ok": True},
+    )
+    running = repo.claim_next_execution_item(
+        task.task_id,
+        store_app_id=store.app_id,
+        owner="worker-1",
+    )
+    assert running is not None
+    with sqlite3.connect(db.path) as conn:
+        conn.execute(
+            """
+            UPDATE dongxiao_tasks
+            SET lease_owner='worker-1', lease_expires_at=?
+            WHERE task_id=?
+            """,
+            ("2000-01-01T00:00:00+00:00", task.task_id),
+        )
+        conn.commit()
+
+    assert repo.recover_expired_task_leases() == 1
+    saved = repo.get_task(task.task_id, store_app_id=store.app_id)
+    assert saved is not None
+    assert saved.status is TaskStatus.PREPARING
+    items = repo.list_task_execution_items(
+        task.task_id,
+        store_app_id=store.app_id,
+    )
+    assert items[0].status is TaskItemStatus.SUCCEEDED
+    assert items[1].status is TaskItemStatus.PENDING
+
+
+def test_expired_platform_write_lease_becomes_unknown(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "phase4-platform-lease-recovery.db")
+    store = _store(db)
+    repo = DongxiaoRepository(db.path)
+    now = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
+    task = Task(
+        task_id="platform-lease-task",
+        store_id=store.id,
+        store_app_id=store.app_id,
+        task_type="platform_write",
+        idempotency_key="platform-lease-task",
+        status=TaskStatus.RUNNING,
+        total_items=1,
+        succeeded_items=0,
+        failed_items=0,
+        created_at=now,
+        updated_at=now,
+        execution_mode="platform_write",
+        lease_owner="crashed-worker",
+        lease_expires_at=datetime(2000, 1, 1, tzinfo=UTC),
+    )
+    repo.create_task_with_execution_items(
+        task,
+        [
+            TaskExecutionItem(
+                item_id="platform-lease-item",
+                task_id=task.task_id,
+                store_id=store.id,
+                store_app_id=store.app_id,
+                subject_type="aftersale",
+                subject_id="platform-case",
+                status=TaskItemStatus.RUNNING,
+                attempt_count=1,
+                max_attempts=1,
+                created_at=now,
+                updated_at=now,
+            )
+        ],
+    )
+
+    assert repo.recover_expired_task_leases() == 1
+    saved = repo.get_task(task.task_id, store_app_id=store.app_id)
+    assert saved is not None
+    assert saved.status is TaskStatus.UNKNOWN
+    item = repo.list_task_execution_items(
+        task.task_id,
+        store_app_id=store.app_id,
+    )[0]
+    assert item.status is TaskItemStatus.UNKNOWN

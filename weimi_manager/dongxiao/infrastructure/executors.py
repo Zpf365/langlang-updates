@@ -21,7 +21,10 @@ from ..domain.rules import (
     SkuSelectionMode,
     select_sku,
 )
-from ..infrastructure.repository import DongxiaoRepository
+from ..infrastructure.repository import (
+    DongxiaoRepository,
+    EntityNotFound,
+)
 
 
 class LocalSkuValidationExecutor:
@@ -250,10 +253,21 @@ class CompositeTaskExecutor:
         return self.local_sku.verify(item)
 
     def _store(self, item: TaskExecutionItem):
-        identity = self.repository.get_store_identity(
-            item.store_id,
-            item.store_app_id,
-        )
+        if item.store_id is None:
+            raise TaskExecutionError(
+                "store_deleted",
+                "店铺已删除，禁止继续平台或业务执行",
+            )
+        try:
+            identity = self.repository.get_store_identity(
+                item.store_id,
+                item.store_app_id,
+            )
+        except EntityNotFound as exc:
+            raise TaskExecutionError(
+                "store_deleted",
+                "店铺已删除，禁止继续平台或业务执行",
+            ) from exc
         return SimpleNamespace(
             id=identity["id"],
             name=identity["name"],
@@ -278,6 +292,7 @@ class AftersaleDecisionExecutor:
                 "unsupported_subject",
                 "售后执行器不支持当前任务对象",
             )
+        store = self._store(item)
         case = self.repository.get_aftersale_case(
             item.store_id,
             item.subject_id,
@@ -310,9 +325,23 @@ class AftersaleDecisionExecutor:
             case,
             approved_amount_cents=amount,
         )
-        store = self._store(item)
         action = str(item.payload.get("action") or "")
         previous_status = case.platform_status
+        target_statuses = _target_platform_statuses(
+            action,
+            case.after_sale_type,
+            (
+                int(item.payload["accept_type"])
+                if item.payload.get("accept_type") is not None
+                else None
+            ),
+        )
+        if not target_statuses:
+            raise TaskExecutionError(
+                "unknown_target_state",
+                "无法根据售后类型确定平台操作目标状态",
+                unknown=True,
+            )
         try:
             if action == "accept":
                 self.adapter.accept_aftersale(
@@ -390,6 +419,12 @@ class AftersaleDecisionExecutor:
                 "平台写请求后状态未变化，需人工核验",
                 unknown=True,
             )
+        if verified.platform_status not in target_statuses:
+            raise TaskExecutionError(
+                "aftersale_target_state_mismatch",
+                "平台状态变化但未达到当前操作的目标状态",
+                unknown=True,
+            )
         return {
             "case_id": verified.platform_case_id,
             "platform_status": verified.platform_status,
@@ -397,10 +432,21 @@ class AftersaleDecisionExecutor:
         }
 
     def _store(self, item: TaskExecutionItem):
-        identity = self.repository.get_store_identity(
-            item.store_id,
-            item.store_app_id,
-        )
+        if item.store_id is None:
+            raise TaskExecutionError(
+                "store_deleted",
+                "禁止对已删除店铺执行平台写操作",
+            )
+        try:
+            identity = self.repository.get_store_identity(
+                item.store_id,
+                item.store_app_id,
+            )
+        except EntityNotFound as exc:
+            raise TaskExecutionError(
+                "store_deleted",
+                "店铺已删除，禁止继续平台或业务执行",
+            ) from exc
         return SimpleNamespace(
             id=identity["id"],
             name=identity["name"],
@@ -427,8 +473,75 @@ class AftersaleDecisionExecutor:
                 "重新核验后平台状态未变化，继续维持结果未知",
                 unknown=True,
             )
+        target_statuses = _target_platform_statuses(
+            str(item.payload.get("action") or ""),
+            verified.after_sale_type,
+            (
+                int(item.payload["accept_type"])
+                if item.payload.get("accept_type") is not None
+                else None
+            ),
+        )
+        if not target_statuses:
+            raise TaskExecutionError(
+                "unknown_target_state",
+                "无法根据售后类型确定平台操作目标状态",
+                unknown=True,
+            )
+        if verified.platform_status not in target_statuses:
+            raise TaskExecutionError(
+                "aftersale_target_state_mismatch",
+                "远端状态变化但未达到当前操作的目标状态",
+                unknown=True,
+            )
         return {
             "verified": True,
             "case_id": verified.platform_case_id,
             "platform_status": verified.platform_status,
         }
+
+
+def _target_platform_statuses(
+    action: str,
+    after_sale_type: str,
+    accept_type: int | None,
+) -> frozenset[str]:
+    normalized_action = str(action or "").upper()
+    normalized_type = str(after_sale_type or "").upper()
+    if normalized_action == "REJECT":
+        return frozenset(
+            {
+                "MERCHANT_REJECT_REFUND",
+                "MERCHANT_REJECT_RETURN",
+                "MERCHANT_REJECT_EXCHANGE",
+                "MERCHANT_REJECT_RESHIP",
+            }
+        )
+    if normalized_action != "ACCEPT":
+        return frozenset()
+    refund_states = {
+        "PLATFORM_REFUNDING",
+        "MERCHANT_REFUND_SUCCESS",
+        "MERCHANT_RETURN_SUCCESS",
+    }
+    if accept_type in {2, 3}:
+        return frozenset(refund_states)
+    if normalized_type == "REFUND":
+        return frozenset(refund_states)
+    if normalized_type == "RETURN":
+        return frozenset(
+            {
+                "USER_WAIT_RETURN",
+                "MERCHANT_WAIT_RECEIPT",
+                "PLATFORM_REFUNDING",
+                "MERCHANT_RETURN_SUCCESS",
+            }
+        )
+    if normalized_type == "EXCHANGE":
+        return frozenset(
+            {
+                "USER_WAIT_RECEIPT",
+                "MERCHANT_EXCHANGE_SUCCESS",
+            }
+        )
+    return frozenset()

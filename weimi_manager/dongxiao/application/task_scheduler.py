@@ -19,6 +19,7 @@ from ..domain.models import (
     TaskExecutionItem,
 )
 from ..domain.operations import TaskExecutionError
+from ..domain.rules import require_permission
 from ..infrastructure.repository import DongxiaoRepository
 
 
@@ -80,6 +81,7 @@ class DongxiaoTaskScheduler:
 
     def start(self) -> None:
         self.repository.recover_interrupted_tasks()
+        self.repository.recover_expired_task_leases()
         with self._lock:
             if self._dispatcher and self._dispatcher.is_alive():
                 return
@@ -139,7 +141,12 @@ class DongxiaoTaskScheduler:
         *,
         store_app_id: str,
         actor_id: str = "",
+        permission_checker=None,
     ) -> tuple[Task, int]:
+        require_permission(
+            permission_checker,
+            "dongxiao_task_verify_unknown",
+        )
         task = self.repository.get_task(
             task_id,
             store_app_id=store_app_id,
@@ -209,7 +216,11 @@ class DongxiaoTaskScheduler:
         return recovered, verified_count
 
     def _dispatch_loop(self) -> None:
+        last_lease_recovery = time.monotonic()
         while not self._stopping.is_set():
+            if time.monotonic() - last_lease_recovery >= 5:
+                self.repository.recover_expired_task_leases()
+                last_lease_recovery = time.monotonic()
             self._dispatch_due()
             self._wake.wait(self.poll_interval_seconds)
             self._wake.clear()
@@ -293,6 +304,12 @@ class DongxiaoTaskScheduler:
                     actor_id="scheduler",
                     reason=f"调度器内部异常：{exc}",
                 )
+        finally:
+            self.repository.release_task_lease(
+                task.task_id,
+                store_app_id=task.store_app_id,
+                owner=self.worker_id,
+            )
 
     def _execute_task_impl(self, task: Task) -> None:
         current = self.repository.get_task(
@@ -321,6 +338,13 @@ class DongxiaoTaskScheduler:
             )
         if current.status is not TaskStatus.RUNNING:
             return
+        if not self.repository.claim_task_lease(
+            current.task_id,
+            store_app_id=current.store_app_id,
+            owner=self.worker_id,
+        ):
+            return
+        lease_refresh_at = time.monotonic()
         persisted_items = self.repository.list_task_execution_items(
             current.task_id,
             store_app_id=current.store_app_id,
@@ -359,6 +383,14 @@ class DongxiaoTaskScheduler:
         )
         batch_execute = getattr(self.executor, "execute_batch", None)
         while not self._stopping.is_set():
+            if time.monotonic() - lease_refresh_at >= 60:
+                if not self.repository.claim_task_lease(
+                    current.task_id,
+                    store_app_id=current.store_app_id,
+                    owner=self.worker_id,
+                ):
+                    return
+                lease_refresh_at = time.monotonic()
             latest = self.repository.get_task(
                 current.task_id,
                 store_app_id=current.store_app_id,
@@ -374,11 +406,23 @@ class DongxiaoTaskScheduler:
                     current.task_id,
                     store_app_id=current.store_app_id,
                     owner=self.worker_id,
-                    limit=100,
+                    limit=500,
                 )
                 if not batch:
                     break
-                batch_results = dict(batch_execute(batch) or {})
+                try:
+                    batch_results = dict(batch_execute(batch) or {})
+                except Exception as exc:
+                    batch_error = TaskExecutionError(
+                        "batch_executor_exception",
+                        str(exc),
+                        retryable=current.execution_mode != "platform_write",
+                        unknown=current.execution_mode == "platform_write",
+                    )
+                    batch_results = {
+                        item.item_id: (None, batch_error)
+                        for item in batch
+                    }
                 if not batch_results:
                     for item in batch:
                         self._execute_item(item)
@@ -551,7 +595,35 @@ class DongxiaoTaskScheduler:
             item.status is TaskItemStatus.SUCCEEDED for item in items
         )
         failed = sum(item.status is TaskItemStatus.FAILED for item in items)
-        pending = [item for item in items if item.status is TaskItemStatus.PENDING]
+        running_items = [
+            item
+            for item in items
+            if item.status is TaskItemStatus.RUNNING
+        ]
+        if running_items:
+            recovered_status = self.repository.recover_running_task_items(
+                task.task_id,
+                store_app_id=task.store_app_id,
+            )
+            if recovered_status == "pending":
+                self.repository.update_task_progress(
+                    task.task_id,
+                    store_id=current.store_id,
+                    store_app_id=current.store_app_id,
+                    succeeded_items=succeeded,
+                    failed_items=failed,
+                    status_reason="已回收未完成执行明细，等待安全重试",
+                    last_error="任务结束检查发现 RUNNING 明细",
+                )
+            return
+        pending = [
+            item
+            for item in items
+            if item.status in {
+                TaskItemStatus.PENDING,
+                TaskItemStatus.RUNNING,
+            }
+        ]
         unknown = any(item.status is TaskItemStatus.UNKNOWN for item in items)
         next_attempt_at = min(
             (

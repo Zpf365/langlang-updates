@@ -42,6 +42,33 @@ class DongxiaoOrderService:
         )
         saved = 0
         errors: list[str] = []
+        pending_records: list[OrderRecord] = []
+
+        def flush() -> None:
+            nonlocal saved
+            if not pending_records:
+                return
+            try:
+                saved += self.repository.upsert_order_records_batch(
+                    pending_records
+                )
+            except Exception as exc:
+                for record in pending_records:
+                    try:
+                        self.repository.upsert_order_record(
+                            record,
+                            request_id=f"order:{record.platform_order_id}",
+                        )
+                        saved += 1
+                    except Exception as item_exc:
+                        errors.append(
+                            f"{record.platform_order_id}: "
+                            f"批量失败后单项保存失败: {item_exc}"
+                        )
+                errors.append(f"订单批量保存失败，已回退逐项保存: {exc}")
+            finally:
+                pending_records.clear()
+
         for index, order_id in enumerate(ids, 1):
             if progress:
                 progress(
@@ -50,10 +77,15 @@ class DongxiaoOrderService:
                     len(ids),
                 )
             try:
-                self.sync_order(store, str(order_id))
-                saved += 1
+                order = self.adapter.get_order(store, str(order_id))
+                if str(order.order_id) != str(order_id):
+                    raise ValueError("订单详情返回的订单号与请求不一致")
+                pending_records.append(self._map_order(store, order))
+                if len(pending_records) >= 100:
+                    flush()
             except Exception as exc:
                 errors.append(f"{order_id}: {exc}")
+        flush()
         return OperationSyncResult(
             discovered=len(ids),
             saved=saved,
@@ -86,6 +118,11 @@ class DongxiaoOrderService:
         return self.repository.get_order_record(
             int(store.id),
             str(order_id),
+        )
+
+    def list_history(self, store_app_id: str) -> list[OrderRecord]:
+        return self.repository.list_order_records_by_store_app_id(
+            str(store_app_id)
         )
 
     def _map_order(self, store, order) -> OrderRecord:

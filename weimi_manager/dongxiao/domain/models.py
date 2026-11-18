@@ -40,6 +40,12 @@ def _store_id(value: object) -> int:
     return value
 
 
+def _optional_store_id(value: object) -> int | None:
+    if value is None:
+        return None
+    return _store_id(value)
+
+
 def _quantity(
     value: object,
     field_name: str,
@@ -414,7 +420,7 @@ class ProductPoolEvent:
 @dataclass(frozen=True, slots=True)
 class Task:
     task_id: str
-    store_id: int
+    store_id: int | None
     store_app_id: str
     task_type: str
     idempotency_key: str
@@ -438,7 +444,7 @@ class Task:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", _required_text(self.task_id, "任务 ID"))
-        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(self, "store_id", _optional_store_id(self.store_id))
         object.__setattr__(self, "store_app_id", _required_text(self.store_app_id, "店铺 AppID"))
         object.__setattr__(self, "task_type", _required_text(self.task_type, "任务类型"))
         object.__setattr__(
@@ -542,7 +548,7 @@ class TaskItem:
 class TaskExecutionItem:
     item_id: str
     task_id: str
-    store_id: int
+    store_id: int | None
     store_app_id: str
     subject_type: str
     subject_id: str
@@ -572,7 +578,7 @@ class TaskExecutionItem:
             "task_id",
             _required_text(self.task_id, "任务 ID"),
         )
-        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(self, "store_id", _optional_store_id(self.store_id))
         object.__setattr__(
             self,
             "store_app_id",
@@ -782,7 +788,7 @@ class OrderStatusSnapshot:
 @dataclass(frozen=True, slots=True)
 class OrderRecord:
     order_ref_id: str
-    store_id: int
+    store_id: int | None
     store_app_id: str
     platform_order_id: str
     status: OrderStatus
@@ -804,7 +810,7 @@ class OrderRecord:
             "order_ref_id",
             _required_text(self.order_ref_id, "订单引用 ID"),
         )
-        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(self, "store_id", _optional_store_id(self.store_id))
         object.__setattr__(
             self,
             "store_app_id",
@@ -869,7 +875,7 @@ class OrderRecord:
 @dataclass(frozen=True, slots=True)
 class AftersaleCase:
     case_id: str
-    store_id: int
+    store_id: int | None
     store_app_id: str
     platform_case_id: str
     status: AftersaleStatus
@@ -882,7 +888,10 @@ class AftersaleCase:
     source: str = "unknown"
     reason: str = ""
     platform_status: str = ""
+    platform_reason: str = ""
     platform_order_id: str = ""
+    platform_state: AftersaleStatus = AftersaleStatus.UNKNOWN
+    platform_state_updated_at: datetime | None = None
     after_sale_type: str = ""
     paid_amount_cents: int = 0
     refunded_amount_cents: int = 0
@@ -894,7 +903,7 @@ class AftersaleCase:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "case_id", _required_text(self.case_id, "售后工单 ID"))
-        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(self, "store_id", _optional_store_id(self.store_id))
         object.__setattr__(self, "store_app_id", _required_text(self.store_app_id, "店铺 AppID"))
         object.__setattr__(
             self,
@@ -935,6 +944,16 @@ class AftersaleCase:
         )
         object.__setattr__(
             self,
+            "platform_reason",
+            str(self.platform_reason or "")[:1000],
+        )
+        object.__setattr__(
+            self,
+            "platform_state",
+            AftersaleStatus(self.platform_state),
+        )
+        object.__setattr__(
+            self,
             "platform_order_id",
             str(self.platform_order_id or ""),
         )
@@ -966,6 +985,7 @@ class AftersaleCase:
             ("售后截止时间", self.deadline),
             ("售后完成时间", self.complete_time),
             ("售后同步时间", self.last_synced_at),
+            ("平台状态更新时间", self.platform_state_updated_at),
         ):
             if value is not None:
                 object.__setattr__(
@@ -974,6 +994,7 @@ class AftersaleCase:
                         "售后截止时间": "deadline",
                         "售后完成时间": "complete_time",
                         "售后同步时间": "last_synced_at",
+                "平台状态更新时间": "platform_state_updated_at",
                     }[field_name],
                     ensure_utc(value, field=field_name),
                 )
@@ -998,7 +1019,7 @@ class AftersaleCase:
 @dataclass(frozen=True, slots=True)
 class Approval:
     approval_id: str
-    store_id: int
+    store_id: int | None
     store_app_id: str
     subject_type: ApprovalSubjectType
     subject_id: str
@@ -1012,7 +1033,7 @@ class Approval:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "approval_id", _required_text(self.approval_id, "审批 ID"))
-        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(self, "store_id", _optional_store_id(self.store_id))
         object.__setattr__(self, "store_app_id", _required_text(self.store_app_id, "店铺 AppID"))
         object.__setattr__(self, "subject_type", ApprovalSubjectType(self.subject_type))
         object.__setattr__(self, "subject_id", _required_text(self.subject_id, "审批对象 ID"))

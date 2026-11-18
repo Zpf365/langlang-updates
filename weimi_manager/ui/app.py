@@ -326,13 +326,20 @@ class MainWindow(tk.Tk):
         else:
             self.service = base_service
             self.web_session = base_web_session
+        self.dongxiao_runtime = None
+        self.dongxiao_runtime_error = ""
         try:
             self.dongxiao_runtime = DongxiaoRuntime(
                 self.base_db.path,
                 self.service,
             )
-        except Exception:
-            self.dongxiao_runtime = None
+        except Exception as exc:
+            self.dongxiao_runtime_error = str(exc)
+            self.diagnostics.capture_exception(
+                exc,
+                category="dongxiao_runtime",
+                detail={"operation": "initialize"},
+            )
         self._task_queue: queue.Queue[tuple[Callable[..., Any], tuple[Any, ...]]] = queue.Queue()
         self._nav_buttons: dict[str, tk.Button] = {}
         self._page_icon_names: dict[str, str] = {}
@@ -1838,7 +1845,7 @@ class MainWindow(tk.Tk):
         self.destroy()
 
     def _start_dongxiao_runtime(self) -> None:
-        runtime = getattr(self, "dongxiao_runtime", None)
+        runtime = self.ensure_dongxiao_runtime()
         if runtime is None:
             return
         try:
@@ -1851,6 +1858,31 @@ class MainWindow(tk.Tk):
                     category="dongxiao_runtime",
                     detail={"operation": "start"},
                 )
+
+    def ensure_dongxiao_runtime(self):
+        runtime = getattr(self, "dongxiao_runtime", None)
+        if runtime is not None:
+            return runtime
+        try:
+            runtime = DongxiaoRuntime(
+                self.base_db.path,
+                self.service,
+            )
+            runtime.start_if_needed()
+        except Exception as exc:
+            self.dongxiao_runtime = None
+            self.dongxiao_runtime_error = str(exc)
+            diagnostics = getattr(self, "diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.capture_exception(
+                    exc,
+                    category="dongxiao_runtime",
+                    detail={"operation": "retry_initialize"},
+                )
+            return None
+        self.dongxiao_runtime = runtime
+        self.dongxiao_runtime_error = ""
+        return runtime
 
     def _toggle_auto_refresh(self) -> None:
         self.auto_refresh_enabled = bool(self.auto_refresh_var.get())

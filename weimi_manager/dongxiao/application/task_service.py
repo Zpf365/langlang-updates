@@ -95,28 +95,29 @@ class DongxiaoTaskService:
             max_attempts=int(max_attempts),
             execution_mode="local_safe",
         )
-        saved, created = self.repository.create_task(task)
-        if created:
-            items = [
-                TaskExecutionItem(
-                    item_id=uuid.uuid4().hex,
-                    task_id=saved.task_id,
-                    store_id=saved.store_id,
-                    store_app_id=saved.store_app_id,
-                    subject_type="product",
-                    subject_id=str(row["product_id"]),
-                    product_id=str(row["product_id"]),
-                    sku_id=str(row["sku_id"] or ""),
-                    status=TaskItemStatus.PENDING,
-                    attempt_count=0,
-                    max_attempts=saved.max_attempts,
-                    created_at=now,
-                    updated_at=now,
-                    payload={"quantity": quantity},
-                )
-                for row in rows
-            ]
-            self.repository.add_task_execution_items(items)
+        items = [
+            TaskExecutionItem(
+                item_id=uuid.uuid4().hex,
+                task_id=task.task_id,
+                store_id=int(store.id),
+                store_app_id=str(store.app_id),
+                subject_type="product",
+                subject_id=str(row["product_id"]),
+                product_id=str(row["product_id"]),
+                sku_id=str(row["sku_id"] or ""),
+                status=TaskItemStatus.PENDING,
+                attempt_count=0,
+                max_attempts=task.max_attempts,
+                created_at=now,
+                updated_at=now,
+                payload={"quantity": quantity},
+            )
+            for row in rows
+        ]
+        saved, created = self.repository.create_task_with_execution_items(
+            task,
+            items,
+        )
         return saved, created
 
     def list_items(self, task_id: str, *, store) -> list[TaskExecutionItem]:
@@ -135,6 +136,11 @@ class DongxiaoTaskService:
 
     def list_tasks(self, store) -> list[Task]:
         return self.repository.list_tasks(int(store.id))
+
+    def list_history(self, store_app_id: str) -> list[Task]:
+        return self.repository.list_tasks_by_store_app_id(
+            str(store_app_id)
+        )
 
     def statistics(self, store):
         return self.repository.task_statistics(int(store.id))
@@ -420,27 +426,27 @@ class DongxiaoTaskService:
             max_attempts=int(max_attempts),
             execution_mode=execution_mode,
         )
-        saved, created = self.repository.create_task(task)
-        if created:
-            self.repository.add_task_execution_items(
-                [
-                    TaskExecutionItem(
-                        item_id=uuid.uuid4().hex,
-                        task_id=saved.task_id,
-                        store_id=saved.store_id,
-                        store_app_id=saved.store_app_id,
-                        subject_type=subject_type,
-                        subject_id=subject_id,
-                        product_id=product_id,
-                        sku_id=sku_id,
-                        status=TaskItemStatus.PENDING,
-                        attempt_count=0,
-                        max_attempts=saved.max_attempts,
-                        created_at=now,
-                        updated_at=now,
-                        payload=payload,
-                    )
-                    for subject_id, product_id, sku_id in subjects
-                ]
+        items = [
+            TaskExecutionItem(
+                item_id=uuid.uuid4().hex,
+                task_id=task.task_id,
+                store_id=int(store.id),
+                store_app_id=str(store.app_id),
+                subject_type=subject_type,
+                subject_id=subject_id,
+                product_id=product_id,
+                sku_id=sku_id,
+                status=TaskItemStatus.PENDING,
+                attempt_count=0,
+                max_attempts=task.max_attempts,
+                created_at=now,
+                updated_at=now,
+                payload=payload,
             )
+            for subject_id, product_id, sku_id in subjects
+        ]
+        saved, created = self.repository.create_task_with_execution_items(
+            task,
+            items,
+        )
         return saved, created

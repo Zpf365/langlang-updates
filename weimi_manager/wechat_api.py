@@ -21,6 +21,7 @@ from .db import order_status_text, product_status_text
 from .models import Order, OrderItem, Product, ShippingAccount, ShippingTemplate, Store
 
 API_ROOT = "https://api.weixin.qq.com"
+MAX_LIST_PAGES = 1000
 TOKEN_PATH = "/cgi-bin/stable_token"
 ORDER_LIST_PATH = "/channels/ec/order/list/get"
 ORDER_DETAIL_PATH = "/channels/ec/order/get"
@@ -241,7 +242,8 @@ class WechatShopClient:
             raise ValueError("单次订单查询时间范围不能超过 7 天")
         ids: list[str] = []
         next_key = ""
-        while True:
+        seen_keys: set[str] = set()
+        for page_number in range(1, MAX_LIST_PAGES + 1):
             payload: dict[str, Any] = {
                 "create_time_range": {
                     "start_time": int(start_time),
@@ -256,9 +258,23 @@ class WechatShopClient:
             result = self._post_api(ORDER_LIST_PATH, payload)
             page_ids = [str(value) for value in result.get("order_id_list", [])]
             ids.extend(page_ids)
+            has_more = result.get("has_more")
             next_key = str(result.get("next_key") or "")
-            if not result.get("has_more") or not next_key:
+            if has_more is False:
                 break
+            if not next_key:
+                if has_more is True:
+                    raise WechatApiError(
+                        "订单分页返回 has_more=true 但缺少 next_key"
+                    )
+                break
+            if next_key in seen_keys:
+                raise WechatApiError("订单分页游标重复，已停止同步")
+            seen_keys.add(next_key)
+        else:
+            raise WechatApiError(
+                f"订单分页超过最大页数 {MAX_LIST_PAGES}"
+            )
         return _unique(ids)
 
     def fetch_order_ids_by_update(
@@ -270,7 +286,8 @@ class WechatShopClient:
             raise ValueError("单次订单更新时间查询不能超过 7 天")
         ids: list[str] = []
         next_key = ""
-        while True:
+        seen_keys: set[str] = set()
+        for _page_number in range(1, MAX_LIST_PAGES + 1):
             payload: dict[str, Any] = {
                 "update_time_range": {
                     "start_time": int(start_time),
@@ -282,9 +299,23 @@ class WechatShopClient:
                 payload["next_key"] = next_key
             result = self._post_api(ORDER_LIST_PATH, payload)
             ids.extend(str(value) for value in result.get("order_id_list", []))
+            has_more = result.get("has_more")
             next_key = str(result.get("next_key") or "")
-            if not result.get("has_more") or not next_key:
+            if has_more is False:
                 break
+            if not next_key:
+                if has_more is True:
+                    raise WechatApiError(
+                        "订单分页返回 has_more=true 但缺少 next_key"
+                    )
+                break
+            if next_key in seen_keys:
+                raise WechatApiError("订单分页游标重复，已停止同步")
+            seen_keys.add(next_key)
+        else:
+            raise WechatApiError(
+                f"订单分页超过最大页数 {MAX_LIST_PAGES}"
+            )
         return _unique(ids)
 
     def fetch_order(self, store: Store, order_id: str) -> Order:
@@ -298,7 +329,7 @@ class WechatShopClient:
         ids: list[str] = []
         next_key = ""
         seen_keys = set()
-        while True:
+        for _page_number in range(1, MAX_LIST_PAGES + 1):
             page = self.fetch_product_id_page(next_key, status)
             ids.extend(page.ids)
             next_key = page.next_key
@@ -307,6 +338,10 @@ class WechatShopClient:
             if next_key in seen_keys:
                 raise WechatApiError("微信商品分页游标重复，未能读取完整商品目录")
             seen_keys.add(next_key)
+        else:
+            raise WechatApiError(
+                f"商品分页超过最大页数 {MAX_LIST_PAGES}"
+            )
         return _unique(ids)
 
     def fetch_product_id_page(
@@ -367,7 +402,8 @@ class WechatShopClient:
             raise ValueError("售后单查询时间范围不能超过 24 小时")
         ids: list[str] = []
         next_key = ""
-        while True:
+        seen_keys: set[str] = set()
+        for _page_number in range(1, MAX_LIST_PAGES + 1):
             prefix = "update" if time_field == "update" else "create"
             payload: dict[str, Any] = {
                 f"begin_{prefix}_time": int(start_time),
@@ -377,9 +413,23 @@ class WechatShopClient:
                 payload["next_key"] = next_key
             result = self._post_api(AFTER_SALE_LIST_PATH, payload)
             ids.extend(str(value) for value in result.get("after_sale_order_id_list", []))
+            has_more = result.get("has_more")
             next_key = str(result.get("next_key") or "")
-            if not result.get("has_more") or not next_key:
+            if has_more is False:
                 break
+            if not next_key:
+                if has_more is True:
+                    raise WechatApiError(
+                        "售后分页返回 has_more=true 但缺少 next_key"
+                    )
+                break
+            if next_key in seen_keys:
+                raise WechatApiError("售后分页游标重复，已停止同步")
+            seen_keys.add(next_key)
+        else:
+            raise WechatApiError(
+                f"售后分页超过最大页数 {MAX_LIST_PAGES}"
+            )
         return _unique(ids)
 
     def fetch_after_sale(self, after_sale_id: str) -> dict[str, Any]:

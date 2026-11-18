@@ -6,7 +6,7 @@ import math
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -1668,6 +1668,19 @@ class DongxiaoRepository:
             )
 
     def create_task(self, task: Task) -> tuple[Task, bool]:
+        return self.create_task_with_execution_items(
+            task,
+            [],
+            verify_execution_items=False,
+        )
+
+    def create_task_with_execution_items(
+        self,
+        task: Task,
+        execution_items: list[TaskExecutionItem],
+        *,
+        verify_execution_items: bool = True,
+    ) -> tuple[Task, bool]:
         fingerprint = task_request_fingerprint(
             task_type=task.task_type,
             store_app_id=task.store_app_id,
@@ -1694,6 +1707,19 @@ class DongxiaoRepository:
                 )
                 if saved is None:
                     raise RepositoryError("幂等任务无法读取")
+                if verify_execution_items:
+                    item_count = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM dongxiao_task_execution_items
+                            WHERE task_id=? AND store_app_id=?
+                            """,
+                            (saved.task_id, saved.store_app_id),
+                        ).fetchone()[0]
+                    )
+                    if item_count != saved.total_items:
+                        raise RepositoryError("幂等任务的历史明细不完整")
                 return saved, False
             conn.execute(
                 """
@@ -1764,6 +1790,20 @@ class DongxiaoRepository:
                 result=AuditResult.SUCCESS,
                 detail={"idempotency_key": task.idempotency_key},
             )
+            if execution_items:
+                if len(execution_items) != task.total_items:
+                    raise ValueError("任务明细数量与任务总项数不一致")
+                if any(
+                    item.task_id != task.task_id
+                    or item.store_id != task.store_id
+                    or item.store_app_id != task.store_app_id
+                    for item in execution_items
+                ):
+                    raise ValueError("任务明细归属与任务不一致")
+                self._insert_task_execution_items_in_connection(
+                    conn,
+                    execution_items,
+                )
         return task, True
 
     def get_task(self, task_id: str, *, store_app_id: str) -> Task | None:
@@ -1792,6 +1832,24 @@ class DongxiaoRepository:
                     int(store_id),
                     max(1, min(10000, int(limit))),
                 ),
+            ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    def list_tasks_by_store_app_id(
+        self,
+        store_app_id: str,
+        *,
+        limit: int = 2000,
+    ) -> list[Task]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dongxiao_tasks
+                WHERE store_app_id=?
+                ORDER BY created_at DESC, task_id
+                LIMIT ?
+                """,
+                (str(store_app_id), max(1, min(10000, int(limit)))),
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
@@ -1906,78 +1964,81 @@ class DongxiaoRepository:
             return
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for store_id, store_app_id in {
-                (item.store_id, item.store_app_id) for item in items
-            }:
-                self._ensure_store(
-                    conn,
-                    store_id,
-                    store_app_id,
-                )
-            for task_id, store_app_id in {
-                (item.task_id, item.store_app_id) for item in items
-            }:
-                task = conn.execute(
-                    """
-                    SELECT total_items FROM dongxiao_tasks
-                    WHERE task_id=? AND store_app_id=?
-                    """,
-                    (task_id, store_app_id),
-                ).fetchone()
-                if task is None:
-                    raise EntityNotFound("执行明细所属任务不存在")
-            conn.executemany(
+            self._insert_task_execution_items_in_connection(conn, items)
+
+    def _insert_task_execution_items_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        items: list[TaskExecutionItem],
+    ) -> None:
+        for store_id, store_app_id in {
+            (item.store_id, item.store_app_id) for item in items
+        }:
+            self._ensure_store(conn, store_id, store_app_id)
+        for task_id, store_app_id in {
+            (item.task_id, item.store_app_id) for item in items
+        }:
+            task = conn.execute(
                 """
-                INSERT INTO dongxiao_task_execution_items(
-                    item_id, task_id, store_id, store_app_id,
-                    subject_type, subject_id, product_id, sku_id,
-                    status, attempt_count, max_attempts, next_attempt_at,
-                    started_at, finished_at, last_error_code,
-                    last_error_message, payload_json, result_json,
-                    created_at, updated_at
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?
-                )
+                SELECT total_items FROM dongxiao_tasks
+                WHERE task_id=? AND store_app_id=?
                 """,
-                [
-                    (
-                        item.item_id,
-                        item.task_id,
-                        item.store_id,
-                        item.store_app_id,
-                        item.subject_type,
-                        item.subject_id,
-                        item.product_id,
-                        item.sku_id,
-                        item.status.value,
-                        item.attempt_count,
-                        item.max_attempts,
-                        (
-                            to_utc_iso(item.next_attempt_at)
-                            if item.next_attempt_at is not None
-                            else None
-                        ),
-                        (
-                            to_utc_iso(item.started_at)
-                            if item.started_at is not None
-                            else None
-                        ),
-                        (
-                            to_utc_iso(item.finished_at)
-                            if item.finished_at is not None
-                            else None
-                        ),
-                        item.last_error_code,
-                        item.last_error_message,
-                        _json(item.payload),
-                        _json(item.result),
-                        to_utc_iso(item.created_at),
-                        to_utc_iso(item.updated_at),
-                    )
-                    for item in items
-                ],
+                (task_id, store_app_id),
+            ).fetchone()
+            if task is None:
+                raise EntityNotFound("执行明细所属任务不存在")
+        conn.executemany(
+            """
+            INSERT INTO dongxiao_task_execution_items(
+                item_id, task_id, store_id, store_app_id,
+                subject_type, subject_id, product_id, sku_id,
+                status, attempt_count, max_attempts, next_attempt_at,
+                started_at, finished_at, last_error_code,
+                last_error_message, payload_json, result_json,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?
             )
+            """,
+            [
+                (
+                    item.item_id,
+                    item.task_id,
+                    item.store_id,
+                    item.store_app_id,
+                    item.subject_type,
+                    item.subject_id,
+                    item.product_id,
+                    item.sku_id,
+                    item.status.value,
+                    item.attempt_count,
+                    item.max_attempts,
+                    (
+                        to_utc_iso(item.next_attempt_at)
+                        if item.next_attempt_at is not None
+                        else None
+                    ),
+                    (
+                        to_utc_iso(item.started_at)
+                        if item.started_at is not None
+                        else None
+                    ),
+                    (
+                        to_utc_iso(item.finished_at)
+                        if item.finished_at is not None
+                        else None
+                    ),
+                    item.last_error_code,
+                    item.last_error_message,
+                    _json(item.payload),
+                    _json(item.result),
+                    to_utc_iso(item.created_at),
+                    to_utc_iso(item.updated_at),
+                )
+                for item in items
+            ],
+        )
 
     def list_task_execution_items(
         self,
@@ -2447,6 +2508,165 @@ class DongxiaoRepository:
                 )
         return len(local_tasks) + len(platform_tasks)
 
+    def claim_task_lease(
+        self,
+        task_id: str,
+        *,
+        store_app_id: str,
+        owner: str,
+        lease_seconds: int = 300,
+    ) -> bool:
+        now_dt = datetime.now(UTC)
+        now = to_utc_iso(now_dt)
+        expires = to_utc_iso(
+            now_dt + timedelta(seconds=max(30, int(lease_seconds)))
+        )
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE dongxiao_tasks
+                SET lease_owner=?, lease_expires_at=?, updated_at=?
+                WHERE task_id=? AND store_app_id=?
+                  AND status IN ('preparing', 'running')
+                  AND (
+                      lease_owner=''
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at<=?
+                      OR lease_owner=?
+                  )
+                """,
+                (
+                    str(owner),
+                    expires,
+                    now,
+                    str(task_id),
+                    str(store_app_id),
+                    now,
+                    str(owner),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def release_task_lease(
+        self,
+        task_id: str,
+        *,
+        store_app_id: str,
+        owner: str,
+    ) -> None:
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE dongxiao_tasks
+                SET lease_owner='', lease_expires_at=NULL, updated_at=?
+                WHERE task_id=? AND store_app_id=? AND lease_owner=?
+                """,
+                (now, str(task_id), str(store_app_id), str(owner)),
+            )
+
+    def recover_expired_task_leases(self) -> int:
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT task_id, store_app_id, execution_mode
+                FROM dongxiao_tasks
+                WHERE status IN ('preparing', 'running')
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at<=?
+                """,
+                (now,),
+            ).fetchall()
+            for row in rows:
+                if row["execution_mode"] == "platform_write":
+                    conn.execute(
+                        """
+                        UPDATE dongxiao_task_execution_items
+                        SET status='unknown', updated_at=?
+                        WHERE task_id=? AND store_app_id=?
+                          AND status='running'
+                        """,
+                        (now, row["task_id"], row["store_app_id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE dongxiao_tasks
+                        SET status='unknown',
+                            status_reason='任务租约过期，平台写结果需核验',
+                            lease_owner='', lease_expires_at=NULL, updated_at=?
+                        WHERE task_id=? AND store_app_id=?
+                        """,
+                        (now, row["task_id"], row["store_app_id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE dongxiao_task_execution_items
+                        SET status='pending', updated_at=?
+                        WHERE task_id=? AND store_app_id=?
+                          AND status='running'
+                        """,
+                        (now, row["task_id"], row["store_app_id"]),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE dongxiao_tasks
+                        SET status='preparing', lease_owner='',
+                            lease_expires_at=NULL, updated_at=?
+                        WHERE task_id=? AND store_app_id=?
+                        """,
+                        (now, row["task_id"], row["store_app_id"]),
+                    )
+        return len(rows)
+
+    def recover_running_task_items(
+        self,
+        task_id: str,
+        *,
+        store_app_id: str,
+    ) -> str:
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute(
+                """
+                SELECT execution_mode FROM dongxiao_tasks
+                WHERE task_id=? AND store_app_id=?
+                """,
+                (str(task_id), str(store_app_id)),
+            ).fetchone()
+            if task is None:
+                raise EntityNotFound("任务不存在")
+            target = (
+                "unknown"
+                if str(task["execution_mode"]) == "platform_write"
+                else "pending"
+            )
+            conn.execute(
+                """
+                UPDATE dongxiao_task_execution_items
+                SET status=?, updated_at=?
+                WHERE task_id=? AND store_app_id=? AND status='running'
+                """,
+                (target, now, str(task_id), str(store_app_id)),
+            )
+            if target == "unknown":
+                conn.execute(
+                    """
+                    UPDATE dongxiao_tasks
+                    SET status='unknown',
+                        status_reason='存在无法确认的平台写执行明细',
+                        lease_owner='', lease_expires_at=NULL, updated_at=?
+                    WHERE task_id=? AND store_app_id=?
+                    """,
+                    (now, str(task_id), str(store_app_id)),
+                )
+            return target
+
     def list_runnable_tasks(
         self,
         *,
@@ -2459,10 +2679,17 @@ class DongxiaoRepository:
                 SELECT * FROM dongxiao_tasks
                 WHERE status IN ('pending', 'preparing', 'running')
                   AND (next_run_at IS NULL OR next_run_at<=?)
+                  AND store_id IS NOT NULL
+                  AND (
+                      lease_owner=''
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at<=?
+                      OR status='pending'
+                  )
                 ORDER BY priority DESC, created_at, task_id
                 LIMIT ?
                 """,
-                (now, max(1, min(500, int(limit)))),
+                (now, now, max(1, min(500, int(limit)))),
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
@@ -2735,151 +2962,11 @@ class DongxiaoRepository:
         now = to_utc_iso(datetime.now(UTC))
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            self._ensure_store(conn, order.store_id, order.store_app_id)
-            existing = conn.execute(
-                """
-                SELECT order_ref_id FROM dongxiao_order_refs
-                WHERE store_app_id=? AND platform_order_id=?
-                """,
-                (order.store_app_id, order.platform_order_id),
-            ).fetchone()
-            order_ref_id = (
-                str(existing["order_ref_id"])
-                if existing is not None
-                else order.order_ref_id
-            )
-            if existing is None:
-                conn.execute(
-                    """
-                    INSERT INTO dongxiao_order_refs(
-                        order_ref_id, store_id, store_app_id,
-                        platform_order_id, status, verified, source,
-                        verified_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, 'platform_api', ?, ?, ?)
-                    """,
-                    (
-                        order_ref_id,
-                        order.store_id,
-                        order.store_app_id,
-                        order.platform_order_id,
-                        order.status.value,
-                        now,
-                        now,
-                        now,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE dongxiao_order_refs
-                    SET status=?, verified=1, source='platform_api',
-                        verified_at=?, updated_at=?
-                    WHERE order_ref_id=? AND store_app_id=?
-                    """,
-                    (
-                        order.status.value,
-                        now,
-                        now,
-                        order_ref_id,
-                        order.store_app_id,
-                    ),
-                )
-            conn.execute(
-                """
-                INSERT INTO dongxiao_order_status_snapshots(
-                    snapshot_id, order_ref_id, store_id, store_app_id,
-                    platform_order_id, status, trusted, source,
-                    request_id, details_json, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, 'platform_api', ?, ?, ?)
-                """,
-                (
-                    uuid.uuid4().hex,
-                    order_ref_id,
-                    order.store_id,
-                    order.store_app_id,
-                    order.platform_order_id,
-                    order.status.value,
-                    str(request_id)[:200],
-                    _json(
-                        {
-                            "item_count": order.item_count,
-                            "total_amount_cents": order.total_amount_cents,
-                        }
-                    ),
-                    now,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO dongxiao_order_details(
-                    order_ref_id, store_id, store_app_id, platform_order_id,
-                    status, create_time, update_time, pay_time,
-                    total_amount_cents, product_amount_cents,
-                    freight_amount_cents, discount_amount_cents,
-                    item_count, items_json, source, last_synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(order_ref_id, store_app_id) DO UPDATE SET
-                    store_id=excluded.store_id,
-                    platform_order_id=excluded.platform_order_id,
-                    status=excluded.status,
-                    create_time=excluded.create_time,
-                    update_time=excluded.update_time,
-                    pay_time=excluded.pay_time,
-                    total_amount_cents=excluded.total_amount_cents,
-                    product_amount_cents=excluded.product_amount_cents,
-                    freight_amount_cents=excluded.freight_amount_cents,
-                    discount_amount_cents=excluded.discount_amount_cents,
-                    item_count=excluded.item_count,
-                    items_json=excluded.items_json,
-                    source=excluded.source,
-                    last_synced_at=excluded.last_synced_at
-                """,
-                (
-                    order_ref_id,
-                    order.store_id,
-                    order.store_app_id,
-                    order.platform_order_id,
-                    order.status.value,
-                    (
-                        to_utc_iso(order.create_time)
-                        if order.create_time is not None
-                        else None
-                    ),
-                    (
-                        to_utc_iso(order.update_time)
-                        if order.update_time is not None
-                        else None
-                    ),
-                    (
-                        to_utc_iso(order.pay_time)
-                        if order.pay_time is not None
-                        else None
-                    ),
-                    order.total_amount_cents,
-                    order.product_amount_cents,
-                    order.freight_amount_cents,
-                    order.discount_amount_cents,
-                    order.item_count,
-                    _json(list(order.items)),
-                    order.source.value,
-                    to_utc_iso(order.last_synced_at),
-                ),
-            )
-            self._insert_audit(
+            self._upsert_order_record_in_connection(
                 conn,
-                store_id=order.store_id,
-                store_app_id=order.store_app_id,
-                actor_id="system",
-                action="order_synced",
-                entity_type="order",
-                entity_id=order.platform_order_id,
-                request_id=str(request_id),
-                result=AuditResult.SUCCESS,
-                detail={
-                    "status": order.status.value,
-                    "item_count": order.item_count,
-                    "total_amount_cents": order.total_amount_cents,
-                },
+                order,
+                request_id=request_id,
+                now=now,
             )
         saved = self.get_order_record(
             order.store_id,
@@ -2888,6 +2975,184 @@ class DongxiaoRepository:
         if saved is None:
             raise RepositoryError("订单保存后无法读取")
         return saved
+
+    def upsert_order_records_batch(
+        self,
+        orders: list[OrderRecord],
+    ) -> int:
+        if not orders:
+            return 0
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for store_id, store_app_id in {
+                (order.store_id, order.store_app_id) for order in orders
+            }:
+                self._ensure_store(conn, store_id, store_app_id)
+            for order in orders:
+                self._upsert_order_record_in_connection(
+                    conn,
+                    order,
+                    request_id=f"order:{order.platform_order_id}",
+                    now=now,
+                )
+        return len(orders)
+
+    def _upsert_order_record_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        order: OrderRecord,
+        *,
+        request_id: str,
+        now: str,
+    ) -> str:
+        self._ensure_store(conn, order.store_id, order.store_app_id)
+        existing = conn.execute(
+            """
+            SELECT order_ref_id FROM dongxiao_order_refs
+            WHERE store_app_id=? AND platform_order_id=?
+            """,
+            (order.store_app_id, order.platform_order_id),
+        ).fetchone()
+        order_ref_id = (
+            str(existing["order_ref_id"])
+            if existing is not None
+            else order.order_ref_id
+        )
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO dongxiao_order_refs(
+                    order_ref_id, store_id, store_app_id,
+                    platform_order_id, status, verified, source,
+                    verified_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, 'platform_api', ?, ?, ?)
+                """,
+                (
+                    order_ref_id,
+                    order.store_id,
+                    order.store_app_id,
+                    order.platform_order_id,
+                    order.status.value,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE dongxiao_order_refs
+                SET status=?, verified=1, source='platform_api',
+                    verified_at=?, updated_at=?
+                WHERE order_ref_id=? AND store_app_id=?
+                """,
+                (
+                    order.status.value,
+                    now,
+                    now,
+                    order_ref_id,
+                    order.store_app_id,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO dongxiao_order_status_snapshots(
+                snapshot_id, order_ref_id, store_id, store_app_id,
+                platform_order_id, status, trusted, source,
+                request_id, details_json, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 'platform_api', ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                order_ref_id,
+                order.store_id,
+                order.store_app_id,
+                order.platform_order_id,
+                order.status.value,
+                str(request_id)[:200],
+                _json(
+                    {
+                        "item_count": order.item_count,
+                        "total_amount_cents": order.total_amount_cents,
+                    }
+                ),
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO dongxiao_order_details(
+                order_ref_id, store_id, store_app_id, platform_order_id,
+                status, create_time, update_time, pay_time,
+                total_amount_cents, product_amount_cents,
+                freight_amount_cents, discount_amount_cents,
+                item_count, items_json, source, last_synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_ref_id, store_app_id) DO UPDATE SET
+                store_id=excluded.store_id,
+                platform_order_id=excluded.platform_order_id,
+                status=excluded.status,
+                create_time=excluded.create_time,
+                update_time=excluded.update_time,
+                pay_time=excluded.pay_time,
+                total_amount_cents=excluded.total_amount_cents,
+                product_amount_cents=excluded.product_amount_cents,
+                freight_amount_cents=excluded.freight_amount_cents,
+                discount_amount_cents=excluded.discount_amount_cents,
+                item_count=excluded.item_count,
+                items_json=excluded.items_json,
+                source=excluded.source,
+                last_synced_at=excluded.last_synced_at
+            """,
+            (
+                order_ref_id,
+                order.store_id,
+                order.store_app_id,
+                order.platform_order_id,
+                order.status.value,
+                (
+                    to_utc_iso(order.create_time)
+                    if order.create_time is not None
+                    else None
+                ),
+                (
+                    to_utc_iso(order.update_time)
+                    if order.update_time is not None
+                    else None
+                ),
+                (
+                    to_utc_iso(order.pay_time)
+                    if order.pay_time is not None
+                    else None
+                ),
+                order.total_amount_cents,
+                order.product_amount_cents,
+                order.freight_amount_cents,
+                order.discount_amount_cents,
+                order.item_count,
+                _json(list(order.items)),
+                order.source.value,
+                to_utc_iso(order.last_synced_at),
+            ),
+        )
+        self._insert_audit(
+            conn,
+            store_id=order.store_id,
+            store_app_id=order.store_app_id,
+            actor_id="system",
+            action="order_synced",
+            entity_type="order",
+            entity_id=order.platform_order_id,
+            request_id=str(request_id),
+            result=AuditResult.SUCCESS,
+            detail={
+                "status": order.status.value,
+                "item_count": order.item_count,
+                "total_amount_cents": order.total_amount_cents,
+            },
+        )
+        return order_ref_id
 
     def get_order_record(
         self,
@@ -2921,6 +3186,26 @@ class DongxiaoRepository:
                 LIMIT ?
                 """,
                 (int(store_id), max(1, min(10000, int(limit)))),
+            ).fetchall()
+        return [self._order_record_from_row(row) for row in rows]
+
+    def list_order_records_by_store_app_id(
+        self,
+        store_app_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[OrderRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dongxiao_order_details
+                WHERE store_app_id=?
+                ORDER BY
+                    COALESCE(update_time, create_time, last_synced_at) DESC,
+                    platform_order_id DESC
+                LIMIT ?
+                """,
+                (str(store_app_id), max(1, min(10000, int(limit)))),
             ).fetchall()
         return [self._order_record_from_row(row) for row in rows]
 
@@ -2981,6 +3266,14 @@ class DongxiaoRepository:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._ensure_store(conn, case.store_id, case.store_app_id)
+            previous = conn.execute(
+                """
+                SELECT status, platform_state, requested_amount_cents
+                FROM dongxiao_aftersale_cases
+                WHERE case_id=? AND store_app_id=?
+                """,
+                (case.case_id, case.store_app_id),
+            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO dongxiao_aftersale_cases(
@@ -2990,10 +3283,11 @@ class DongxiaoRepository:
                     created_at, updated_at, platform_status, after_sale_type,
                     paid_amount_cents, refunded_amount_cents,
                     inflight_amount_cents, deadline, complete_time,
-                    details_json, last_synced_at
+                    details_json, last_synced_at, platform_state,
+                    platform_state_updated_at, platform_reason
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?
+                    ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(store_app_id, platform_case_id) DO UPDATE SET
                     order_ref_id=excluded.order_ref_id,
@@ -3011,7 +3305,10 @@ class DongxiaoRepository:
                     deadline=excluded.deadline,
                     complete_time=excluded.complete_time,
                     details_json=excluded.details_json,
-                    last_synced_at=excluded.last_synced_at
+                    last_synced_at=excluded.last_synced_at,
+                    platform_state=excluded.platform_state,
+                    platform_state_updated_at=excluded.platform_state_updated_at,
+                    platform_reason=excluded.platform_reason
                 """,
                 (
                     case.case_id,
@@ -3048,8 +3345,96 @@ class DongxiaoRepository:
                         if case.last_synced_at is not None
                         else None
                     ),
+                    case.platform_state.value,
+                    (
+                        to_utc_iso(case.platform_state_updated_at)
+                        if case.platform_state_updated_at is not None
+                        else None
+                    ),
+                    case.platform_reason,
                 ),
             )
+            if (
+                previous is None
+                or (
+                    str(previous["status"]) != case.status.value
+                    or str(previous["platform_state"])
+                    != case.platform_state.value
+                )
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO dongxiao_aftersale_status_history(
+                        history_id, case_id, store_id, store_app_id,
+                        previous_workflow_status, new_workflow_status,
+                        previous_platform_state, new_platform_state,
+                        platform_status, source, actor_id, reason, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        case.case_id,
+                        case.store_id,
+                        case.store_app_id,
+                        (
+                            str(previous["status"])
+                            if previous is not None
+                            else None
+                        ),
+                        case.status.value,
+                        (
+                            str(previous["platform_state"])
+                            if previous is not None
+                            else None
+                        ),
+                        case.platform_state.value,
+                        case.platform_status,
+                        case.source,
+                        "system",
+                        "",
+                        to_utc_iso(datetime.now(UTC)),
+                    ),
+                )
+            if (
+                previous is not None
+                and int(previous["requested_amount_cents"])
+                != case.requested_amount_cents
+                and str(previous["status"])
+                in {"pending_review", "approved"}
+            ):
+                now = to_utc_iso(datetime.now(UTC))
+                conn.execute(
+                    """
+                    UPDATE dongxiao_approvals
+                    SET status='cancelled', decided_by='system',
+                        decision_reason='官方售后金额变化，原审批自动失效',
+                        decided_at=?
+                    WHERE store_app_id=? AND subject_type='aftersale'
+                      AND subject_id=?
+                      AND status IN ('pending', 'approved')
+                    """,
+                    (now, case.store_app_id, case.case_id),
+                )
+                self._insert_audit(
+                    conn,
+                    store_id=case.store_id,
+                    store_app_id=case.store_app_id,
+                    actor_id="system",
+                    action="aftersale_amount_changed",
+                    entity_type="aftersale",
+                    entity_id=case.platform_case_id,
+                    request_id="",
+                    result=AuditResult.INFO,
+                    detail={
+                        "previous_requested_amount_cents": int(
+                            previous["requested_amount_cents"]
+                        ),
+                        "new_requested_amount_cents": (
+                            case.requested_amount_cents
+                        ),
+                        "message": "原审批已失效，需要重新核验金额",
+                    },
+                )
             self._insert_audit(
                 conn,
                 store_id=case.store_id,
@@ -3066,6 +3451,22 @@ class DongxiaoRepository:
                     "requested_amount_cents": case.requested_amount_cents,
                 },
             )
+            if case.platform_state is AftersaleStatus.UNKNOWN:
+                self._insert_audit(
+                    conn,
+                    store_id=case.store_id,
+                    store_app_id=case.store_app_id,
+                    actor_id="system",
+                    action="aftersale_platform_status_unknown",
+                    entity_type="aftersale",
+                    entity_id=case.platform_case_id,
+                    request_id="",
+                    result=AuditResult.INFO,
+                    detail={
+                        "platform_status": case.platform_status,
+                        "message": "官方售后状态未识别，审批和执行已阻止",
+                    },
+                )
         saved = self.get_aftersale_case(
             case.store_id,
             case.platform_case_id,
@@ -3127,6 +3528,52 @@ class DongxiaoRepository:
         with self.connect() as conn:
             rows = conn.execute(sql, args).fetchall()
         return [self._aftersale_from_row(row) for row in rows]
+
+    def list_aftersale_cases_by_store_app_id(
+        self,
+        store_app_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[AftersaleCase]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT cases.*,
+                       refs.platform_order_id AS platform_order_id
+                FROM dongxiao_aftersale_cases AS cases
+                LEFT JOIN dongxiao_order_refs AS refs
+                  ON refs.order_ref_id=cases.order_ref_id
+                 AND refs.store_app_id=cases.store_app_id
+                WHERE cases.store_app_id=?
+                ORDER BY cases.updated_at DESC, cases.case_id
+                LIMIT ?
+                """,
+                (str(store_app_id), max(1, min(10000, int(limit)))),
+            ).fetchall()
+        return [self._aftersale_from_row(row) for row in rows]
+
+    def list_aftersale_status_history(
+        self,
+        store_app_id: str,
+        case_id: str,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dongxiao_aftersale_status_history
+                WHERE store_app_id=? AND case_id=?
+                ORDER BY observed_at DESC, history_id DESC
+                LIMIT ?
+                """,
+                (
+                    str(store_app_id),
+                    str(case_id),
+                    max(1, min(10000, int(limit))),
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def aftersale_refund_commitments(
         self,
@@ -3206,6 +3653,30 @@ class DongxiaoRepository:
                     str(case_id),
                     str(store_app_id),
                     str(row["status"]),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO dongxiao_aftersale_status_history(
+                    history_id, case_id, store_id, store_app_id,
+                    previous_workflow_status, new_workflow_status,
+                    previous_platform_state, new_platform_state,
+                    platform_status, source, actor_id, reason, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    str(case_id),
+                    int(store_id),
+                    str(store_app_id),
+                    str(row["status"]),
+                    target.value,
+                    str(row["platform_state"] or "unknown"),
+                    str(row["platform_state"] or "unknown"),
+                    str(row["platform_status"] or ""),
+                    str(actor_id),
+                    str(reason),
+                    now,
                 ),
             )
             self._insert_audit(
@@ -3377,6 +3848,27 @@ class DongxiaoRepository:
         if subject_type:
             sql += " AND subject_type=?"
             args.append(str(subject_type))
+        if subject_id:
+            sql += " AND subject_id=?"
+            args.append(str(subject_id))
+        sql += " ORDER BY requested_at DESC, approval_id LIMIT ?"
+        args.append(max(1, min(10000, int(limit))))
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._approval_from_row(row) for row in rows]
+
+    def list_approvals_by_store_app_id(
+        self,
+        store_app_id: str,
+        *,
+        subject_id: str = "",
+        limit: int = 500,
+    ) -> list[Approval]:
+        sql = """
+            SELECT * FROM dongxiao_approvals
+            WHERE store_app_id=?
+        """
+        args: list[Any] = [str(store_app_id)]
         if subject_id:
             sql += " AND subject_id=?"
             args.append(str(subject_id))
@@ -3611,7 +4103,11 @@ class DongxiaoRepository:
         )
         return OrderRecord(
             order_ref_id=str(row["order_ref_id"]),
-            store_id=int(row["store_id"]),
+            store_id=(
+                int(row["store_id"])
+                if row["store_id"] is not None
+                else None
+            ),
             store_app_id=str(row["store_app_id"]),
             platform_order_id=str(row["platform_order_id"]),
             status=OrderStatus(row["status"]),
@@ -3632,7 +4128,11 @@ class DongxiaoRepository:
     def _aftersale_from_row(row: sqlite3.Row) -> AftersaleCase:
         return AftersaleCase(
             case_id=str(row["case_id"]),
-            store_id=int(row["store_id"]),
+            store_id=(
+                int(row["store_id"])
+                if row["store_id"] is not None
+                else None
+            ),
             store_app_id=str(row["store_app_id"]),
             platform_case_id=str(row["platform_case_id"]),
             order_ref_id=str(row["order_ref_id"] or ""),
@@ -3645,11 +4145,18 @@ class DongxiaoRepository:
             source=str(row["source"]),
             reason=str(row["reason"] or ""),
             platform_status=str(row["platform_status"] or ""),
+            platform_reason=str(row["platform_reason"] or ""),
             platform_order_id=str(
                 row["platform_order_id"]
                 if "platform_order_id" in row.keys()
                 and row["platform_order_id"]
                 else ""
+            ),
+            platform_state=AftersaleStatus(
+                row["platform_state"] or "unknown"
+            ),
+            platform_state_updated_at=_row_time(
+                row["platform_state_updated_at"]
             ),
             after_sale_type=str(row["after_sale_type"] or ""),
             paid_amount_cents=int(row["paid_amount_cents"]),
@@ -3665,7 +4172,11 @@ class DongxiaoRepository:
     def _approval_from_row(row: sqlite3.Row) -> Approval:
         return Approval(
             approval_id=str(row["approval_id"]),
-            store_id=int(row["store_id"]),
+            store_id=(
+                int(row["store_id"])
+                if row["store_id"] is not None
+                else None
+            ),
             store_app_id=str(row["store_app_id"]),
             subject_type=ApprovalSubjectType(row["subject_type"]),
             subject_id=str(row["subject_id"]),
@@ -3698,7 +4209,11 @@ class DongxiaoRepository:
     def _task_from_row(row: sqlite3.Row) -> Task:
         return Task(
             task_id=str(row["task_id"]),
-            store_id=int(row["store_id"]),
+            store_id=(
+                int(row["store_id"])
+                if row["store_id"] is not None
+                else None
+            ),
             store_app_id=str(row["store_app_id"]),
             task_type=str(row["task_type"]),
             idempotency_key=str(row["idempotency_key"]),
@@ -3728,7 +4243,11 @@ class DongxiaoRepository:
         return TaskExecutionItem(
             item_id=str(row["item_id"]),
             task_id=str(row["task_id"]),
-            store_id=int(row["store_id"]),
+            store_id=(
+                int(row["store_id"])
+                if row["store_id"] is not None
+                else None
+            ),
             store_app_id=str(row["store_app_id"]),
             subject_type=str(row["subject_type"]),
             subject_id=str(row["subject_id"]),

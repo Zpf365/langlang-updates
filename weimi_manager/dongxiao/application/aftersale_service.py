@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Callable
@@ -30,9 +31,12 @@ class DongxiaoAftersaleService:
         self,
         repository: DongxiaoRepository,
         adapter: DongxiaoPlatformAdapter,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
         self.adapter = adapter
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     def sync_aftersales(
         self,
@@ -91,6 +95,11 @@ class DongxiaoAftersaleService:
             limit=limit,
         )
 
+    def list_history(self, store_app_id: str) -> list[AftersaleCase]:
+        return self.repository.list_aftersale_cases_by_store_app_id(
+            str(store_app_id)
+        )
+
     def preview_amount(
         self,
         case: AftersaleCase,
@@ -104,8 +113,11 @@ class DongxiaoAftersaleService:
             raise TypeError("审批退款金额必须是整数分")
         if approved_amount_cents < 0:
             raise ValueError("审批退款金额不能小于 0")
-        if approved_amount_cents > case.requested_amount_cents:
-            raise ValueError("审批退款金额不能超过售后申请金额")
+        if approved_amount_cents != case.requested_amount_cents:
+            raise ValueError(
+                "官方同意售后接口不支持指定部分退款金额，"
+                "本地审批金额必须等于官方申请金额"
+            )
         refunded, inflight, reserved_other = (
             self.repository.aftersale_refund_commitments(
                 store_id=case.store_id,
@@ -164,6 +176,15 @@ class DongxiaoAftersaleService:
             raise ValueError("售后工单不存在")
         if case.source != "platform_api":
             raise ValueError("只有官方平台售后单可以进入审批")
+        if case.platform_state is AftersaleStatus.UNKNOWN:
+            raise ValueError("官方售后状态未知，禁止创建审批")
+        if case.platform_state in {
+            AftersaleStatus.COMPLETED,
+            AftersaleStatus.REJECTED,
+            AftersaleStatus.FAILED,
+            AftersaleStatus.CANCELLED,
+        }:
+            raise ValueError("官方售后已经结束，不能创建审批")
         preview = self.preview_amount(
             case,
             approved_amount_cents=approved_amount_cents,
@@ -201,7 +222,7 @@ class DongxiaoAftersaleService:
             for approval in pending
         ):
             raise ValueError("该售后已有待处理审批")
-        now = datetime.now(UTC)
+        now = self.clock()
         if case.status is AftersaleStatus.REQUESTED:
             case = self.repository.transition_aftersale(
                 case.case_id,
@@ -232,7 +253,12 @@ class DongxiaoAftersaleService:
             decision_reason=str(reason),
             expires_at=expires_at,
         )
-        self.repository.create_approval(approval)
+        try:
+            self.repository.create_approval(approval)
+        except sqlite3.IntegrityError as exc:
+            if "approvals" in str(exc).lower() or "unique" in str(exc).lower():
+                raise ValueError("该售后已有待处理审批") from exc
+            raise
         return approval, case
 
     def decide_approval(
@@ -255,6 +281,21 @@ class DongxiaoAftersaleService:
         )
         if approval is None:
             raise ValueError("审批记录不存在")
+        now = self.clock()
+        if (
+            approval.status is ApprovalStatus.PENDING
+            and approval.expires_at is not None
+            and now > approval.expires_at
+        ):
+            self.repository.transition_approval(
+                approval.approval_id,
+                store_id=int(store.id),
+                store_app_id=str(store.app_id),
+                event="expire",
+                actor_id=actor_id,
+                reason="审批已超过有效期",
+            )
+            raise ValueError("审批已过期，不能批准或驳回")
         target_status = (
             ApprovalStatus.APPROVED
             if approved
@@ -332,6 +373,15 @@ class DongxiaoAftersaleService:
             raise ValueError("售后工单不存在")
         if case.status is not AftersaleStatus.APPROVED:
             raise ValueError("售后工单尚未通过金额审批")
+        if case.platform_state is AftersaleStatus.UNKNOWN:
+            raise ValueError("官方售后状态未知，禁止平台执行")
+        if case.platform_state in {
+            AftersaleStatus.COMPLETED,
+            AftersaleStatus.REJECTED,
+            AftersaleStatus.FAILED,
+            AftersaleStatus.CANCELLED,
+        }:
+            raise ValueError("官方售后已经结束，不能执行平台写操作")
         approvals = self.repository.list_approvals(
             int(store.id),
             subject_type="aftersale",
@@ -380,10 +430,23 @@ class DongxiaoAftersaleService:
         )
         created_at = _timestamp(detail.get("create_time"))
         updated_at = _timestamp(detail.get("update_time"))
-        now = datetime.now(UTC)
+        now = self.clock()
         mapped_status = _map_aftersale_status(
             str(detail.get("status") or "")
         )
+        workflow_status = _next_workflow_status(
+            existing.status if existing else None,
+            mapped_status,
+        )
+        amount_changed = (
+            existing is not None
+            and existing.requested_amount_cents != requested
+        )
+        if amount_changed and workflow_status in {
+            AftersaleStatus.APPROVED,
+            AftersaleStatus.PENDING_REVIEW,
+        }:
+            workflow_status = AftersaleStatus.PENDING_REVIEW
         refunded = (
             requested
             if mapped_status is AftersaleStatus.COMPLETED
@@ -405,19 +468,28 @@ class DongxiaoAftersaleService:
             store_app_id=str(store.app_id),
             platform_case_id=case_id,
             order_ref_id=order.order_ref_id if order else "",
-            status=mapped_status,
+            status=workflow_status,
             requested_amount_cents=requested,
-            approved_amount_cents=min(
-                requested,
-                existing.approved_amount_cents if existing else 0,
+            approved_amount_cents=(
+                0
+                if amount_changed
+                else min(
+                    requested,
+                    existing.approved_amount_cents if existing else 0,
+                )
             ),
             idempotency_key=f"platform:{store.app_id}:{case_id}",
             created_at=created_at or now,
             updated_at=updated_at or now,
             source="platform_api",
-            reason=str(detail.get("reason_text") or detail.get("reason") or ""),
+            reason=existing.reason if existing else "",
             platform_status=str(detail.get("status") or ""),
+            platform_reason=str(
+                detail.get("reason_text") or detail.get("reason") or ""
+            ),
             platform_order_id=order_id,
+            platform_state=mapped_status,
+            platform_state_updated_at=now,
             after_sale_type=str(detail.get("type") or ""),
             paid_amount_cents=(
                 order.total_amount_cents if order is not None else 0
@@ -470,6 +542,13 @@ def _map_aftersale_status(value: str) -> AftersaleStatus:
     }:
         return AftersaleStatus.FAILED
     if status in {
+        "MERCHANT_PROCESSING",
+        "USER_WAIT_CONFIRM",
+        "USER_WAIT_CONFIRM_UPDATE",
+        "USER_WAIT_HANDLE_MERCHANT_AFTER_SALE",
+    }:
+        return AftersaleStatus.PENDING_REVIEW
+    if status in {
         "PLATFORM_REFUNDING",
         "PLATFORM_PROCESSING",
         "MERCHANT_OVERDUE_REFUND",
@@ -481,4 +560,31 @@ def _map_aftersale_status(value: str) -> AftersaleStatus:
         "MERCHANT_RESHIP_OVERDUE",
     }:
         return AftersaleStatus.PROCESSING
-    return AftersaleStatus.PENDING_REVIEW
+    return AftersaleStatus.UNKNOWN
+
+
+def _next_workflow_status(
+    current: AftersaleStatus | None,
+    platform_state: AftersaleStatus,
+) -> AftersaleStatus:
+    if platform_state is AftersaleStatus.UNKNOWN:
+        return current or AftersaleStatus.UNKNOWN
+    if platform_state is AftersaleStatus.COMPLETED:
+        return AftersaleStatus.COMPLETED
+    if platform_state is AftersaleStatus.REJECTED:
+        return AftersaleStatus.REJECTED
+    if platform_state is AftersaleStatus.FAILED:
+        return AftersaleStatus.FAILED
+    if platform_state is AftersaleStatus.CANCELLED:
+        return AftersaleStatus.CANCELLED
+    if platform_state is AftersaleStatus.PROCESSING:
+        if current in {AftersaleStatus.APPROVED, AftersaleStatus.PENDING_REVIEW}:
+            return AftersaleStatus.PROCESSING
+        return current or AftersaleStatus.PROCESSING
+    if current is not None:
+        return current
+    return (
+        AftersaleStatus.PENDING_REVIEW
+        if platform_state is AftersaleStatus.PENDING_REVIEW
+        else platform_state
+    )
