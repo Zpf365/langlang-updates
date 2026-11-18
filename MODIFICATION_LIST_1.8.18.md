@@ -1,0 +1,21 @@
+# 澜琅 1.8.18 修改清单
+
+- `weimi_manager/ui/activity_center.py`
+  - 调整限时活动默认值和规则校验。
+  - 增加续期全选、清空和右侧续期按钮。
+  - 增加云端命令授权与逐店结果汇总。
+- `weimi_manager/service.py`
+  - 增加 7 天、8.5 折和 1 元最低优惠校验。
+  - 默认持续时间调整为 7 天。
+- `weimi_manager/pyside/pages/activity_center.py`
+  - 同步 PySide 开发页默认值和控件边界。
+- `weimi_manager/ui/hosted_center.py`
+  - 同步托管中心限时抢购默认折扣与上限。
+- `tests/test_limited_discount.py`
+  - 增加规则、弹窗、刷新、选择和续期测试。
+- `tests/test_core.py`
+  - 更新限时抢购价格计算测试。
+- `tests/test_pyside_activity_and_sales.py`
+  - 增加 PySide 默认值断言。
+- `tests/test_refactor_1_8_1.py`
+  - 更新版本元数据断言。

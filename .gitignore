@@ -1,0 +1,25 @@
+.env.local
+assets/auth_config.json
+assets/tester_accounts.json
+assets/tester_channel.json
+assets/universal_login.json
+auth/
+.venv/
+.venv311/
+__pycache__/
+*.py[cod]
+*.log
+*.zip
+data/
+build/
+dist/
+release/
+browser_runtime/
+*.spec
+!LangLang.spec
+.pytest_cache/
+supabase/.temp/
+
+# Local delivery artifacts are versioned by directory, not tracked by Git.
+发布文件/
+

@@ -1,0 +1,39 @@
+{
+  "version": "1.8.29",
+  "python": "3.11.9",
+  "pyinstaller": "6.22.3",
+  "platform": "Windows 10.0.26200 x64",
+  "build_environment": {
+    "path_isolated": true,
+    "qt_plugin_path_removed": true,
+    "qml_import_path_removed": true
+  },
+  "artifacts": {
+    "package": {
+      "path": "release/LangLang-1.8.29-win64.zip",
+      "bytes": 70087487,
+      "sha256": "0d0090dd7e0471880964e6d9ab4edb7814d064fbe031110ff5bd3d06c9fc2174"
+    },
+    "source": {
+      "path": "release/LangLang_1.8.29_Source.zip",
+      "bytes": 1602829,
+      "sha256": "37a7a674a46168469109cac5ffa5bb4c9d3e34a5c5d212b969b3f24404dae29d"
+    },
+    "exe": {
+      "path": "release/LangLang_1.8.29_Windows_x64/LangLang.exe",
+      "bytes": 7106956,
+      "sha256": "d9e63a1953a326ce908890fd7ec62afb97a0fb1c686b8d1654d26a72a258d0f7"
+    }
+  },
+  "launch_verification": {
+    "started": true,
+    "window_title": "澜琅 · 登录 重构1.8.29",
+    "responded": true
+  },
+  "source_archive_security_check": {
+    "integrity": "ok",
+    "forbidden_entries": [],
+    "entries": 471
+  },
+  "remote_update_published": false
+}

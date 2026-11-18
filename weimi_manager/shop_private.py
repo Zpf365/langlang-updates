@@ -1,0 +1,1621 @@
+from __future__ import annotations
+
+import time
+from datetime import date, datetime, timedelta
+from datetime import time as datetime_time
+from typing import Any, Callable
+
+import requests
+
+from .db import Database
+from .models import Product, Store
+from .web_session import cookie_header, normalize_cookies
+
+BASE_URL = "https://store.weixin.qq.com"
+SCAN_PATH = (
+    "/shop-faas/mmchannelstradeproductcore/cgi/goods/scanProductPreview"
+)
+METRIC_PATH = (
+    "/shop-faas/mmecnodeproductlist/cgi/goods/getProductMetricList"
+)
+ACTIVITY_PRODUCTS_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/"
+    "getPlatformInvestmentProductInfoList"
+)
+ACTIVITY_LIST_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/"
+    "listShopPlatformActivity"
+)
+ACTIVITY_APPLY_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/"
+    "applyShopPlatformActivity"
+)
+ACCOUNT_CLOSE_STATUS_PATH = (
+    "/shop-faas/mmecnodebase/close/cgi/getEcAcctCloseStatus"
+)
+ACTIVITY_UPDATE_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/updateRequestProductList"
+)
+ACTIVITY_CHECK_PRICE_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/checkModifyActivityPrice"
+)
+ACTIVITY_SUBMIT_PRICE_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/submitModifyActivityPrice"
+)
+ACTIVITY_VALIDATE_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/"
+    "checkPlatformInvestmentProductValid"
+)
+ACTIVITY_CAN_APPLY_PATH = (
+    "/shop-faas/mmeckolmarketingnode/activity/cgi/"
+    "getShopActivityCanApplyProduct"
+)
+SNAPUP_LIST_PATH = (
+    "/shop-faas/market/cgi/snapupV2/bGetSnapUpTaskListV2"
+)
+SNAPUP_DETAIL_PATH = (
+    "/shop-faas/market/cgi/snapupV2/bGetSnapUpTaskV2"
+)
+SNAPUP_PRODUCTS_PATH = (
+    "/shop-faas/market/cgi/snapupV2/batchGetProducts"
+)
+SNAPUP_CREATE_PATH = (
+    "/shop-faas/market/cgi/snapupV2/createSnapUpTaskV2"
+)
+SNAPUP_STOP_PATH = (
+    "/shop-faas/market/cgi/snapupV2/stopSnapUpTaskV2"
+)
+SNAPUP_DELETE_PATH = (
+    "/shop-faas/market/cgi/snapupV2/deleteSnapUpTaskV2"
+)
+SNAPUP_MAX_PRODUCTS = 200
+PRODUCT_RECYCLE_PATH = (
+    "/shop-faas/mmecnodeproductlist/cgi/goods/batchDel"
+)
+PRODUCT_REAL_DELETE_PATH = (
+    "/shop-faas/mmecnodeproductlist/cgi/goods/batchRealDel"
+)
+PRODUCT_UNLIST_PATH = (
+    "/shop-faas/mmecnodeproductlist/cgi/goods/BatchUnListing"
+)
+VIOLATION_LIST_PATH = (
+    "/shop-faas/mmecnodeviolationsec/violation/cgi/get"
+)
+VIOLATION_PREWARN_PATH = (
+    "/shop-faas/mmecnodeviolationsec/prewarn/cgi/getList"
+)
+REALTIME_STATS_PATH = (
+    "/shop-faas/mmecnodelinercgi/cgi/liner_query/3/"
+    "home-overview-shop-realtime?token=&lang=zh_CN"
+)
+TODO_STATS_PATH = (
+    "/shop-faas/mmchannelstradehome/home/todo?token=&lang=zh_CN"
+)
+SCORE_STATS_PATH = (
+    "/shop-faas/statistic/cgi/search?token=&lang=zh_CN"
+)
+RECOMMEND_STATS_PATH = (
+    "/shop-faas/mmchannelstradebase/cgi/shop/"
+    "getShopRecommendProductsStat"
+)
+SEARCH_STATS_PATH = (
+    "/shop-faas/mmchannelstradebase/cgi/shop/"
+    "getShopSearchProductsStat"
+)
+ACCOUNT_BALANCE_PATH = (
+    "/shop-faas/mmchannelstradefunds/cgi/generalAccount/"
+    "getGeneralAccountBalance?token=&lang=zh_CN"
+)
+DEPOSIT_STATE_PATH = (
+    "/shop-faas/mmchannelstradedeposit/home/cgi/"
+    "getDepositMPayState?token=&lang=zh_CN"
+)
+FULL_CATEGORY_TREE_PATH = (
+    "/shop-faas/mmchannelstradecategory/cgi/category/getFullCategoryTree"
+)
+CATEGORY_RELATION_PATH = (
+    "/shop-faas/mmchannelstradecategory/cgi/category/"
+    "getCategoryRelationList"
+)
+CATEGORY_DEPOSIT_PATH = (
+    "/shop-faas/mmchannelstradedeposit/home/cgi/getCategoryDeposit"
+)
+CATEGORY_REQUIREMENT_PATH = (
+    "/shop-faas/mmchannelstradecategory/cgi/category/"
+    "checkNeedQualificationByCategoryIds"
+)
+CATEGORY_ADD_PATH = (
+    "/shop-faas/mmchannelstradecategory/cgi/category/"
+    "batchAddCategory"
+)
+
+TAB_STATUSES: dict[str, tuple[int, ...]] = {
+    "sales": (5,),
+    "audit": (2,),
+    "failed": (3,),
+    "draft": (0,),
+    "offline": (11, 12, 13, 20),
+    "recycle": (6,),
+    "strategy": (7,),
+}
+
+PRODUCT_STATUS_NAMES = {
+    0: "草稿箱",
+    1: "草稿箱",
+    2: "审核中",
+    3: "审核失败",
+    4: "审核成功",
+    5: "销售中",
+    6: "回收站",
+    7: "上架策略生效中",
+    10: "待删除",
+    11: "已下架",
+    12: "售罄下架",
+    13: "平台下架",
+    20: "封禁下架",
+}
+
+AUDIT_STATUS_NAMES = {
+    1: "编辑中",
+    2: "审核中",
+    3: "审核失败",
+    4: "审核成功",
+}
+
+
+class ShopPrivateError(RuntimeError):
+    pass
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _first(item: dict[str, Any], *keys: str, default: Any = "") -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+class ShopPrivateClient:
+    """Merchant-backend adapter using the user's existing web login.
+
+    These are page-backend (shop-faas) endpoints, not public OpenAPI endpoints.
+    They are isolated here so official API paths can remain the primary choice.
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        store: Store,
+        use_system_proxy: bool = False,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self.store = store
+        payload = db.get_web_cookies(store.id)
+        cookies = normalize_cookies((payload or {}).get("cookies") or [])
+        if not cookies:
+            raise ShopPrivateError("店铺未登录网页后台")
+        cookie_map = {
+            str(cookie["name"]): str(cookie["value"])
+            for cookie in cookies
+        }
+        self.session = requests.Session()
+        self.session.trust_env = use_system_proxy
+        self._headers = {
+            "Cookie": cookie_header(cookies),
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "zh-CN,zh;q=0.9",
+            "biz_magic": cookie_map.get("biz_magic", ""),
+            "potter-scene": "weixinShop",
+            "origin": BASE_URL,
+            "referer": f"{BASE_URL}/shop/home",
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/132.0.0.0 Safari/537.36"
+            ),
+            "content-type": "application/json",
+        }
+        self._sleep = sleeper
+        self._last_request = 0.0
+        self._min_interval = 0.18
+
+    def _post(
+        self,
+        path: str,
+        body: dict[str, Any],
+        timeout: int = 25,
+    ) -> dict[str, Any]:
+        delay = self._min_interval - (time.monotonic() - self._last_request)
+        if delay > 0:
+            self._sleep(delay)
+        try:
+            response = self.session.post(
+                BASE_URL + path,
+                params={"token": "", "lang": "zh_CN"},
+                headers=self._headers,
+                json=body,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise ShopPrivateError(f"商家后台网络异常：{exc}") from exc
+        finally:
+            self._last_request = time.monotonic()
+        if response.status_code in {401, 403, 429}:
+            raise ShopPrivateError(
+                f"商家后台拒绝请求（HTTP {response.status_code}），请重新扫码"
+            )
+        if response.status_code >= 400:
+            raise ShopPrivateError(
+                f"商家后台请求失败（HTTP {response.status_code}）"
+            )
+        lowered = response.text[:100000].lower()
+        if "扫码进入我的小店" in response.text or "/login" in lowered:
+            raise ShopPrivateError("网页登录已失效，请重新扫码")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise ShopPrivateError("商家后台返回了非 JSON 页面") from exc
+        if not isinstance(result, dict):
+            raise ShopPrivateError("商家后台返回格式异常")
+        code = result.get("code")
+        if code not in (None, 0, "0") or result.get("errcode") not in (None, 0, "0"):
+            message = (
+                result.get("errmsg")
+                or result.get("errMsg")
+                or result.get("message")
+                or result.get("error")
+                or f"商家后台接口返回 code={code}"
+            )
+            raise ShopPrivateError(str(message))
+        data = result.get("data")
+        check = data if isinstance(data, dict) else result
+        if (
+            check.get("success") is False
+            or _as_int(check.get("ret"), 0) != 0
+            or _as_int(check.get("errcode"), 0) != 0
+        ):
+            message = (
+                check.get("errMsg")
+                or check.get("errmsg")
+                or check.get("message")
+                or "商家后台接口返回失败"
+            )
+            raise ShopPrivateError(str(message))
+        return result
+
+    def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        timeout: int = 25,
+    ) -> dict[str, Any]:
+        request_params = {"token": "", "lang": "zh_CN"}
+        if params:
+            request_params.update(params)
+        try:
+            response = self.session.get(
+                BASE_URL + path,
+                params=request_params,
+                headers=self._headers,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise ShopPrivateError(f"商家后台网络异常：{exc}") from exc
+        if response.status_code in {401, 403, 429}:
+            raise ShopPrivateError(
+                f"商家后台拒绝请求（HTTP {response.status_code}），请重新扫码"
+            )
+        if response.status_code >= 400:
+            raise ShopPrivateError(
+                f"商家后台请求失败（HTTP {response.status_code}）"
+            )
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise ShopPrivateError("商家后台返回了非 JSON 页面") from exc
+        return result
+
+    @staticmethod
+    def _data(result: dict[str, Any]) -> dict[str, Any]:
+        data = result.get("data")
+        return data if isinstance(data, dict) else result
+
+    def scan_page(
+        self,
+        tab_key: str,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        if tab_key not in TAB_STATUSES:
+            raise ValueError(f"未知商品页签：{tab_key}")
+        body = {
+            "pageSize": max(1, int(page_size)),
+            "productStatus": [-1],
+            "productSource": "[1,16,32]",
+            "searchSource": 1,
+            "useNew": True,
+            "pageNum": max(1, int(page)),
+            "status": list(TAB_STATUSES[tab_key]),
+        }
+        return self._data(self._post(SCAN_PATH, body))
+
+    def status_counts(self) -> dict[str, int]:
+        counts = {}
+        for key in TAB_STATUSES:
+            data = self.scan_page(key, page=1, page_size=1)
+            counts[key] = _as_int(data.get("totalNum"))
+        return counts
+
+    def audit_success_today(self, max_pages: int = 5) -> int:
+        start = int(
+            datetime.combine(date.today(), datetime_time.min).timestamp()
+        )
+        count = 0
+        newest = 0.0
+        for page in range(1, max(1, int(max_pages)) + 1):
+            data = self.scan_page("sales", page=page, page_size=50)
+            rows = data.get("productList") or []
+            if isinstance(rows, dict):
+                rows = rows.get("list") or rows.get("items") or []
+            if not rows:
+                break
+            page_count = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                audit_info = row.get("auditResultInfo")
+                audit_info = (
+                    audit_info if isinstance(audit_info, dict) else {}
+                )
+                timestamp = _as_int(
+                    _first(
+                        audit_info,
+                        "auditTimestamp",
+                        "auditPassTime",
+                        "auditTime",
+                        default=_first(
+                            row,
+                            "auditTimestamp",
+                            "auditPassTime",
+                            "auditTime",
+                            default=0,
+                        ),
+                    )
+                )
+                if timestamp >= start:
+                    page_count += 1
+                newest = max(newest, float(timestamp))
+            count += page_count
+            if len(rows) < 50:
+                break
+            if page > 1 and page_count == 0 and newest < start:
+                break
+        return count
+
+    def scan_products(
+        self,
+        tab_key: str,
+        max_pages: int | None = 10,
+        page_size: int = 50,
+        stop: Callable[[], bool] | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
+    ) -> list[Product]:
+        first = self.scan_page(tab_key, page=1, page_size=page_size)
+        if max_pages is None and ("totalNum" not in first or "productList" not in first):
+            raise ShopPrivateError("商品接口缺少总数或列表，无法确认最新商品")
+        total = _as_int(first.get("totalNum"), -1)
+        if total < 0:
+            raise ShopPrivateError("商品接口总数格式异常")
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if max_pages is not None:
+            total_pages = min(max(1, max_pages), total_pages)
+        products: list[Product] = []
+        for page in range(1, total_pages + 1):
+            if stop and stop():
+                break
+            data = (
+                first
+                if page == 1
+                else self.scan_page(tab_key, page=page, page_size=page_size)
+            )
+            rows = data.get("productList")
+            if rows is None and max_pages is not None:
+                rows = []
+            if isinstance(rows, dict):
+                rows = rows.get("list") or rows.get("items") or []
+            if not isinstance(rows, list):
+                raise ShopPrivateError("商品接口列表格式异常")
+            if max_pages is None and _as_int(data.get("totalNum"), -1) != total:
+                raise ShopPrivateError("查询期间商品数量发生变化，请重新查询")
+            for item in rows:
+                if isinstance(item, dict):
+                    products.append(self._parse_product(item))
+            if on_progress:
+                on_progress(tab_key, page, total_pages)
+            if len(rows) < page_size:
+                break
+        if max_pages is None and not (stop and stop()):
+            if len({product.product_id for product in products if product.product_id}) != total:
+                raise ShopPrivateError("商品分页结果不完整，请重新查询")
+        return products
+
+    @staticmethod
+    def _parse_product(item: dict[str, Any]) -> Product:
+        product_id = str(
+            _first(
+                item,
+                "spuId",
+                "spu_id",
+                "productId",
+                "product_id",
+                default="",
+            )
+        )
+        if not product_id and isinstance(item.get("productKey"), dict):
+            product_id = str(item["productKey"].get("productId") or "")
+        title = str(
+            _first(item, "title", "productTitle", "name", "productName")
+        ).strip()
+        status = _as_int(item.get("status"), 0)
+        edit_status = _as_int(item.get("editStatus"), 0)
+        price = _first(item, "price", "lowSalePrice", default=0)
+        stock = _first(
+            item,
+            "totalStockNum",
+            "stockNum",
+            "spuTotalStockNum",
+            default=0,
+        )
+        if not stock and isinstance(item.get("spuTotalStock"), dict):
+            stock = item["spuTotalStock"].get("stockNum") or 0
+        sold = _first(item, "soldNum", "totalSoldNum", default=0)
+        listing_time = _as_int(item.get("listingTime"), 0)
+        audit_info = item.get("auditResultInfo")
+        audit_time = (
+            _as_int(audit_info.get("auditTimestamp"), 0)
+            if isinstance(audit_info, dict)
+            else 0
+        )
+        raw = {
+            **item,
+            "_private_source": "shop-faas",
+            "_private_audit": AUDIT_STATUS_NAMES.get(edit_status, str(edit_status)),
+            "_private_listing_time": listing_time,
+            "_private_audit_time": audit_time,
+            "total_sold_num": _as_int(sold),
+        }
+        return Product(
+            store_id=0,
+            store_name="",
+            product_id=product_id,
+            title=title,
+            status=status,
+            status_text=PRODUCT_STATUS_NAMES.get(status, str(status)),
+            edit_status=edit_status,
+            min_price=_as_int(price),
+            sku_count=len(item.get("skuList") or []),
+            stock_total=_as_int(stock),
+            spu_code=str(item.get("spuCode") or item.get("spu_code") or ""),
+            out_product_id=str(
+                item.get("outProductId") or item.get("out_product_id") or ""
+            ),
+            head_img=str(item.get("headImg") or item.get("head_img") or ""),
+            raw=raw,
+        )
+
+    def product_metrics(
+        self,
+        product_ids: list[str],
+        page_size: int = 200,
+        stop: Callable[[], bool] | None = None,
+    ) -> dict[str, dict[str, int]]:
+        remaining = list(dict.fromkeys(str(value) for value in product_ids if value))
+        output: dict[str, dict[str, int]] = {}
+        while remaining:
+            if stop and stop():
+                break
+            batch = remaining[:page_size]
+            remaining = remaining[page_size:]
+            body = {
+                "spuIdList": batch,
+                "offset": 0,
+                "limit": len(batch),
+                "sortMetricCode": "shopxspu_growth_pay_product_cnt_30d_2",
+                "sortRule": "desc",
+            }
+            data = self._data(self._post(METRIC_PATH, body))
+            rows = data.get("rowsMap") or []
+            if isinstance(rows, dict):
+                rows = list(rows.values())
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                value = row.get("value")
+                if not isinstance(value, dict):
+                    continue
+                if str(value.get("scene_type_", "0")) != "0":
+                    continue
+                product_id = str(value.get("spu_id_") or "")
+                if not product_id:
+                    continue
+                metrics = output.setdefault(
+                    product_id,
+                    {"views30": 0, "sold30": 0},
+                )
+                metrics["views30"] = max(
+                    metrics["views30"],
+                    _as_int(
+                        value.get("shopxspu_growth_product_view_cnt_30d_2")
+                    ),
+                )
+                metrics["sold30"] = max(
+                    metrics["sold30"],
+                    _as_int(
+                        value.get("shopxspu_growth_pay_product_cnt_30d_2")
+                    ),
+                )
+        return output
+
+    def activity_products(
+        self,
+        activity_id: int = 1323,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        return self._data(
+            self._post(
+                ACTIVITY_PRODUCTS_PATH,
+                {
+                    "platformActivityId": int(activity_id),
+                    "pageNum": int(page),
+                    "pageSize": int(page_size),
+                },
+            )
+        )
+
+    def activity_submitted_products(
+        self,
+        activity_id: int = 1323,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        first = self.activity_products(
+            activity_id,
+            page=1,
+            page_size=page_size,
+        )
+        try:
+            total = int(first.get("totalNum") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        max_pages = max(1, (total + page_size - 1) // page_size)
+        for page in range(1, max_pages + 1):
+            data = (
+                first
+                if page == 1
+                else self.activity_products(
+                    activity_id,
+                    page=page,
+                    page_size=page_size,
+                )
+            )
+            page_rows = data.get("productList") or []
+            if not isinstance(page_rows, list) or not page_rows:
+                break
+            added = 0
+            for row in page_rows:
+                if not isinstance(row, dict):
+                    continue
+                key = (
+                    str(row.get("productId") or ""),
+                    str(row.get("skuId") or ""),
+                )
+                if not all(key) or key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+                added += 1
+            if added == 0 or len(page_rows) < page_size:
+                break
+        return rows
+
+    def platform_activities(self) -> list[dict[str, Any]]:
+        activities: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for page in range(1, 21):
+            result = self._get(
+                ACTIVITY_LIST_PATH,
+                {"pageNum": page, "pageSize": 50},
+            )
+            rows = result.get("shopPlatformActivityList") or []
+            if not isinstance(rows, list) or not rows:
+                break
+            added = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                activity_id = str(
+                    row.get("activityId")
+                    or row.get("platformActivityId")
+                    or ""
+                )
+                if not activity_id or activity_id in seen:
+                    continue
+                seen.add(activity_id)
+                item = dict(row)
+                item["activity_id"] = activity_id
+                activities.append(item)
+                added += 1
+            if added == 0:
+                break
+        return activities
+
+    def snapup_activities(
+        self,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        activities: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        page = 1
+        while page <= 100:
+            result = self._get(
+                SNAPUP_LIST_PATH,
+                {"pageNum": page, "pageSize": page_size},
+            )
+            rows = result.get("snapupTasks") or []
+            if not isinstance(rows, list) or not rows:
+                break
+            added = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                activity_id = str(row.get("activityId") or "")
+                if not activity_id or activity_id in seen:
+                    continue
+                seen.add(activity_id)
+                extra = row.get("extra") or {}
+                products = (
+                    extra.get("snapupProducts") or []
+                    if isinstance(extra, dict)
+                    else []
+                )
+                item = dict(row)
+                item["activity_id"] = activity_id
+                item["product_count"] = (
+                    len(products) if isinstance(products, list) else 0
+                )
+                activities.append(item)
+                added += 1
+            try:
+                total = int(result.get("totalNum") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if added == 0 or (total > 0 and page * page_size >= total):
+                break
+            page += 1
+        return activities
+
+    def snapup_activity(self, activity_id: str) -> dict[str, Any]:
+        result = self._get(
+            SNAPUP_DETAIL_PATH,
+            {"activityId": str(activity_id)},
+        )
+        task = result.get("task")
+        return dict(task) if isinstance(task, dict) else {}
+
+    def fetch_snapup_products(
+        self,
+        product_ids: list[str],
+        batch_size: int = 20,
+    ) -> list[dict[str, Any]]:
+        normalized = list(
+            dict.fromkeys(str(product_id) for product_id in product_ids if product_id)
+        )
+        batch_size = max(1, min(50, int(batch_size)))
+        products: list[dict[str, Any]] = []
+        for index in range(0, len(normalized), batch_size):
+            result = self._get(
+                SNAPUP_PRODUCTS_PATH,
+                {
+                    "productIds": normalized[index : index + batch_size],
+                    "needSku": True,
+                    "needStock": True,
+                },
+            )
+            rows = result.get("products") or []
+            if isinstance(rows, list):
+                products.extend(
+                    dict(row) for row in rows if isinstance(row, dict)
+                )
+        return products
+
+    def create_snapup_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post(
+            SNAPUP_CREATE_PATH,
+            {**payload, "uploadSource": 6},
+        )
+
+    def stop_snapup_activity(self, activity_id: str) -> dict[str, Any]:
+        return self._post(
+            SNAPUP_STOP_PATH,
+            {"activityId": str(activity_id), "uploadSource": 6},
+        )
+
+    def delete_snapup_activity(self, activity_id: str) -> dict[str, Any]:
+        return self._post(
+            SNAPUP_DELETE_PATH,
+            {"activityId": str(activity_id)},
+        )
+
+    def apply_platform_activity(
+        self,
+        activity_id: int,
+    ) -> dict[str, Any]:
+        return self._post(
+            ACTIVITY_APPLY_PATH,
+            {"platformActivityId": int(activity_id)},
+        )
+
+    def account_close_status(self) -> int | None:
+        try:
+            result = self._get(ACCOUNT_CLOSE_STATUS_PATH)
+        except ShopPrivateError:
+            return None
+        value = result.get("ecAcctStatus")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def activity_update_products(
+        self,
+        activity_id: int,
+        items: list[dict[str, Any]],
+        action_type: int,
+        del_source: int = 0,
+        add_source: int = 0,
+    ) -> dict[str, Any]:
+        return self._data(
+            self._post(
+                ACTIVITY_UPDATE_PATH,
+                {
+                    "platformActivityId": int(activity_id),
+                    "productList": items,
+                    "actionType": int(action_type),
+                    "delSource": int(del_source),
+                    "addSource": int(add_source),
+                },
+            )
+        )
+
+    def activity_check_prices(
+        self,
+        activity_id: int,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self._data(
+            self._post(
+                ACTIVITY_CHECK_PRICE_PATH,
+                {
+                    "platformActivityId": int(activity_id),
+                    "productList": items,
+                },
+            )
+        )
+
+    def activity_validate_products(
+        self,
+        activity_id: int,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self._post(
+            ACTIVITY_VALIDATE_PATH,
+            {
+                "skuList": items,
+                "platformActivityId": str(int(activity_id)),
+                "checkSource": 3,
+                "applyType": 0,
+            },
+        )
+
+    def activity_eligible_products(
+        self,
+        activity_id: int,
+        page_size: int = 50,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for page in range(1, 201):
+            result = self._post(
+                ACTIVITY_CAN_APPLY_PATH,
+                {
+                    "platformActivityId": str(int(activity_id)),
+                    "page": page,
+                    "pageSize": int(page_size),
+                    "queryWord": "",
+                },
+            )
+            data = result.get("data") or {}
+            request_info = data.get("requestProductInfoList") or {}
+            page_rows = request_info.get("resultList") or []
+            if not isinstance(page_rows, list) or not page_rows:
+                break
+            added = 0
+            for row in page_rows:
+                if not isinstance(row, dict):
+                    continue
+                product = row.get("product") or {}
+                key = (
+                    str(product.get("productId") or ""),
+                    str(product.get("skuId") or ""),
+                )
+                if not all(key) or key in seen:
+                    continue
+                seen.add(key)
+                item = dict(row)
+                item["productId"] = key[0]
+                item["skuId"] = key[1]
+                rows.append(item)
+                added += 1
+            if added == 0:
+                break
+            try:
+                total_pages = int(data.get("totalPage") or 0)
+            except (TypeError, ValueError):
+                total_pages = 0
+            if total_pages and page >= total_pages:
+                break
+        return rows
+
+    def activity_submit_prices(
+        self,
+        activity_id: int,
+        items: list[dict[str, Any]],
+        apply_type: int = 1,
+    ) -> dict[str, Any]:
+        return self._data(
+            self._post(
+                ACTIVITY_SUBMIT_PRICE_PATH,
+                {
+                    "platformActivityId": int(activity_id),
+                    "productList": items,
+                    "applyType": int(apply_type),
+                },
+            )
+        )
+
+    def platform_violation_products(self) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for path, params in (
+            (
+                VIOLATION_LIST_PATH,
+                {"page": 1, "pageSize": 100, "violationType": "finder"},
+            ),
+            (
+                VIOLATION_PREWARN_PATH,
+                {"pageNum": 1, "pageSize": 100},
+            ),
+        ):
+            try:
+                result = self._get(path, params)
+            except ShopPrivateError:
+                continue
+            data = self._data(result)
+            if not isinstance(data, dict):
+                data = {}
+            record = result.get("record")
+            if not isinstance(record, dict):
+                record = data.get("record") if isinstance(data, dict) else {}
+            rows = (
+                data.get("list")
+                or data.get("rows")
+                or data.get("records")
+                or data.get("pageProducts")
+                or (
+                    record.get("items")
+                    if isinstance(record, dict)
+                    else None
+                )
+                or []
+            )
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                product_id = str(
+                    _first(
+                        row,
+                        "productId",
+                        "spuId",
+                        "spu_id",
+                        "product_id",
+                    )
+                )
+                title = str(
+                    _first(row, "title", "productTitle", "productName", "name")
+                    or _first(
+                        row.get("punishObject")
+                        if isinstance(row.get("punishObject"), list)
+                        and row.get("punishObject")
+                        and isinstance(row.get("punishObject")[0], dict)
+                        else {},
+                        "productDesc",
+                        "name",
+                        "title",
+                    )
+                )
+                reason = str(
+                    _first(
+                        row,
+                        "punishReason",
+                        "reason",
+                        "preWarnExplain",
+                        "rectificationMethod",
+                        "suggest",
+                    )
+                )
+                if product_id:
+                    output.append(
+                        {
+                            "product_id": product_id,
+                            "title": title,
+                            "reason": reason or "平台违规/预警",
+                            "raw": row,
+                        }
+                    )
+        return output
+
+    def platform_violation_records(self) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for source_name, path, params in (
+            (
+                "违规记录",
+                VIOLATION_LIST_PATH,
+                {"page": 1, "pageSize": 100, "violationType": "finder"},
+            ),
+        ):
+            try:
+                result = self._get(path, params)
+            except ShopPrivateError:
+                continue
+            data = self._data(result)
+            if not isinstance(data, dict):
+                data = {}
+            record = result.get("record")
+            if not isinstance(record, dict):
+                record = data.get("record") if isinstance(data, dict) else {}
+            rows = (
+                data.get("list")
+                or data.get("rows")
+                or data.get("records")
+                or data.get("pageProducts")
+                or (
+                    record.get("items")
+                    if isinstance(record, dict)
+                    else None
+                )
+                or []
+            )
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                objects = (
+                    row.get("punishObject")
+                    or row.get("objects")
+                    or []
+                )
+                first_object = (
+                    objects[0]
+                    if isinstance(objects, list)
+                    and objects
+                    and isinstance(objects[0], dict)
+                    else {}
+                )
+                product_id = str(
+                    _first(
+                        row,
+                        "productId",
+                        "spuId",
+                        "spu_id",
+                        "product_id",
+                        default=_first(
+                            first_object,
+                            "productId",
+                            "spuId",
+                            "id",
+                        ),
+                    )
+                )
+                title = str(
+                    _first(
+                        row,
+                        "title",
+                        "productTitle",
+                        "productName",
+                        "preWarnTitle",
+                        "name",
+                        default=_first(
+                            first_object,
+                            "productDesc",
+                            "name",
+                            "title",
+                            "productName",
+                        ),
+                    )
+                )
+                violation_type = str(
+                    _first(
+                        row,
+                        "punishReason",
+                        "reason",
+                        "preWarnTypeName",
+                        "warnTypeName",
+                        "typeName",
+                        default="平台违规/预警",
+                    )
+                )
+                status_value = _first(
+                    row,
+                    "statusName",
+                    "status_name",
+                    "punishStatusName",
+                    "preWarnStatusName",
+                    default=row.get("status", ""),
+                )
+                status = {
+                    "5": "超时未申诉",
+                    "14": "已撤销",
+                    "1": "待处理",
+                    "2": "申诉中",
+                    "3": "申诉成功",
+                    "4": "申诉驳回",
+                }.get(str(status_value), str(status_value))
+                fix = str(
+                    _first(
+                        row,
+                        "rectificationMethod",
+                        "recommendation",
+                        "preWarnExplain",
+                        "suggest",
+                        "punishMethod",
+                        default="",
+                    )
+                )
+                output.append(
+                    {
+                        "record_id": str(
+                            _first(
+                                row,
+                                "punishUuid",
+                                "preWarnId",
+                                "id",
+                                default=f"{source_name}-{len(output)}",
+                            )
+                        ),
+                        "product_id": product_id,
+                        "title": title or violation_type,
+                        "reason": violation_type,
+                        "source": source_name,
+                        "status": status,
+                        "fix": fix,
+                        "time": str(
+                            _first(
+                                row,
+                                "punishTime",
+                                "preWarnTime",
+                                "createTime",
+                                "create_time",
+                                default="",
+                            )
+                        ),
+                        "raw": row,
+                    }
+                )
+        output.extend(self.prewarning_records())
+        return output
+
+    def prewarning_records(self) -> list[dict[str, Any]]:
+        try:
+            type_result = self._get(
+                "/shop-faas/mmecnodeviolationsec/prewarn/cgi/"
+                "getPreWarnTypeList"
+            )
+        except ShopPrivateError:
+            type_result = {}
+        type_map = {
+            str(key): str(value)
+            for key, value in type_result.items()
+            if key not in {"code", "msg"}
+        }
+        try:
+            result = self._post(
+                VIOLATION_PREWARN_PATH,
+                {
+                    "offset": 0,
+                    "rows": 200,
+                    "count": 200,
+                    "idx": 0,
+                },
+            )
+        except ShopPrivateError:
+            return []
+        objects = result.get("preWarnObjects") or []
+        if not isinstance(objects, list):
+            return []
+        status_names = {
+            1: "待处理",
+            2: "已违规",
+            3: "预警解除",
+            4: "预警结束",
+            5: "审核中",
+        }
+        output = []
+        for row in objects:
+            if not isinstance(row, dict):
+                continue
+            warn_type = str(row.get("warnType") or "")
+            tag = type_map.get(warn_type, "店铺预警")
+            object_info = row.get("warnObjectInfo")
+            object_info = (
+                object_info if isinstance(object_info, dict) else {}
+            )
+            object_items = object_info.get("objectItems")
+            if not isinstance(object_items, list) or not object_items:
+                object_items = [{}]
+            for item in object_items:
+                if not isinstance(item, dict):
+                    continue
+                status_code = _as_int(row.get("preWarnStatus"))
+                fix = str(
+                    row.get("rectificationMethod")
+                    or row.get("preWarnExplain")
+                    or ""
+                )
+                output.append(
+                    {
+                        "record_id": str(
+                            row.get("preWarnId")
+                            or f"warn-{len(output)}"
+                        ),
+                        "product_id": str(item.get("ids") or ""),
+                        "title": str(
+                            item.get("name")
+                            or tag
+                            or "店铺预警"
+                        ),
+                        "reason": tag,
+                        "source": "预警",
+                        "status": status_names.get(
+                            status_code, str(status_code)
+                        ),
+                        "fix": fix,
+                        "time": str(row.get("preWarnTime") or ""),
+                        "raw": row,
+                    }
+                )
+        return output
+
+    def batch_product_action(
+        self,
+        product_ids: list[str],
+        way: str,
+    ) -> dict[str, Any]:
+        paths = {
+            "recycle": PRODUCT_RECYCLE_PATH,
+            "real": PRODUCT_REAL_DELETE_PATH,
+            "offshelf": PRODUCT_UNLIST_PATH,
+        }
+        if way not in paths:
+            raise ValueError("不支持的商品批量处理方式")
+        result = self._data(
+            self._post(
+                paths[way],
+                {
+                    "ids": [str(value) for value in product_ids],
+                    "uploadSource": 6,
+                },
+            )
+        )
+        if result.get("success") is not True and not (
+            "ret" in result and _as_int(result["ret"], -1) == 0
+        ):
+            raise ShopPrivateError("商品操作没有返回明确成功确认，请重新查询并核对微信后台")
+        return result
+
+    def realtime_overview(self) -> dict[str, Any]:
+        return self.period_overview(1, offset_days=0)
+
+    def period_overview(
+        self,
+        days: int = 1,
+        offset_days: int = 1,
+    ) -> dict[str, Any]:
+        span = max(1, int(days))
+        last = date.today() - timedelta(days=max(0, int(offset_days)))
+        first = last - timedelta(days=span - 1)
+        start = int(
+            datetime.combine(first, datetime_time.min).timestamp() * 1000
+        )
+        end = (
+            int(time.time() * 1000)
+            if offset_days == 0
+            else int(
+                datetime.combine(last, datetime_time.max).timestamp() * 1000
+            )
+        )
+        result = self._post(
+            REALTIME_STATS_PATH,
+            {
+                "time_query": {
+                    "dateFormat": 1,
+                    "dateType": 0,
+                    "dateRange": span,
+                    "startMs": start,
+                    "endMs": end,
+                }
+            },
+        )
+        return dict(result.get("total") or {})
+
+    def todo_overview(self) -> dict[str, int]:
+        result = self._get(TODO_STATS_PATH)
+        mapping = {
+            "待发货": "wait_send",
+            "物流异常": "express_err",
+            "售后": "aftersale",
+            "服务保障": "guarantee",
+            "客诉工单": "complaint",
+            "店铺预警": "warn",
+            "店铺违规": "violation",
+        }
+        output = {}
+        for item in result.get("list") or []:
+            if not isinstance(item, dict):
+                continue
+            key = mapping.get(str(item.get("title") or "").strip())
+            if key:
+                output[key] = _as_int(item.get("num"))
+        return output
+
+    def score_overview(self) -> dict[str, float | None]:
+        result = self._post(
+            SCORE_STATS_PATH,
+            {
+                "days": 14,
+                "scoreTypeList": [11, 12, 13, 14, 1000],
+            },
+        )
+        output: dict[str, float | None] = {}
+        for key, target in (
+            ("dsrScore", "dsr"),
+            ("productScore", "score_product"),
+            ("deliverScore", "score_deliver"),
+            ("serviceScore", "score_service"),
+        ):
+            block = result.get(key)
+            if isinstance(block, dict):
+                try:
+                    output[target] = float(block.get("curValue"))
+                except (TypeError, ValueError):
+                    output[target] = None
+            else:
+                output[target] = None
+        return output
+
+    def evaluation_overview(self) -> dict[str, float | None]:
+        result = self._post(
+            SCORE_STATS_PATH,
+            {
+                "days": 14,
+                "scoreTypeList": [70, 64, 1000],
+            },
+        )
+        good = result.get("proValidGoodEvalRatio")
+        if not isinstance(good, dict) or not good:
+            good = result.get("afterSaleNpsGoodRatio")
+        quality = result.get("productQualityRatio_30d")
+
+        def value(block: Any) -> float | None:
+            if not isinstance(block, dict):
+                return None
+            try:
+                return float(block.get("curValue"))
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "good_eval_ratio": value(good) or 0.0,
+            "quality_refund_ratio": value(quality) or 0.0,
+        }
+
+    def account_balance(self) -> dict[str, int]:
+        result = self._get(ACCOUNT_BALANCE_PATH)
+        data = self._data(result)
+        return {
+            "cash": _as_int(data.get("availableAmount")),
+            "frozen": _as_int(data.get("tempFrozenAmount")),
+            "settle": _as_int(data.get("pendingAmount")),
+        }
+
+    def deposit_balance(self) -> int:
+        result = self._get(DEPOSIT_STATE_PATH)
+        return _as_int(result.get("depositBalance"))
+
+    @staticmethod
+    def _category_leaves(
+        nodes: list[dict[str, Any]],
+        parents: list[str] | None = None,
+        parent_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        parents = parents or []
+        parent_ids = parent_ids or []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            path = [*parents, str(node.get("label") or "")]
+            category_id = str(node.get("value") or "")
+            id_path = [
+                *parent_ids,
+                *([category_id] if category_id else []),
+            ]
+            children = node.get("options")
+            if isinstance(children, list) and children:
+                output.extend(
+                    ShopPrivateClient._category_leaves(
+                        children,
+                        path,
+                        id_path,
+                    )
+                )
+                continue
+            if not node.get("leaf") or _as_int(node.get("state"), 0) != 0:
+                continue
+            output.append(
+                {
+                    "category_id": category_id,
+                    "id_path": id_path,
+                    "name": str(node.get("label") or ""),
+                    "path": " / ".join(value for value in path if value),
+                    "forbidden": bool(
+                        node.get("isForbidForSpecialization")
+                    ),
+                }
+            )
+        return output
+
+    def category_catalog(self) -> list[dict[str, Any]]:
+        tree_result = self._get(FULL_CATEGORY_TREE_PATH)
+        return self._category_leaves(
+            list(tree_result.get("productCats") or [])
+        )
+
+    def category_candidates(
+        self,
+        max_deposit_cents: int,
+    ) -> list[dict[str, Any]]:
+        tree_result = self._get(FULL_CATEGORY_TREE_PATH)
+        leaves = self._category_leaves(
+            list(tree_result.get("productCats") or [])
+        )
+        if not leaves:
+            return []
+        existing: set[str] = set()
+        for relation_status in (1, 2):
+            relation_result = self._post(
+                CATEGORY_RELATION_PATH,
+                {"status": relation_status},
+            )
+            existing.update(
+                str(item.get("id") or "")
+                for item in relation_result.get("categoryRelationList") or []
+                if isinstance(item, dict)
+            )
+        candidates = [
+            item
+            for item in leaves
+            if item["category_id"]
+            and item["category_id"] not in existing
+            and not item["forbidden"]
+        ]
+        if not candidates:
+            return []
+        ids = [item["category_id"] for item in candidates]
+        deposit_by_id: dict[str, dict[str, Any]] = {}
+        requirement_by_id: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(ids), 200):
+            chunk = ids[start : start + 200]
+            deposit_result = self._post(
+                CATEGORY_DEPOSIT_PATH,
+                {
+                    "categoryList": [
+                        {"categoryId": category_id}
+                        for category_id in chunk
+                    ]
+                },
+            )
+            for item in deposit_result.get("categoryDepositList") or []:
+                if not isinstance(item, dict):
+                    continue
+                category = item.get("category") or {}
+                category_id = str(category.get("categoryId") or "")
+                if category_id:
+                    deposit_by_id[category_id] = item
+            requirement_result = self._post(
+                CATEGORY_REQUIREMENT_PATH,
+                {"categoryIds": [int(value) for value in chunk]},
+            )
+            requirement_data = self._data(requirement_result)
+            for category_id in requirement_data.get(
+                "needQualificationIdList"
+            ) or []:
+                requirement_by_id[str(category_id)] = {"required": True}
+        rows: list[dict[str, Any]] = []
+        for item in candidates:
+            category_id = item["category_id"]
+            deposit = deposit_by_id.get(category_id)
+            if not deposit:
+                continue
+            required = _as_int(deposit.get("requiredDeposit"))
+            if required > max(0, int(max_deposit_cents)):
+                continue
+            rows.append(
+                {
+                    **item,
+                    "required_deposit": required,
+                    "amount_to_pay": _as_int(deposit.get("amountToPay")),
+                    "deposit_balance": _as_int(
+                        deposit.get("depositBalance")
+                    ),
+                    "status": (
+                        "需资质"
+                        if requirement_by_id.get(category_id)
+                        else "可申请"
+                    ),
+                }
+            )
+        return rows
+
+    def batch_add_categories(
+        self,
+        category_ids: list[str],
+    ) -> dict[str, Any]:
+        ids = [int(value) for value in category_ids if str(value).isdigit()]
+        if not ids:
+            return {}
+        return self._data(
+            self._post(CATEGORY_ADD_PATH, {"categoryIdList": ids})
+        )
+
+    def category_relation_statuses(
+        self,
+        category_ids: list[str],
+    ) -> dict[str, str]:
+        requested = {
+            str(category_id)
+            for category_id in category_ids
+            if str(category_id)
+        }
+        found: dict[str, str] = {}
+        for relation_status, label in ((1, "已生效"), (2, "审核中")):
+            result = self._post(
+                CATEGORY_RELATION_PATH,
+                {"status": relation_status},
+            )
+            for item in result.get("categoryRelationList") or []:
+                if not isinstance(item, dict):
+                    continue
+                category_id = str(
+                    item.get("id")
+                    or item.get("categoryId")
+                    or (item.get("category") or {}).get("categoryId")
+                    or ""
+                )
+                if category_id in requested:
+                    found[category_id] = label
+        return {
+            category_id: found.get(category_id, "未查到")
+            for category_id in requested
+        }
+
+    def recommend_overview(self, yesterday: bool = False) -> dict[str, int]:
+        day = date.today() - timedelta(days=1 if yesterday else 0)
+        start = datetime.combine(day, datetime_time.min)
+        end = (
+            datetime.combine(day, datetime_time(23, 59, 59))
+            if yesterday
+            else datetime.now()
+        )
+        result = self._post(
+            RECOMMEND_STATS_PATH,
+            {
+                "isToday": not yesterday,
+                "isYesterday": yesterday,
+                "time_query": {
+                    "dateFormat": 1,
+                    "dateType": 1,
+                    "startMs": int(start.timestamp() * 1000),
+                    "endMs": int(end.timestamp() * 1000),
+                },
+            },
+        )
+        data = result.get("data")
+        if isinstance(data, dict):
+            data = data.get("data")
+        total = (
+            data.get("total")
+            if isinstance(data, dict)
+            and isinstance(data.get("total"), dict)
+            else {}
+        )
+        return {
+            "exposure": _as_int(total.get("product_view_uv")),
+            "click": _as_int(total.get("product_click_uv")),
+            "orders": _as_int(total.get("pay_order_cnt")),
+            "gmv": _as_int(total.get("pay_gmv")),
+        }
+
+    def search_overview(self, days: int = 30) -> dict[str, int]:
+        span = max(1, min(int(days), 90))
+        last = date.today() - timedelta(days=1)
+        first = last - timedelta(days=span - 1)
+        start = int(time.mktime(first.timetuple()) * 1000)
+        end = int(
+            time.mktime(
+                datetime.combine(last, datetime_time.max).timetuple()
+            )
+            * 1000
+        )
+        result = self._post(
+            SEARCH_STATS_PATH,
+            {
+                "isToday": False,
+                "isYesterday": False,
+                "time_query": {
+                    "dateFormat": 2,
+                    "dateType": 0,
+                    "dateRange": span,
+                    "startMs": start,
+                    "endMs": end,
+                },
+            },
+        )
+        data = result.get("data")
+        if isinstance(data, dict):
+            data = data.get("data")
+        totals = (
+            data.get("total")
+            if isinstance(data, dict) and isinstance(data.get("total"), dict)
+            else {}
+        )
+        yesterday = date.today() - timedelta(days=1)
+        yday_key = yesterday.strftime("%Y%m%d")
+        trend = data.get("trend") if isinstance(data, dict) else []
+        yday_row = next(
+            (
+                row
+                for row in (trend or [])
+                if isinstance(row, dict)
+                and str(row.get("datetime") or "") == yday_key
+            ),
+            {},
+        )
+        return {
+            "visitors_30d": _as_int(totals.get("product_view_uv")),
+            "product_click_30d": _as_int(totals.get("product_click_uv")),
+            "search_pay_orders": _as_int(totals.get("pay_order_cnt")),
+            "search_pay_gmv": _as_int(totals.get("pay_gmv")),
+            "search_exposure_yesterday": _as_int(
+                yday_row.get("product_view_cnt")
+            ),
+        }

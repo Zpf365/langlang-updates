@@ -1,0 +1,26 @@
+# 澜琅 1.8.31 修改清单
+
+- `weimi_manager/ui/upload_page.py`
+  - 1688 offerId 写入商家编码。
+  - 上货成功后自动建立上家链接和 SKU 映射。
+  - 支持补齐历史已上传商品的上家关联。
+- `weimi_manager/ui/product_card_list.py`
+  - 标题、上家编码、商品 ID 复制。
+  - 标题快捷修改和上家更换入口。
+- `weimi_manager/ui/order_card_list.py`
+  - 地址复制、解密和改址入口。
+- `weimi_manager/ui/pages.py`
+  - 地址解密弹窗、地址复制和改址。
+  - 商品标题快捷修改和字段复制。
+  - 近期订单增量同步和勾选订单单独刷新。
+- `weimi_manager/db.py`
+  - 上架历史、上家链接和 SKU 映射原子保存。
+  - 商品关联统计返回上家商品 ID。
+- `weimi_manager/service.py`
+  - 单订单刷新接口。
+- `weimi_manager/account_store_sync.py`
+  - 店铺状态更新可跳过订单工作台和共享设置同步。
+- `weimi_manager/cloud_commands.py`
+  - 扩展仅本机设置前缀。
+- `supabase/migrations/202611150001_optimize_local_settings_sync.sql`
+  - 云端设置写入与拉取排除大体积本机数据。

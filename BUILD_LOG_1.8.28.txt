@@ -1,0 +1,23 @@
+澜琅 1.8.28 Windows 构建记录
+================================
+
+构建时间：2026-11-15 12:30（Asia/Shanghai）
+Python：3.11.9
+PyInstaller：6.22.3
+平台：Windows 10.0.26200 x64
+
+隔离环境：
+- PATH 仅保留 Python 3.11、Python Scripts、Windows System32 和 Windows。
+- QT_PLUGIN_PATH 已移除。
+- QML2_IMPORT_PATH 已移除。
+- LANGLANG_INCLUDE_TEST_ACCOUNTS=0。
+
+构建命令：
+
+python -m PyInstaller --clean --noconfirm LangLang.spec
+
+结果：
+- PyInstaller Analysis、PYZ、PKG、EXE、COLLECT 全部成功。
+- EXE 已实际启动，标题为：澜琅 · 登录 重构1.8.28。
+- 未打入 ICU、Qt6 或 QML 运行库。
+- warn-LangLang.txt 中没有本程序必需模块缺失。

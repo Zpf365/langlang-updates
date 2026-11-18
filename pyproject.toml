@@ -1,0 +1,35 @@
+[project]
+name = "weimi-manager"
+version = "1.8.41"
+description = "澜琅微信小店多店铺运营工作台（1.6.63 原界面重构版）"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "PySide6>=6.8,<7",
+    "playwright>=1.50",
+    "requests>=2.32",
+    "pillow>=10",
+    "openpyxl>=3.1",
+    "cryptography>=45",
+    "psutil>=6,<8",
+    "opencv-python>=4.10,<6",
+    "rapidocr-onnxruntime>=1.4,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-qt>=4.4,<5"]
+build = ["pyinstaller>=6.10,<7"]
+
+[project.scripts]
+weimi-manager = "weimi_manager.main:main"
+langlang = "weimi_manager.pyside.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+

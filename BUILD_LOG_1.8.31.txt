@@ -1,0 +1,24 @@
+澜琅 1.8.31 Windows 构建记录
+================================
+
+构建时间：2026-11-15 12:51（Asia/Shanghai）
+Python：3.11.9
+PyInstaller：6.22.3
+平台：Windows 10.0.26200 x64
+
+隔离环境：
+- PATH 仅保留 Python 3.11、Python Scripts、Windows System32 和 Windows。
+- QT_PLUGIN_PATH 已移除。
+- QML2_IMPORT_PATH 已移除。
+- LANGLANG_INCLUDE_TEST_ACCOUNTS=0。
+
+验证：
+- PyInstaller Analysis、PYZ、PKG、EXE、COLLECT 全部成功。
+- EXE 已实际启动，标题为：澜琅 · 登录 重构1.8.31。
+- 程序包未发现 Qt6、QML 或 ICU 运行库。
+- 程序包未发现测试账号、环境文件或 SQLite 数据库。
+- 发布目录 EXE 已再次实际启动，标题为：澜琅 · 登录 重构1.8.31。
+- 安装包：LangLang-1.8.31-win64.zip
+- 安装包 SHA256：285b411abe77dd4799b8decd7dfbd55949e84045c18920c8942475b8d7fc6781
+- 源码包：LangLang_1.8.31_Source.zip
+- 源码包 SHA256：71c6302ab8a849e9d174e5b8ff242e0d9eee8f4eb18434cce038f61d2f754c22

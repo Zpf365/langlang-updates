@@ -1,0 +1,23 @@
+# 澜琅 1.8.19 修改清单
+
+- `weimi_manager/ui/activity_center.py`
+  - 移除刷新和续期后台任务中重复、错误的 `command` 参数。
+  - 创建活动按店铺聚合商品，每店只创建一场活动。
+  - 商品预览增加分页、每页数量和前后页控制。
+  - 续期页增加删除选中活动和完成结果提示。
+- `weimi_manager/shop_private.py`
+  - 增加多商品活动详情、商品批量读取、创建、停止和删除接口。
+- `weimi_manager/service.py`
+  - 增加多商品活动创建与安全删除。
+  - 以后台真实商品状态过滤已删除、下架、售罄和无效价格商品。
+- `weimi_manager/cloud_commands.py`
+  - 增加多商品活动创建和删除的权限映射。
+- `tests/test_limited_discount.py`
+  - 增加禁止向任务层传业务方法名的回归断言。
+  - 增加多商品、200 商品上限、分页、删除和真实载荷结构测试。
+- `weimi_manager/__init__.py`
+  - 版本更新为 1.8.19。
+- `pyproject.toml`、`uv.lock`
+  - 同步项目版本。
+- `README.md`
+  - 更新版本和交接文档入口。

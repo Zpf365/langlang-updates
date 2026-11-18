@@ -1,0 +1,26 @@
+# 澜琅 1.8.41 修改清单
+
+- `weimi_manager/ui/sales_related_page.py`
+  - 多行链接输入及逐行下发。
+  - 原始微信小店链接校验。
+  - 逐条下发结果和失败行保留。
+- `tests/test_sales_related_navigation.py`
+  - 原始微信小店链接顺序回归测试。
+- `tools/package_pyside.py`
+  - 允许浏览器运行时携带必需的 `icudtl.dat`，同时继续拦截程序根目录中的意外 ICU 文件。
+- `tests/test_package_manifest.py`
+  - 浏览器运行时 ICU 数据打包边界回归测试。
+- `supabase/migrations/202611170001_mobile_sales_wechat_shop_queue.sql`
+  - 允许原始微信小店分享链接。
+  - 任务按创建顺序返回。
+  - 新增 `cart_added` 手机状态。
+- `supabase/migrations/202611170002_mobile_sales_raw_wechat_link.sql`
+  - 手机端手动创建任务也允许原始微信小店链接。
+- `D:\GPT\langlang-mobile`
+  - Android 1.2.0 前台任务服务、开始触发和剪贴板桥接。
+  - 移除悬浮窗和无障碍返回权限。
+- `weimi_manager/mobile_automation.py`
+  - ADB 截图、本地中文 OCR、微信加购状态机。
+  - 文件传输助手搜索、商品打开、规格数量选择和返回。
+- `supabase/migrations/202611170003_mobile_sales_owner_list_tasks.sql`
+  - 电脑读取当前设备任务及租约。
