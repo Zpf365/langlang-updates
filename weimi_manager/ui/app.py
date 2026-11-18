@@ -1395,6 +1395,13 @@ class MainWindow(tk.Tk):
             or self._account_sync_running
         ):
             return
+        if (
+            getattr(self, "_task_running", False)
+            or self.has_running_task("stores", "account")
+        ):
+            if self.winfo_exists():
+                self.after(5000, self._push_account_store_sync)
+            return
         self._account_sync_running = True
         sync = self.account_store_sync
         started = time.monotonic()
@@ -1829,6 +1836,12 @@ class MainWindow(tk.Tk):
             self.auto_refresh_enabled
             and not self._auto_refresh_running
             and not self.has_running_task("stores:scan-login")
+            and not self.has_running_task(
+                "stores:offline-selected",
+                "account:clear-web-logins",
+            )
+            and not getattr(self, "_task_running", False)
+            and not getattr(self, "_account_sync_running", False)
         ):
             self._auto_refresh_running = True
             self._auto_tick_count += 1

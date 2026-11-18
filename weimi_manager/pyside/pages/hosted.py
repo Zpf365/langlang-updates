@@ -85,24 +85,42 @@ class HostedPage(TaskPage):
             for index in self.table.selectionModel().selectedRows()
         ]
         ids = {int(row["id"]) for row in rows if row} or {store.id for store in self._stores}
-        for store_id in ids:
-            self.workspace.db.update_hosted_config(
-                store_id,
-                revoke_audit=self.revoke.isChecked(),
-                delete_audit_failed=self.delete_failed.isChecked(),
-                list_products=self.list_products.isChecked(),
-                prefill_11=self.prefill.isChecked(),
-                enabled=any(
-                    (
-                        self.revoke.isChecked(),
-                        self.delete_failed.isChecked(),
-                        self.list_products.isChecked(),
-                        self.prefill.isChecked(),
-                    )
-                ),
+        changes = {
+            "revoke_audit": self.revoke.isChecked(),
+            "delete_audit_failed": self.delete_failed.isChecked(),
+            "list_products": self.list_products.isChecked(),
+            "prefill_11": self.prefill.isChecked(),
+            "enabled": any(
+                (
+                    self.revoke.isChecked(),
+                    self.delete_failed.isChecked(),
+                    self.list_products.isChecked(),
+                    self.prefill.isChecked(),
+                )
+            ),
+        }
+
+        def work() -> int:
+            for store_id in ids:
+                self.workspace.db.update_hosted_config(
+                    store_id,
+                    **changes,
+                )
+            return len(ids)
+
+        def done(count: int) -> None:
+            self.refresh()
+            self.notify.emit(
+                "已保存",
+                f"{count} 家店铺托管配置",
             )
-        self.refresh()
-        self.notify.emit("已保存", f"{len(ids)} 家店铺托管配置")
+
+        self.submit(
+            "hosted:save-configs",
+            work,
+            done,
+            self.save_button,
+        )
 
     def _execute(self) -> None:
         rows = [

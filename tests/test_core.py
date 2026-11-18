@@ -332,6 +332,208 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(status, "已掉线")
         self.assertIn("身份不匹配", detail)
 
+    def test_selected_web_sessions_only_clear_logged_in_selected_stores(
+        self,
+    ) -> None:
+        selected_logged = self.db.add_store(
+            "所选已登录",
+            "wx-selected-logged",
+            "secret-one",
+        )
+        selected_unlogged = self.db.add_store(
+            "所选未登录",
+            "wx-selected-unlogged",
+            "secret-two",
+        )
+        unselected_logged = self.db.add_store(
+            "未选已登录",
+            "wx-unselected-logged",
+            "secret-three",
+        )
+        for store_id in (selected_logged, unselected_logged):
+            self.db.set_web_session(
+                store_id,
+                {
+                    "cookies": [
+                        {"name": "session", "value": f"cookie-{store_id}"}
+                    ]
+                },
+                "已登录",
+                "测试登录",
+            )
+
+        result = self.db.clear_selected_web_sessions(
+            [selected_logged, selected_unlogged],
+            "已离线所选店铺",
+        )
+
+        self.assertEqual(result, {"cleared": 1, "skipped": 1})
+        selected = self.db.get_store(selected_logged)
+        skipped = self.db.get_store(selected_unlogged)
+        untouched = self.db.get_store(unselected_logged)
+        self.assertEqual(selected.web_status, "未登录")
+        self.assertEqual(selected.web_status_detail, "已离线所选店铺")
+        self.assertIsNone(self.db.get_web_cookies(selected_logged))
+        self.assertEqual(skipped.web_status, "未登录")
+        self.assertEqual(untouched.web_status, "已登录")
+        self.assertIsNotNone(self.db.get_web_cookies(unselected_logged))
+
+    def test_clear_all_web_logins_updates_stores_and_procurement_in_batch(
+        self,
+    ) -> None:
+        first_store = self.db.add_store(
+            "全部离线一",
+            "wx-clear-all-one",
+            "secret-one",
+        )
+        second_store = self.db.add_store(
+            "全部离线二",
+            "wx-clear-all-two",
+            "secret-two",
+        )
+        for store_id in (first_store, second_store):
+            self.db.set_web_session(
+                store_id,
+                {"cookies": [{"name": "sid", "value": "cookie"}]},
+                "已登录",
+                "测试登录",
+            )
+        procurement_id = self.db.add_procurement_account(
+            "1688",
+            "采购账号",
+        )
+        self.db.set_procurement_session(
+            procurement_id,
+            {"cookies": [{"name": "sid", "value": "cookie"}]},
+            "已登录",
+        )
+
+        result = self.db.clear_all_web_logins("账号中心批量清理")
+
+        self.assertEqual(
+            result,
+            {"stores_cleared": 2, "procurement_cleared": 1},
+        )
+        for store_id in (first_store, second_store):
+            self.assertEqual(self.db.get_store(store_id).web_status, "未登录")
+            self.assertIsNone(self.db.get_web_cookies(store_id))
+        self.assertEqual(
+            self.db.get_procurement_account(procurement_id)["status"],
+            "未登录",
+        )
+        self.assertIsNone(
+            self.db.get_procurement_session(procurement_id)
+        )
+
+    def test_account_snapshot_clears_cookie_removed_on_another_device(
+        self,
+    ) -> None:
+        source = Database(self.root / "snapshot-source.db")
+        target = Database(self.root / "snapshot-target.db")
+        source_id = source.add_store(
+            "同步离线店铺",
+            "wx-snapshot-offline",
+            "secret",
+        )
+        target_id = target.add_store(
+            "同步离线店铺",
+            "wx-snapshot-offline",
+            "secret",
+        )
+        for db, store_id in ((source, source_id), (target, target_id)):
+            db.set_web_session(
+                store_id,
+                {"cookies": [{"name": "sid", "value": "cookie"}]},
+                "已登录",
+                "测试登录",
+            )
+
+        source.clear_selected_web_sessions(
+            [source_id],
+            "已离线所选店铺",
+        )
+        target.import_store_accounts(source.export_store_accounts())
+
+        synced = target.get_store(target_id)
+        self.assertEqual(synced.web_status, "未登录")
+        self.assertEqual(synced.web_status_detail, "已离线所选店铺")
+        self.assertIsNone(target.get_web_cookies(target_id))
+
+    def test_account_snapshot_unlogged_status_overrides_stale_cookie(
+        self,
+    ) -> None:
+        source = Database(self.root / "stale-cookie-source.db")
+        target = Database(self.root / "stale-cookie-target.db")
+        source_id = source.add_store(
+            "快照残留 Cookie",
+            "wx-snapshot-stale-cookie",
+            "secret",
+        )
+        target_id = target.add_store(
+            "快照残留 Cookie",
+            "wx-snapshot-stale-cookie",
+            "secret",
+        )
+        for db, store_id in ((source, source_id), (target, target_id)):
+            db.set_web_session(
+                store_id,
+                {"cookies": [{"name": "sid", "value": "cookie"}]},
+                "已登录",
+                "测试登录",
+            )
+        snapshot = source.export_store_accounts()
+        snapshot["stores"][0]["web_status"] = "未登录"
+        snapshot["stores"][0]["web_status_detail"] = "快照明确离线"
+
+        target.import_store_accounts(snapshot)
+
+        synced = target.get_store(target_id)
+        self.assertEqual(synced.web_status, "未登录")
+        self.assertEqual(synced.web_status_detail, "快照明确离线")
+        self.assertIsNone(target.get_web_cookies(target_id))
+
+    def test_newer_local_login_survives_older_snapshot_import(
+        self,
+    ) -> None:
+        source = Database(self.root / "older-snapshot-source.db")
+        target = Database(self.root / "newer-login-target.db")
+        source_id = source.add_store(
+            "并发保护店铺",
+            "wx-newer-local-login",
+            "secret",
+        )
+        target_id = target.add_store(
+            "并发保护店铺",
+            "wx-newer-local-login",
+            "secret",
+        )
+        source.set_web_session(
+            source_id,
+            {"cookies": [{"name": "sid", "value": "old-cookie"}]},
+            "已登录",
+            "旧服务器登录",
+        )
+        old_snapshot = source.export_store_accounts()
+        old_snapshot["stores"][0]["web_session_updated_at"] = (
+            "2026-01-01T00:00:00+00:00"
+        )
+        target.set_web_session(
+            target_id,
+            {"cookies": [{"name": "sid", "value": "new-cookie"}]},
+            "已登录",
+            "刚扫码登录",
+        )
+
+        target.import_store_accounts(old_snapshot)
+
+        synced = target.get_store(target_id)
+        self.assertEqual(synced.web_status, "已登录")
+        self.assertEqual(synced.web_status_detail, "刚扫码登录")
+        self.assertEqual(
+            target.get_web_cookies(target_id)["cookies"][0]["value"],
+            "new-cookie",
+        )
+
     def test_reopen_preserves_store_secret_and_web_cookie(self) -> None:
         database_path = self.root / "stable" / "weimi_manager.db"
         first = Database(database_path)

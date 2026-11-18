@@ -97,6 +97,66 @@ def _hosted_no_traffic_product_ids(
     return selected
 
 
+def _run_hosted_config_save(
+    window,
+    db,
+    stores: list[Any],
+    changes: dict[str, Any],
+    listing_mode: str,
+    listing_count: int,
+    *,
+    on_done,
+    save_button=None,
+) -> bool:
+    """Persist hosted configuration without blocking the Tk main thread."""
+    def work(progress):
+        total = len(stores)
+        for index, store in enumerate(stores, 1):
+            db.update_hosted_config(store.id, **changes)
+            db.set_setting(
+                f"hosted_listing_mode_{store.id}",
+                listing_mode,
+            )
+            db.set_setting(
+                f"hosted_listing_count_{store.id}",
+                str(listing_count),
+            )
+            if progress:
+                progress(
+                    f"正在保存 {store.name} 的托管配置",
+                    index,
+                    total,
+                )
+        return total
+
+    def done(count: int) -> None:
+        if save_button is not None:
+            save_button.configure(state="normal")
+        on_done(count)
+
+    def failed(error: str) -> None:
+        if save_button is not None:
+            save_button.configure(state="normal")
+        window.set_status("托管配置保存失败")
+        messagebox.showerror(
+            "保存托管配置失败",
+            error,
+        )
+
+    if save_button is not None:
+        save_button.configure(state="disabled")
+    started = window.run_task(
+        work,
+        done,
+        failed,
+        log_title="保存托管配置",
+        task_scope="hosted:save-configs",
+    )
+    if not started and save_button is not None:
+        save_button.configure(state="normal")
+    return bool(started)
+
+
 def _display_timestamp(value: object) -> str:
     text = str(value or "").strip()
     if not text:
@@ -3377,21 +3437,61 @@ class AccountPage(BasePage):
         os.startfile(str(self.window.paths.data_dir))
 
     def _clear_web_sessions(self) -> None:
+        if getattr(self.window, "_auto_refresh_running", False):
+            messagebox.showinfo(
+                "自动检查进行中",
+                "正在自动检查店铺登录状态，请等待本次检查完成后再清空网页登录。",
+                parent=self,
+            )
+            return
         if not messagebox.askyesno(
             "清空全部网页登录",
             "微信店铺、1688和淘宝采购账号的本地登录会话都会被清除。是否继续？",
             parent=self,
         ):
             return
-        for store in self.db.list_stores():
-            self.db.clear_web_session(store.id, "账号中心批量清理")
-        with self.db.connect() as conn:
-            conn.execute(
-                "UPDATE procurement_accounts SET status='未登录', last_error='登录态已清理'"
+        self.window.set_status(
+            "正在后台清理全部网页登录…",
+            busy=True,
+        )
+
+        def work(progress):
+            if progress:
+                progress("正在批量清理店铺和采购账号登录态", 0, 1)
+            result = self.db.clear_all_web_logins(
+                "账号中心批量清理"
             )
-            conn.execute("DELETE FROM procurement_sessions")
-        self.window.store_data_changed()
-        self.refresh()
+            if progress:
+                progress("全部网页登录状态已保存", 1, 1)
+            return result
+
+        def done(result: dict[str, int]) -> None:
+            stores_cleared = int(result.get("stores_cleared") or 0)
+            procurement_cleared = int(
+                result.get("procurement_cleared") or 0
+            )
+            self.window.store_login_updated()
+            self.refresh()
+            self.window.set_status(
+                f"已清理 {stores_cleared} 家店铺网页登录，"
+                f"采购账号 {procurement_cleared} 个"
+            )
+
+        def failed(error: str) -> None:
+            self.window.set_status("清空全部网页登录失败")
+            messagebox.showerror(
+                "清空全部网页登录失败",
+                error,
+                parent=self,
+            )
+
+        self.window.run_task(
+            work,
+            done,
+            failed,
+            log_title="清空全部网页登录",
+            task_scope="account:clear-web-logins",
+        )
 
 
 class SalesSuggestionsPage(BasePage):
@@ -5243,33 +5343,36 @@ class HostedOperationsPage(BasePage):
                 "下架": "offshelf",
                 "彻底删除": "real",
             }[no_traffic_method_var.get()]
-            for store in stores:
-                self.db.update_hosted_config(
-                    store.id,
+            def saved(count: int) -> None:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+                self.refresh()
+                self.window.set_status(
+                    f"已保存 {count} 家店铺的托管配置"
+                )
+
+            _run_hosted_config_save(
+                self.window,
+                self.db,
+                stores,
+                {
                     **{
                         key: variable.get()
                         for key, variable in variables.items()
                     },
-                    enabled=enabled_var.get(),
-                    no_traffic_days=no_traffic_days,
-                    no_traffic_max_sales=no_traffic_sales,
-                    no_traffic_method=no_traffic_method,
-                )
-                self.db.set_setting(
-                    f"hosted_listing_mode_{store.id}",
-                    listing_mode,
-                )
-                self.db.set_setting(
-                    f"hosted_listing_count_{store.id}",
-                    str(listing_count),
-                )
-            dialog.destroy()
-            self.refresh()
-            self.window.set_status(
-                f"已保存 {len(stores)} 家店铺的托管配置"
+                    "enabled": enabled_var.get(),
+                    "no_traffic_days": no_traffic_days,
+                    "no_traffic_max_sales": no_traffic_sales,
+                    "no_traffic_method": no_traffic_method,
+                },
+                listing_mode,
+                listing_count,
+                on_done=saved,
+                save_button=save_button,
             )
 
-        button(actions, "保存配置", save, "Primary").grid(
+        save_button = button(actions, "保存配置", save, "Primary")
+        save_button.grid(
             row=0,
             column=2,
         )

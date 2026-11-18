@@ -156,7 +156,29 @@ class AccountPage(TaskPage):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        for store in self.workspace.db.list_stores():
-            self.workspace.db.clear_web_session(store.id, "账号中心批量清理")
-        self.workspace.web_session.cleanup_cache()
-        self.notify.emit("已清理", "全部网页登录状态已清空")
+
+        def work():
+            result = self.workspace.db.clear_all_web_logins(
+                "账号中心批量清理"
+            )
+            self.workspace.web_session.cleanup_cache()
+            return result
+
+        def done(result: dict[str, int]) -> None:
+            self.refresh()
+            stores_cleared = int(result.get("stores_cleared") or 0)
+            procurement_cleared = int(
+                result.get("procurement_cleared") or 0
+            )
+            self.notify.emit(
+                "已清理",
+                f"已清理 {stores_cleared} 家店铺网页登录，"
+                f"采购账号 {procurement_cleared} 个",
+            )
+
+        self.submit(
+            "account:clear-web-logins",
+            work,
+            done,
+            self.clear_sessions_button,
+        )

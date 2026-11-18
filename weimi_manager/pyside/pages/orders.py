@@ -430,13 +430,21 @@ class OrdersPage(TaskPage):
         value, accepted = QInputDialog.getText(self, "填写采购号", "采购订单号：")
         if not accepted:
             return
-        for row in rows:
-            self.workspace.db.update_order_workbench(
-                int(row["store_id"]),
-                str(row["order_id"]),
-                purchase_order_no=value.strip(),
-            )
-        self.refresh()
+
+        def work() -> int:
+            for row in rows:
+                self.workspace.db.update_order_workbench(
+                    int(row["store_id"]),
+                    str(row["order_id"]),
+                    purchase_order_no=value.strip(),
+                )
+            return len(rows)
+
+        self.submit(
+            "orders:batch-purchase-number",
+            work,
+            lambda _count: self.refresh(),
+        )
 
     def _copy_pickup_codes(self) -> None:
         rows = self._selected_rows()
@@ -452,13 +460,21 @@ class OrdersPage(TaskPage):
 
     def _set_marked_sent(self, value: bool) -> None:
         rows = self._selected_rows()
-        for row in rows:
-            self.workspace.db.update_order_workbench(
-                int(row["store_id"]),
-                str(row["order_id"]),
-                is_marked_sent=1 if value else 0,
-            )
-        self.refresh()
+
+        def work() -> int:
+            for row in rows:
+                self.workspace.db.update_order_workbench(
+                    int(row["store_id"]),
+                    str(row["order_id"]),
+                    is_marked_sent=1 if value else 0,
+                )
+            return len(rows)
+
+        self.submit(
+            "orders:batch-mark-sent",
+            work,
+            lambda _count: self.refresh(),
+        )
 
     def _sync_pickup_codes(self) -> None:
         store_id = self.store_combo.currentData()

@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS stores (
     web_status_detail TEXT NOT NULL DEFAULT '',
     web_checked_at TEXT,
     web_logged_in_at TEXT,
+    web_session_updated_at TEXT NOT NULL DEFAULT '',
     web_cookies_protected BLOB,
     last_sync_at TEXT,
     created_at TEXT NOT NULL,
@@ -641,6 +642,26 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def _incoming_session_is_not_older(
+    incoming: str,
+    current: str,
+) -> bool:
+    if not incoming:
+        return False
+    if not current:
+        return True
+    try:
+        incoming_time = datetime.fromisoformat(
+            incoming.replace("Z", "+00:00")
+        )
+        current_time = datetime.fromisoformat(
+            current.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return incoming >= current
+    return incoming_time >= current_time
+
+
 class Database:
     def __init__(self, path: Path, protector: CredentialProtector | None = None):
         self.path = Path(path)
@@ -742,6 +763,7 @@ class Database:
                 "web_status_detail": "TEXT NOT NULL DEFAULT ''",
                 "web_checked_at": "TEXT",
                 "web_logged_in_at": "TEXT",
+                "web_session_updated_at": "TEXT NOT NULL DEFAULT ''",
                 "web_cookies_protected": "BLOB",
             }
             for column, definition in migrations.items():
@@ -769,6 +791,19 @@ class Database:
                         f"ADD COLUMN {column} {definition}"
                     )
             now = _now()
+            conn.execute(
+                """
+                UPDATE stores
+                SET web_session_updated_at=COALESCE(
+                    NULLIF(web_session_updated_at, ''),
+                    NULLIF(web_checked_at, ''),
+                    NULLIF(updated_at, ''),
+                    ?
+                )
+                WHERE TRIM(COALESCE(web_session_updated_at, ''))=''
+                """,
+                (now,),
+            )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO store_groups (name, created_at, updated_at)
@@ -1569,10 +1604,20 @@ class Database:
                     web_status_detail=?,
                     web_checked_at=?,
                     web_logged_in_at=?,
+                    web_session_updated_at=?,
                     updated_at=?
                 WHERE id=?
                 """,
-                (protected, status, detail[:500], now, now, now, store_id),
+                (
+                    protected,
+                    status,
+                    detail[:500],
+                    now,
+                    now,
+                    now,
+                    now,
+                    store_id,
+                ),
             )
 
     def update_web_status(
@@ -1586,10 +1631,14 @@ class Database:
             conn.execute(
                 """
                 UPDATE stores
-                SET web_status=?, web_status_detail=?, web_checked_at=?, updated_at=?
+                SET web_status=?,
+                    web_status_detail=?,
+                    web_checked_at=?,
+                    web_session_updated_at=?,
+                    updated_at=?
                 WHERE id=?
                 """,
-                (status, detail[:500], now, now, store_id),
+                (status, detail[:500], now, now, now, store_id),
             )
 
     def get_web_cookies(self, store_id: int) -> dict[str, Any] | None:
@@ -1611,6 +1660,15 @@ class Database:
     def export_store_accounts(self) -> dict[str, Any]:
         """Build a portable account snapshot for encrypted cloud sync."""
         stores: list[dict[str, Any]] = []
+        with self.connect() as conn:
+            session_times = {
+                int(row["id"]): str(
+                    row["web_session_updated_at"] or ""
+                )
+                for row in conn.execute(
+                    "SELECT id, web_session_updated_at FROM stores"
+                ).fetchall()
+            }
         for store in self.list_stores():
             secret = ""
             try:
@@ -1626,6 +1684,10 @@ class Database:
                     "secret": secret,
                     "web_status": store.web_status,
                     "web_status_detail": store.web_status_detail,
+                    "web_session_updated_at": session_times.get(
+                        store.id,
+                        "",
+                    ),
                     "cookies": cookies,
                     "created_at": store.created_at,
                 }
@@ -1674,6 +1736,24 @@ class Database:
             group_name = str(item.get("group_name") or "").strip()
             secret = str(item.get("secret") or "")
             current = existing.get(app_id)
+            current_session_time = ""
+            current_web_status = "未登录"
+            if current is not None:
+                current_web_status = current.web_status
+                with self.connect() as conn:
+                    row = conn.execute(
+                        """
+                        SELECT web_session_updated_at
+                        FROM stores
+                        WHERE id=?
+                        """,
+                        (current.id,),
+                    ).fetchone()
+                current_session_time = str(
+                    row["web_session_updated_at"] or ""
+                    if row
+                    else ""
+                )
             if current is None:
                 store_id = self.add_store(
                     name,
@@ -1691,13 +1771,36 @@ class Database:
                     secret or None,
                 )
                 updated += 1
+            incoming_session_time = str(
+                item.get("web_session_updated_at") or ""
+            )
+            apply_login = (
+                _incoming_session_is_not_older(
+                    incoming_session_time,
+                    current_session_time,
+                )
+                if incoming_session_time
+                else current_web_status != "已登录"
+            )
             cookies = item.get("cookies")
-            if isinstance(cookies, dict) and cookies:
+            incoming_status = str(item.get("web_status") or "已登录")
+            incoming_detail = str(
+                item.get("web_status_detail")
+                or "账户同步恢复"
+            )
+            if not apply_login:
+                continue
+            if "cookies" in item and incoming_status == "未登录":
+                self.clear_web_session(
+                    store_id,
+                    incoming_detail,
+                )
+            elif isinstance(cookies, dict) and cookies:
                 self.set_web_session(
                     store_id,
                     cookies,
-                    str(item.get("web_status") or "已登录"),
-                    str(item.get("web_status_detail") or "账户同步恢复"),
+                    incoming_status,
+                    incoming_detail,
                 )
                 logins += 1
         return {
@@ -1789,6 +1892,84 @@ class Database:
                 "UPDATE stores SET web_cookies_protected=NULL WHERE id=?",
                 (store_id,),
             )
+
+    def clear_selected_web_sessions(
+        self,
+        store_ids: list[int],
+        detail: str = "已离线所选店铺",
+    ) -> dict[str, int]:
+        """Clear login cookies only for selected stores that are logged in."""
+        normalized_ids = sorted(
+            {
+                int(store_id)
+                for store_id in store_ids
+                if store_id is not None
+            }
+        )
+        if not normalized_ids:
+            return {"cleared": 0, "skipped": 0}
+        placeholders = ",".join("?" for _ in normalized_ids)
+        now = _now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE stores
+                SET web_cookies_protected=NULL,
+                    web_status='未登录',
+                    web_status_detail=?,
+                    web_checked_at=?,
+                    web_session_updated_at=?,
+                    updated_at=?
+                WHERE id IN ({placeholders})
+                  AND web_status='已登录'
+                """,
+                (detail[:500], now, now, now, *normalized_ids),
+            )
+            cleared = max(0, int(cursor.rowcount))
+        return {
+            "cleared": cleared,
+            "skipped": len(normalized_ids) - cleared,
+        }
+
+    def clear_all_web_logins(
+        self,
+        detail: str = "账号中心批量清理",
+    ) -> dict[str, int]:
+        """Clear every shop and procurement web login in one transaction."""
+        now = _now()
+        with self.connect() as conn:
+            stores = conn.execute(
+                """
+                UPDATE stores
+                SET web_cookies_protected=NULL,
+                    web_status='未登录',
+                    web_status_detail=?,
+                    web_checked_at=?,
+                    web_session_updated_at=?,
+                    updated_at=?
+                WHERE web_status='已登录'
+                   OR web_cookies_protected IS NOT NULL
+                """,
+                (detail[:500], now, now, now),
+            )
+            procurement = conn.execute(
+                """
+                UPDATE procurement_accounts
+                SET status='未登录',
+                    last_error='登录态已清理'
+                WHERE status<>'未登录'
+                   OR EXISTS (
+                       SELECT 1
+                       FROM procurement_sessions AS session
+                       WHERE session.account_id=procurement_accounts.id
+                   )
+                """
+            )
+            conn.execute("DELETE FROM procurement_sessions")
+        return {
+            "stores_cleared": max(0, int(stores.rowcount)),
+            "procurement_cleared": max(0, int(procurement.rowcount)),
+        }
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self.connect() as conn:

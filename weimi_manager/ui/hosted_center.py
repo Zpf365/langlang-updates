@@ -9,7 +9,10 @@ from typing import Any
 
 from ..models import Store
 from .pages import BasePage
-from .skeletons import _hosted_no_traffic_product_ids
+from .skeletons import (
+    _hosted_no_traffic_product_ids,
+    _run_hosted_config_save,
+)
 from .theme import MUTED, PANEL, TEXT, button
 
 HOSTED_ACTIONS = (
@@ -849,7 +852,8 @@ class HostedCenterPage(BasePage):
             selectcolor="white",
             bd=0,
         ).pack(side="left")
-        button(footer, "保存配置", lambda: save()).pack(side="right")
+        save_button = button(footer, "保存配置", lambda: save())
+        save_button.pack(side="right")
         button(footer, "取消", dialog.destroy).pack(
             side="right",
             padx=6,
@@ -938,19 +942,24 @@ class HostedCenterPage(BasePage):
                 "no_traffic_max_sales": no_traffic_sales,
                 "no_traffic_method": str(config.get("no_traffic_method") or "recycle"),
             }
-            for store in stores:
-                self.db.update_hosted_config(store.id, **common)
-                self.db.set_setting(
-                    f"hosted_listing_mode_{store.id}",
-                    common["listing_mode"],
+            def saved(count: int) -> None:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+                self.refresh()
+                self.window.set_status(
+                    f"已保存 {count} 家店铺托管配置"
                 )
-                self.db.set_setting(
-                    f"hosted_listing_count_{store.id}",
-                    str(common["listing_count"]),
-                )
-            dialog.destroy()
-            self.refresh()
-            self.window.set_status(f"已保存 {len(stores)} 家店铺托管配置")
+
+            _run_hosted_config_save(
+                self.window,
+                self.db,
+                stores,
+                common,
+                str(common["listing_mode"]),
+                int(common["listing_count"]),
+                on_done=saved,
+                save_button=save_button,
+            )
 
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
         dialog.grab_set()

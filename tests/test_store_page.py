@@ -14,6 +14,8 @@ from weimi_manager.account_store_sync import (
     derive_vault_key,
 )
 from weimi_manager.db import Database
+from weimi_manager.ui.app import MainWindow
+from weimi_manager.ui.skeletons import AccountPage
 from weimi_manager.ui.store_page import StorePage
 
 
@@ -283,6 +285,190 @@ class StorePageContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(StorePage.field_definitions), 41)
+
+    def test_offline_selected_stores_skips_unlogged_selection(
+        self,
+    ) -> None:
+        logged_one = SimpleNamespace(
+            id=11,
+            app_id="wx-offline-selected-one",
+            name="已登录一",
+            web_status="已登录",
+        )
+        logged_two = SimpleNamespace(
+            id=12,
+            app_id="wx-offline-selected-two",
+            name="已登录二",
+            web_status="已登录",
+        )
+        unlogged = SimpleNamespace(
+            id=13,
+            app_id="wx-already-unlogged",
+            name="本来就未登录",
+            web_status="未登录",
+        )
+        calls = {}
+
+        class FakeDb:
+            @staticmethod
+            def clear_selected_web_sessions(store_ids, detail):
+                calls["store_ids"] = store_ids
+                calls["detail"] = detail
+                return {"cleared": 2, "skipped": 1}
+
+        class FakeWindow:
+            @staticmethod
+            def set_status(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def store_login_updated():
+                calls["data_changed"] = True
+
+            @staticmethod
+            def run_task(work, done, _error, **kwargs):
+                calls["used_run_task"] = True
+                calls["run_task"] = kwargs
+                done(work(lambda *_args: None))
+                return True
+
+        page = object.__new__(StorePage)
+        page.db = FakeDb()
+        page.window = FakeWindow()
+        page.refresh = lambda: calls.setdefault("refreshed", True)
+        page.status_line_var = SimpleNamespace(
+            set=lambda value: calls.setdefault("status", value)
+        )
+        page._selected_stores = lambda: [
+            logged_one,
+            logged_two,
+            unlogged,
+        ]
+        page._has_permission = lambda _permission: True
+
+        with mock.patch(
+            "weimi_manager.ui.store_page.messagebox.askyesno",
+            return_value=True,
+        ):
+            page._offline_selected_stores()
+
+        self.assertEqual(calls["store_ids"], [11, 12])
+        self.assertEqual(calls["detail"], "已离线所选店铺")
+        self.assertTrue(calls["used_run_task"])
+        self.assertTrue(calls["data_changed"])
+        self.assertIn("已离线 2 家", calls["status"])
+
+    def test_offline_selected_stores_waits_for_auto_login_check(
+        self,
+    ) -> None:
+        logged = SimpleNamespace(
+            id=11,
+            app_id="wx-offline-selected",
+            name="已登录",
+            web_status="已登录",
+        )
+        page = object.__new__(StorePage)
+        page.window = SimpleNamespace(_auto_refresh_running=True)
+        page._selected_stores = lambda: [logged]
+        page._has_permission = lambda _permission: True
+
+        with (
+            mock.patch(
+                "weimi_manager.ui.store_page.messagebox.showinfo"
+            ) as showinfo,
+            mock.patch(
+                "weimi_manager.ui.store_page.messagebox.askyesno"
+            ) as askyesno,
+        ):
+            page._offline_selected_stores()
+
+        showinfo.assert_called_once()
+        self.assertIn("自动检查", showinfo.call_args.args[0])
+        askyesno.assert_not_called()
+
+    def test_clear_all_web_logins_uses_one_background_batch(
+        self,
+    ) -> None:
+        calls = {}
+
+        class FakeDb:
+            @staticmethod
+            def clear_all_web_logins(detail):
+                calls["detail"] = detail
+                return {
+                    "stores_cleared": 85,
+                    "procurement_cleared": 2,
+                }
+
+        class FakeWindow:
+            @staticmethod
+            def set_status(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def store_login_updated():
+                calls["data_changed"] = True
+
+            @staticmethod
+            def run_task(work, done, _error, **kwargs):
+                calls["used_run_task"] = True
+                calls["run_task"] = kwargs
+                done(work(lambda *_args: None))
+                return True
+
+        page = object.__new__(AccountPage)
+        page.db = FakeDb()
+        page.window = FakeWindow()
+        page.refresh = lambda: calls.setdefault("refreshed", True)
+
+        with mock.patch(
+            "weimi_manager.ui.skeletons.messagebox.askyesno",
+            return_value=True,
+        ):
+            page._clear_web_sessions()
+
+        self.assertEqual(calls["detail"], "账号中心批量清理")
+        self.assertTrue(calls["used_run_task"])
+        self.assertTrue(calls["data_changed"])
+        self.assertTrue(calls["refreshed"])
+
+    def test_clear_all_web_logins_waits_for_auto_login_check(
+        self,
+    ) -> None:
+        page = object.__new__(AccountPage)
+        page.window = SimpleNamespace(_auto_refresh_running=True)
+
+        with mock.patch(
+            "weimi_manager.ui.skeletons.messagebox.showinfo"
+        ) as showinfo:
+            page._clear_web_sessions()
+
+        showinfo.assert_called_once()
+        self.assertIn("自动检查", showinfo.call_args.args[0])
+
+    def test_auto_login_check_skips_running_store_mutation(self) -> None:
+        window = object.__new__(MainWindow)
+        window._running_tasks = {
+            "stores:offline-selected": {object()},
+        }
+        window._task_running = True
+        window.auto_refresh_enabled = True
+        window._auto_refresh_running = False
+        window._auto_tick_count = 0
+        window._account_sync_running = False
+        window.winfo_exists = lambda: False
+        window.db = SimpleNamespace(
+            list_stores=lambda: [],
+            start_task_log=lambda **_kwargs: 1,
+        )
+
+        with mock.patch(
+            "weimi_manager.ui.app.threading.Thread"
+        ) as thread:
+            window._auto_refresh_tick()
+
+        self.assertFalse(window._auto_refresh_running)
+        thread.assert_not_called()
 
     def test_compact_columns_match_original(self) -> None:
         self.assertEqual(

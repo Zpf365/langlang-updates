@@ -267,7 +267,9 @@ WEB_SESSION_COMMANDS = {
 
 STORE_SNAPSHOT_MUTATIONS = {
     "add_store",
+    "clear_all_web_logins",
     "clear_web_session",
+    "clear_selected_web_sessions",
     "create_store_group",
     "delete_store",
     "ensure_web_login_store",
@@ -293,6 +295,8 @@ DATABASE_COMMANDS = {
     "set_web_session": "stores.login",
     "update_web_status": "stores.edit",
     "clear_web_session": "stores.login",
+    "clear_selected_web_sessions": "stores.login",
+    "clear_all_web_logins": "stores.login",
     "delete_store": "stores.delete",
     "import_store_accounts": "stores.edit",
     "rename_store_group": "stores.organize",
@@ -334,7 +338,10 @@ def _command_store_ids(args: tuple[Any, ...]) -> list[str]:
 def _store_id_app_ids(db: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[str]:
     values: list[Any] = []
     if args:
-        values.append(args[0])
+        if isinstance(args[0], (list, tuple, set)):
+            values.extend(args[0])
+        else:
+            values.append(args[0])
     values.extend(
         kwargs[key]
         for key in ("store_id", "store_ids")
@@ -381,6 +388,14 @@ def _mutation_store_ids(
                 and str(row[1]).strip()
             }
         )
+    if name == "clear_all_web_logins":
+        return sorted(
+            {
+                store.app_id
+                for store in db.list_stores()
+                if store.app_id
+            }
+        )
     if name == "import_store_accounts":
         snapshot = args[0] if args else kwargs.get("snapshot", {})
         return sorted(
@@ -409,6 +424,7 @@ def _mutation_store_ids(
         return _store_id_app_ids(db, args[:1], kwargs)
     if name in {
         "clear_web_session",
+        "clear_selected_web_sessions",
         "delete_store",
         "set_store_status",
         "set_web_session",

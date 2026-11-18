@@ -20,8 +20,12 @@ These rules are mandatory for every future code change.
    verified, or intentionally changed with user approval.
 8. Never describe an implementation as complete if its real platform path
    has not been verified. Record unverified items explicitly.
-9. After every successful build intended for the user, run
+9. After every user-requested change, build the latest application and run
    `tools/deploy_latest_local.ps1`. It must close all older LangLang
    processes, back up `D:\WG\LangLang`, deploy the latest build there, and
-   launch it. Local deployment is required even when cloud update has not
-   been published.
+   launch it. If the build fails, keep the existing deployment intact and
+   report the failure instead of claiming the change is complete.
+10. Never publish a GitHub Release, push release assets, or change the hosted
+    automatic-update manifest unless the user explicitly asks to publish a
+    new version. Updating `D:\WG\LangLang` after a requested change is
+    mandatory and independent of cloud release approval.

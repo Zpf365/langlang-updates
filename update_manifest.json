@@ -1,8 +1,8 @@
 {
-  "version": "1.8.41",
-  "download_url": "https://github.com/Zpf365/langlang-updates/releases/download/v1.8.41/LangLang-1.8.41-Portable-Share-win64.zip",
-  "sha256": "f68a263e740d733bd1f7b57dd068558bf3065e7f447f5346da4dc88e9273ccf2",
+  "version": "1.8.47",
+  "download_url": "https://github.com/Zpf365/langlang-updates/releases/download/v1.8.47/LangLang-1.8.47-win64.zip",
+  "sha256": "92d7a73d25e15e68393dce6b970450a1eb3a96c0bd802dabc2c0fb77638ac6fc",
   "mandatory": false,
-  "published_at": "2026-11-17T03:53:21+00:00",
-  "notes": "# 澜琅重构 1.8.41\n\n本版把动销任务改为手机单击开始、电脑自动控制微信的逐条执行流程。\n\n## 动销相关\n\n- 电脑端改为多行输入，一行一条，按输入顺序逐条下发。\n- `#微信小店://...` 链接按原文保存和传递，不再改写成 `weixin://...`。\n- 手机端显示当前任务和总进度，点击“开始逐条执行”后无需继续操作。\n- 电脑通过 ADB 截图和本地 OCR 识别微信界面，不再使用固定盲坐标。\n- 自动搜索并进入文件传输助手，逐条发送原始链接。\n- 自动打开商品、点击购物车、选择第一个规格、设置数量并加入购物车。\n- 加入成功后自动返回文件传输助手并处理下一条。\n- 移除悬浮“完成，下一条”和无障碍返回服务。\n- 不点击购买、送朋友或任何支付入口。\n\n## 验证\n\n- 原始微信小店链接与普通 HTTPS 链接回归测试通过。\n- Python 全套测试通过。\n- Android 单元测试和签名 release APK 构建通过。\n- 打包程序内 OCR 自检通过。\n- Supabase 生产迁移和数据库 lint 通过。"
+  "published_at": "2026-11-18T11:04:01+00:00",
+  "notes": "# 澜琅重构 1.8.47\n\n本版修复主账号和子账号混合时的登录筛选。\n\n## 规则\n\n- 按每个微信账号分别判断角色。\n- 同一微信同时存在主账号和子账号时，跳过该微信主账号并登录子账号。\n- 某微信仅有主账号时，保留并登录该主账号。\n- 不再因为另一微信存在子账号，就把所有主账号一起跳过。\n\n## 发布\n\n- 发布 Windows 免安装包和源码包。\n- 更新 GitHub 自动更新清单。"
 }

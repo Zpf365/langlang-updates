@@ -442,6 +442,11 @@ class StorePage(ttk.Frame):
             side="right",
             padx=(0, 6),
         )
+        button(
+            toolbar,
+            "离线所选店铺",
+            self._offline_selected_stores,
+        ).pack(side="right", padx=(0, 6))
 
         view_bar = ttk.Frame(self, style="TFrame")
         view_bar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -1994,6 +1999,100 @@ class StorePage(ttk.Frame):
             task_scope=f"stores:logout:{store.id}",
             command="stores.login",
             store_app_id=store.app_id,
+        )
+
+    def _offline_selected_stores(self) -> None:
+        if not self._has_permission("stores_login"):
+            return
+        if getattr(self.window, "_auto_refresh_running", False):
+            messagebox.showinfo(
+                "自动检查进行中",
+                "正在自动检查店铺登录状态，请等待本次检查完成后再离线店铺。",
+                parent=self,
+            )
+            return
+        selected = self._selected_stores()
+        if not selected:
+            messagebox.showinfo(
+                "请选择店铺",
+                "请先勾选需要离线的店铺。",
+                parent=self,
+            )
+            return
+        eligible = [
+            store for store in selected if store.web_status == "已登录"
+        ]
+        skipped = len(selected) - len(eligible)
+        if not eligible:
+            messagebox.showinfo(
+                "无需离线",
+                "所选店铺当前都未登录，本次会全部跳过。",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "离线所选店铺",
+            (
+                f"将把所选店铺中 {len(eligible)} 家“已登录”店铺改为"
+                f"“未登录”，并清除其网页登录会话。\n\n"
+                f"另有 {skipped} 家本来未登录，会直接跳过。\n"
+                "店铺资料和业务数据不会删除，是否继续？"
+            ),
+            parent=self,
+        ):
+            return
+
+        store_ids = [store.id for store in eligible]
+        detail = "已离线所选店铺"
+        self.window.set_status(
+            f"正在后台离线 {len(store_ids)} 家店铺…",
+            busy=True,
+        )
+
+        def work(progress):
+            if progress:
+                progress(
+                    f"正在批量离线 {len(store_ids)} 家店铺",
+                    0,
+                    1,
+                )
+            result = self.db.clear_selected_web_sessions(
+                store_ids,
+                detail,
+            )
+            if progress:
+                progress("店铺登录状态已保存", 1, 1)
+            return result
+
+        def done(result: dict[str, int]) -> None:
+            cleared = int(result.get("cleared") or 0)
+            database_skipped = int(result.get("skipped") or 0)
+            self.window.store_login_updated()
+            message = (
+                f"已离线 {cleared} 家店铺"
+                + (
+                    f"，跳过 {database_skipped} 家未登录店铺"
+                    if database_skipped
+                    else ""
+                )
+            )
+            self.status_line_var.set(message)
+            self.window.set_status(message)
+
+        def failed(error: str) -> None:
+            self.window.set_status("离线所选店铺失败")
+            messagebox.showerror(
+                "离线所选店铺失败",
+                error,
+                parent=self,
+            )
+
+        self.window.run_task(
+            work,
+            done,
+            failed,
+            log_title="离线所选店铺",
+            task_scope="stores:offline-selected",
         )
 
     def _show_store_menu(self, event: tk.Event) -> None:

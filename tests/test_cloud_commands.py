@@ -593,6 +593,115 @@ class CloudCommandTests(unittest.TestCase):
                 "已登录",
             )
 
+    def test_selected_store_offline_pulls_and_pushes_vault_once(
+        self,
+    ) -> None:
+        client = FakeClient()
+        commands = CloudCommandClient(client, "access")  # type: ignore[arg-type]
+
+        class StoreSync:
+            def __init__(self) -> None:
+                self.pulls = 0
+                self.pushes = 0
+
+            def pull(self, **_kwargs):
+                self.pulls += 1
+                return {}
+
+            def push_current(self):
+                self.pushes += 1
+                return {"stored": True}
+
+        store_sync = StoreSync()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "langlang.db")
+            first_id = db.add_store("店铺一", "wx-offline-one", "")
+            second_id = db.add_store("店铺二", "wx-offline-two", "")
+            for store_id in (first_id, second_id):
+                db.set_web_session(
+                    store_id,
+                    {"cookies": [{"name": "sid", "value": "cookie"}]},
+                    "已登录",
+                    "测试",
+                )
+            adapter = AuthorizedDatabaseAdapter(
+                db,
+                commands,
+                store_sync,
+            )
+
+            result = adapter.clear_selected_web_sessions(
+                [first_id, second_id],
+                "已离线所选店铺",
+            )
+
+            self.assertEqual(result, {"cleared": 2, "skipped": 0})
+            self.assertEqual(store_sync.pulls, 1)
+            self.assertEqual(store_sync.pushes, 1)
+            self.assertEqual(
+                sorted(row[2] for row in client.authorized),
+                ["wx-offline-one", "wx-offline-two"],
+            )
+            self.assertEqual(len(client.completed), 2)
+            self.assertEqual(
+                db.get_store(first_id).web_status,
+                "未登录",
+            )
+            self.assertEqual(
+                db.get_store(second_id).web_status,
+                "未登录",
+            )
+
+    def test_clear_all_web_logins_pulls_and_pushes_vault_once(
+        self,
+    ) -> None:
+        client = FakeClient()
+        commands = CloudCommandClient(client, "access")  # type: ignore[arg-type]
+
+        class StoreSync:
+            def __init__(self) -> None:
+                self.pulls = 0
+                self.pushes = 0
+
+            def pull(self, **_kwargs):
+                self.pulls += 1
+                return {}
+
+            def push_current(self):
+                self.pushes += 1
+                return {"stored": True}
+
+        store_sync = StoreSync()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "langlang.db")
+            first_id = db.add_store("店铺一", "wx-clear-one", "")
+            second_id = db.add_store("店铺二", "wx-clear-two", "")
+            for store_id in (first_id, second_id):
+                db.set_web_session(
+                    store_id,
+                    {"cookies": [{"name": "sid", "value": "cookie"}]},
+                    "已登录",
+                    "测试",
+                )
+            adapter = AuthorizedDatabaseAdapter(
+                db,
+                commands,
+                store_sync,
+            )
+
+            result = adapter.clear_all_web_logins(
+                "账号中心批量清理"
+            )
+
+            self.assertEqual(result["stores_cleared"], 2)
+            self.assertEqual(store_sync.pulls, 1)
+            self.assertEqual(store_sync.pushes, 1)
+            self.assertEqual(
+                sorted(row[2] for row in client.authorized),
+                ["wx-clear-one", "wx-clear-two"],
+            )
+            self.assertEqual(len(client.completed), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

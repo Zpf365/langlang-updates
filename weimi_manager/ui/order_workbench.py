@@ -663,26 +663,63 @@ class StoreAfterSalePage(WorkbenchTablePage):
             if not note:
                 messagebox.showwarning("售后备注", "请输入备注。", parent=self)
                 return
-            changed = 0
-            for row in rows:
-                order_id = str(row.get("order_id") or "")
-                if not order_id:
-                    continue
-                current = self.db.get_order_workbench_row(
-                    int(row["store_id"]),
-                    order_id,
-                ) or {}
-                previous = str(current.get("note") or "").strip()
-                combined = f"{previous}\n{note}".strip() if previous else note
-                self.db.update_order_workbench(
-                    int(row["store_id"]),
-                    order_id,
-                    note=combined,
-                    is_marked=1,
+            def work(progress):
+                changed = 0
+                total = len(rows)
+                for index, row in enumerate(rows, 1):
+                    order_id = str(row.get("order_id") or "")
+                    if not order_id:
+                        continue
+                    current = self.db.get_order_workbench_row(
+                        int(row["store_id"]),
+                        order_id,
+                    ) or {}
+                    previous = str(current.get("note") or "").strip()
+                    combined = (
+                        f"{previous}\n{note}".strip()
+                        if previous
+                        else note
+                    )
+                    self.db.update_order_workbench(
+                        int(row["store_id"]),
+                        order_id,
+                        note=combined,
+                        is_marked=1,
+                    )
+                    changed += 1
+                    if progress:
+                        progress(
+                            f"正在保存第 {index}/{total} 条售后备注",
+                            index,
+                            total,
+                        )
+                return changed
+
+            def done(changed: int) -> None:
+                self.refresh()
+                self.window.set_status(
+                    f"已为 {changed} 条售后订单添加备注并插旗"
                 )
-                changed += 1
-            self.refresh()
-            self.window.set_status(f"已为 {changed} 条售后订单添加备注并插旗")
+
+            def failed(error: str) -> None:
+                self.window.set_status("批量备注保存失败")
+                messagebox.showerror(
+                    "批量备注保存失败",
+                    error,
+                    parent=self,
+                )
+
+            self.window.set_status(
+                f"正在后台保存 {len(rows)} 条售后备注…",
+                busy=True,
+            )
+            self.window.run_task(
+                work,
+                done,
+                failed,
+                log_title="批量售后备注",
+                task_scope="workbench:batch-note",
+            )
 
         SimpleFieldsDialog(
             self,
@@ -2017,15 +2054,55 @@ class MessageCenterPage(WorkbenchTablePage):
             return
         self.clipboard_clear()
         self.clipboard_append("\n".join(codes))
-        for row in selected:
-            for link in row.get("_links") or []:
+        links = [
+            (
+                int(link["store_id"]),
+                str(link["order_id"]),
+            )
+            for row in selected
+            for link in row.get("_links") or []
+        ]
+
+        def work(progress):
+            for index, (store_id, order_id) in enumerate(links, 1):
                 self.db.update_order_workbench(
-                    int(link["store_id"]),
-                    str(link["order_id"]),
+                    store_id,
+                    order_id,
                     is_marked_sent=1,
                 )
-        self.window.set_status(f"已复制 {len(codes)} 条取件码并记录为已发送")
-        self.refresh()
+                if progress:
+                    progress(
+                        f"正在记录第 {index}/{len(links)} 条取件码",
+                        index,
+                        len(links),
+                    )
+            return len(links)
+
+        def done(count: int) -> None:
+            self.refresh()
+            self.window.set_status(
+                f"已复制 {len(codes)} 条取件码，并记录 {count} 条为已发送"
+            )
+
+        def failed(error: str) -> None:
+            self.window.set_status("取件码发送状态保存失败")
+            messagebox.showerror(
+                "取件码发送状态保存失败",
+                error,
+                parent=self,
+            )
+
+        self.window.set_status(
+            f"已复制 {len(codes)} 条取件码，正在后台记录发送状态…",
+            busy=True,
+        )
+        self.window.run_task(
+            work,
+            done,
+            failed,
+            log_title="记录取件码已发送",
+            task_scope="workbench:mark-pickup-codes",
+        )
 
 
 class TransitAfterSalePage(WorkbenchTablePage):

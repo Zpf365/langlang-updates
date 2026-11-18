@@ -305,6 +305,40 @@ def select_preferred_shop_accounts(
         for account in normalized
         if account.get("account_role") == "unknown"
     ]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for account in normalized:
+        group_key = str(
+            account.get("account_username")
+            or account.get("account_nickname")
+            or ""
+        ).strip().casefold()
+        if group_key:
+            grouped.setdefault(group_key, []).append(account)
+    if grouped:
+        selected: list[dict[str, Any]] = []
+        excluded: list[dict[str, Any]] = []
+        for account in normalized:
+            group_key = str(
+                account.get("account_username")
+                or account.get("account_nickname")
+                or ""
+            ).strip().casefold()
+            group = grouped.get(
+                group_key,
+                [account] if not group_key else [],
+            )
+            group_has_sub = any(
+                item.get("account_role") == "sub"
+                for item in group
+            )
+            if (
+                account.get("account_role") == "main"
+                and group_has_sub
+            ):
+                excluded.append(account)
+            else:
+                selected.append(account)
+        return selected, excluded
     if sub_accounts:
         return [*sub_accounts, *unknown_accounts], main_accounts
     return normalized, []

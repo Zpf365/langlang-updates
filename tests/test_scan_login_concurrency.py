@@ -68,6 +68,32 @@ class ScanLoginConcurrencyTests(unittest.TestCase):
         self.assertEqual(captured.get("store_app_id"), "wx-store-one")
         self.assertNotIn("store_app_ids", captured)
 
+    def test_account_sync_does_not_start_during_scan_login(self) -> None:
+        window = object.__new__(MainWindow)
+        window.account_store_sync = SimpleNamespace(
+            push=mock.Mock(),
+        )
+        window._account_sync_running = False
+        window._account_sync_job = None
+        window._task_running = True
+        window._running_tasks = {
+            "stores:scan-login": {object()},
+        }
+        window.has_running_task = mock.Mock(return_value=True)
+        window.winfo_exists = lambda: False
+        window.db = SimpleNamespace(
+            start_task_log=mock.Mock(return_value=1),
+        )
+
+        with mock.patch(
+            "weimi_manager.ui.app.threading.Thread"
+        ) as thread:
+            window._push_account_store_sync()
+
+        thread.assert_not_called()
+        window.account_store_sync.push.assert_not_called()
+        self.assertFalse(window._account_sync_running)
+
 
 if __name__ == "__main__":
     unittest.main()

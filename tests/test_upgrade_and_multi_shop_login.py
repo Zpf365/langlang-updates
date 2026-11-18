@@ -3,9 +3,9 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
-from pathlib import Path
 
 from weimi_manager.config import (
     _database_store_count,
@@ -14,11 +14,11 @@ from weimi_manager.config import (
 )
 from weimi_manager.web_session import (
     MULTI_LOGIN_URL,
+    WechatWebSession,
     extract_shop_switch_accounts,
     filter_shop_switch_accounts,
     normalize_shop_switch_account,
     select_preferred_shop_accounts,
-    WechatWebSession,
 )
 
 
@@ -584,6 +584,41 @@ class MultiShopLoginTests(unittest.TestCase):
         selected, excluded = select_preferred_shop_accounts(accounts)
         self.assertEqual(len(selected), 1)
         self.assertFalse(excluded)
+
+    def test_main_only_wechat_is_kept_alongside_another_wechat_sub(
+        self,
+    ) -> None:
+        accounts = [
+            {
+                "app_id": "wx-main-a",
+                "name": "微信 A 主账号",
+                "account_role": "main",
+                "account_username": "wechat-a",
+            },
+            {
+                "app_id": "wx-sub-a",
+                "name": "微信 A 子账号",
+                "account_role": "sub",
+                "account_username": "wechat-a",
+            },
+            {
+                "app_id": "wx-main-b",
+                "name": "微信 B 主账号",
+                "account_role": "main",
+                "account_username": "wechat-b",
+            },
+        ]
+
+        selected, excluded = select_preferred_shop_accounts(accounts)
+
+        self.assertEqual(
+            [item["app_id"] for item in selected],
+            ["wx-sub-a", "wx-main-b"],
+        )
+        self.assertEqual(
+            [item["app_id"] for item in excluded],
+            ["wx-main-a"],
+        )
 
     def test_normalizes_initial_state_role(self) -> None:
         account = normalize_shop_switch_account(
