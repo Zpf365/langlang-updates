@@ -100,7 +100,12 @@ class SyncService:
         _, secret = self.db.get_store_secret(store.id)
         if not secret:
             raise ValueError("该店铺仅使用网页登录，未配置 AppSecret，不能调用公开 API")
-        kwargs = {"sleeper": self.sleep} if self.sleep else {}
+        kwargs: dict[str, Any] = (
+            {"sleeper": self.sleep} if self.sleep else {}
+        )
+        observer = getattr(self, "call_observer", None)
+        if callable(observer):
+            kwargs["call_observer"] = observer
         return WechatShopClient(store.app_id, secret, **kwargs)
 
     def validate_store(self, store: Store) -> None:

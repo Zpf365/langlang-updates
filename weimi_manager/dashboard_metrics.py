@@ -55,9 +55,12 @@ def _parse_time(value: Any) -> datetime | None:
         return None
     for candidate in (text, text.replace("Z", "+00:00")):
         try:
-            return datetime.fromisoformat(candidate).replace(tzinfo=None)
+            parsed = datetime.fromisoformat(candidate)
         except ValueError:
             continue
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             return datetime.strptime(text[:19], pattern)

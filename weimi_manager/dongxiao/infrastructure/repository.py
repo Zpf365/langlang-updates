@@ -45,7 +45,7 @@ from ..domain.models import (
     TaskExecutionItem,
     TaskItem,
 )
-from ..domain.operations import TaskStatistics
+from ..domain.operations import ApiCallRecord, TaskStatistics
 from ..domain.queries import (
     ProductFilter,
     ProductPage,
@@ -1729,11 +1729,11 @@ class DongxiaoRepository:
                     total_items, succeeded_items, failed_items,
                     status_reason, metadata_json, created_at, updated_at,
                     priority, max_attempts, next_run_at, lease_owner,
-                    lease_expires_at, started_at, finished_at, last_error,
-                    execution_mode
+                    lease_expires_at, last_heartbeat_at, started_at,
+                    finished_at, last_error, execution_mode
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1762,6 +1762,11 @@ class DongxiaoRepository:
                     (
                         to_utc_iso(task.lease_expires_at)
                         if task.lease_expires_at is not None
+                        else None
+                    ),
+                    (
+                        to_utc_iso(task.last_heartbeat_at)
+                        if task.last_heartbeat_at is not None
                         else None
                     ),
                     (
@@ -2526,7 +2531,8 @@ class DongxiaoRepository:
             cursor = conn.execute(
                 """
                 UPDATE dongxiao_tasks
-                SET lease_owner=?, lease_expires_at=?, updated_at=?
+                SET lease_owner=?, lease_expires_at=?,
+                    last_heartbeat_at=?, updated_at=?
                 WHERE task_id=? AND store_app_id=?
                   AND status IN ('preparing', 'running')
                   AND (
@@ -2539,6 +2545,7 @@ class DongxiaoRepository:
                 (
                     str(owner),
                     expires,
+                    now,
                     now,
                     str(task_id),
                     str(store_app_id),
@@ -2693,6 +2700,127 @@ class DongxiaoRepository:
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
+    def platform_writes_enabled(self) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT setting_value
+                FROM dongxiao_runtime_settings
+                WHERE setting_key='platform_writes_enabled'
+                """
+            ).fetchone()
+        return row is not None and str(row["setting_value"]) == "1"
+
+    def set_platform_writes_enabled(
+        self,
+        enabled: bool,
+        *,
+        actor_id: str,
+    ) -> bool:
+        if not isinstance(enabled, bool):
+            raise TypeError("平台写操作开关必须是布尔值")
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute(
+                """
+                SELECT setting_value
+                FROM dongxiao_runtime_settings
+                WHERE setting_key='platform_writes_enabled'
+                """
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO dongxiao_runtime_settings(
+                    setting_key, setting_value, updated_by, updated_at
+                ) VALUES(
+                    'platform_writes_enabled', ?, ?, ?
+                )
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value=excluded.setting_value,
+                    updated_by=excluded.updated_by,
+                    updated_at=excluded.updated_at
+                """,
+                ("1" if enabled else "0", str(actor_id), now),
+            )
+            self._insert_audit(
+                conn,
+                store_id=None,
+                store_app_id="",
+                actor_id=str(actor_id),
+                action="platform_write_guard_changed",
+                entity_type="runtime",
+                entity_id="platform_writes_enabled",
+                request_id="",
+                result=AuditResult.INFO,
+                detail={
+                    "enabled": enabled,
+                    "previous_enabled": (
+                        previous is not None
+                        and str(previous["setting_value"]) == "1"
+                    ),
+                    "message": (
+                        "已允许创建和执行经人工确认的平台写任务"
+                        if enabled
+                        else "已禁止所有新的平台写任务和执行"
+                    ),
+                },
+            )
+        return enabled
+
+    def schema_migration_summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT version, name, checksum, applied_at
+                FROM dongxiao_schema_migrations
+                ORDER BY version
+                """
+            ).fetchall()
+        return {
+            "versions": [int(row["version"]) for row in rows],
+            "latest": int(rows[-1]["version"]) if rows else 0,
+            "latest_name": str(rows[-1]["name"]) if rows else "",
+            "latest_checksum": str(rows[-1]["checksum"]) if rows else "",
+            "applied_at": str(rows[-1]["applied_at"]) if rows else "",
+        }
+
+    def integrity_check(self) -> str:
+        with self.connect() as conn:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+        return str(row[0]) if row else "unknown"
+
+    def audit_log_health(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            triggers = {
+                str(row["name"])
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type='trigger'
+                      AND name IN (
+                          'prevent_dongxiao_audit_update_v5',
+                          'prevent_dongxiao_audit_update',
+                          'prevent_dongxiao_audit_delete'
+                      )
+                    """
+                ).fetchall()
+            }
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM dongxiao_audit_events"
+                ).fetchone()[0]
+            )
+        return {
+            "append_only": bool(
+                {
+                    "prevent_dongxiao_audit_update_v5",
+                    "prevent_dongxiao_audit_delete",
+                }.issubset(triggers)
+            ),
+            "event_count": count,
+        }
+
     def find_task_for_execution_subject(
         self,
         *,
@@ -2779,6 +2907,62 @@ class DongxiaoRepository:
             unknown_items=int(item_row["unknown_items"] or 0),
             by_status=counts,
         )
+
+    def record_api_call(self, call: ApiCallRecord) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO dongxiao_api_calls(
+                    call_id, store_app_id, request_id, method, path,
+                    attempt_no, outcome, errcode, rid, error_type,
+                    error_message, started_at, finished_at, duration_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    call.call_id,
+                    call.store_app_id,
+                    call.request_id,
+                    call.method,
+                    call.path,
+                    call.attempt_no,
+                    call.outcome,
+                    call.errcode,
+                    call.rid,
+                    call.error_type,
+                    call.error_message,
+                    to_utc_iso(call.started_at),
+                    to_utc_iso(call.finished_at),
+                    call.duration_ms,
+                ),
+            )
+
+    def list_api_calls(
+        self,
+        store_app_id: str = "",
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if store_app_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM dongxiao_api_calls
+                    WHERE store_app_id=?
+                    ORDER BY started_at DESC, call_id DESC
+                    LIMIT ?
+                    """,
+                    (str(store_app_id), max(1, min(10000, int(limit)))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM dongxiao_api_calls
+                    ORDER BY started_at DESC, call_id DESC
+                    LIMIT ?
+                    """,
+                    (max(1, min(10000, int(limit))),),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_task_attempts(
         self,
@@ -4230,6 +4414,7 @@ class DongxiaoRepository:
             next_run_at=_row_time(row["next_run_at"]),
             lease_owner=str(row["lease_owner"] or ""),
             lease_expires_at=_row_time(row["lease_expires_at"]),
+            last_heartbeat_at=_row_time(row["last_heartbeat_at"]),
             started_at=_row_time(row["started_at"]),
             finished_at=_row_time(row["finished_at"]),
             last_error=str(row["last_error"] or ""),

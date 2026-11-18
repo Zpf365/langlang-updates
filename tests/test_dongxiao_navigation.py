@@ -45,6 +45,7 @@ def test_formal_sales_related_route_opens_dongxiao_center(
             "真实订单",
             "售后工单",
             "日志审计",
+            "实盘前检查",
         ]
 
         page.section_buttons["tasks"].invoke()

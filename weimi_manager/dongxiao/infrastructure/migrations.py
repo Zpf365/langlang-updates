@@ -23,8 +23,8 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 5
-DONGXIAO_MIGRATION_NAME = "dongxiao_fix1_integrity_v5"
+DONGXIAO_MIGRATION_VERSION = 6
+DONGXIAO_MIGRATION_NAME = "dongxiao_release_candidate_v6"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
 )
@@ -39,6 +39,9 @@ DONGXIAO_V4_CHECKSUM = (
 )
 DONGXIAO_V5_CHECKSUM = (
     "d74be519cddb09bc4afe0f4893e0c91f9cf3a3b303d9c8250fb8a54f6c7eed90"
+)
+DONGXIAO_V6_CHECKSUM = (
+    "26c3bfc3bc3e19fde485fc8972b09e7b630daad303780d2d0ee63ca408d18673"
 )
 
 
@@ -973,6 +976,50 @@ END;
 """
 
 
+def _migration_v6_sql() -> str:
+    return """
+ALTER TABLE dongxiao_tasks ADD COLUMN last_heartbeat_at TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_dongxiao_tasks_heartbeat_v6
+    ON dongxiao_tasks(status, last_heartbeat_at, store_app_id);
+
+CREATE TABLE IF NOT EXISTS dongxiao_api_calls (
+    call_id TEXT PRIMARY KEY,
+    store_app_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    outcome TEXT NOT NULL
+        CHECK (outcome IN ('success', 'api_error', 'transport_error')),
+    errcode INTEGER,
+    rid TEXT NOT NULL DEFAULT '',
+    error_type TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_api_calls_store_time_v6
+    ON dongxiao_api_calls(store_app_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_api_calls_request_v6
+    ON dongxiao_api_calls(request_id);
+
+CREATE TABLE IF NOT EXISTS dongxiao_runtime_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO dongxiao_runtime_settings(
+    setting_key, setting_value, updated_by, updated_at
+) VALUES(
+    'platform_writes_enabled', '0', 'migration-v6',
+    strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')
+);
+"""
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
@@ -980,6 +1027,7 @@ def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
         (3, "dongxiao_catalog_consistency_v3", _migration_v3_sql),
         (4, "dongxiao_operations_v4", _migration_v4_sql),
         (5, "dongxiao_fix1_integrity_v5", _migration_v5_sql),
+        (6, "dongxiao_release_candidate_v6", _migration_v6_sql),
     )
 
 
@@ -1066,6 +1114,10 @@ def migrate_dongxiao_schema(
             raise sqlite3.IntegrityError(
                 "动销中心 v5 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
+        if version == 6 and current_checksum != DONGXIAO_V6_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v6 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
             conn.executescript(
@@ -1133,6 +1185,8 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_execution_attempts",
         "dongxiao_order_details",
         "dongxiao_aftersale_status_history",
+        "dongxiao_api_calls",
+        "dongxiao_runtime_settings",
     }
     tables = {
         str(row[0])

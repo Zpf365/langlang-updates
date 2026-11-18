@@ -3,14 +3,16 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import socket
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
@@ -22,6 +24,7 @@ from .models import Order, OrderItem, Product, ShippingAccount, ShippingTemplate
 
 API_ROOT = "https://api.weixin.qq.com"
 MAX_LIST_PAGES = 1000
+TOKEN_INVALID_CODES = frozenset({40001, 40014, 42001})
 TOKEN_PATH = "/cgi-bin/stable_token"
 ORDER_LIST_PATH = "/channels/ec/order/list/get"
 ORDER_DETAIL_PATH = "/channels/ec/order/get"
@@ -88,11 +91,48 @@ LIMITED_DISCOUNT_LIST_PATH = "/channels/ec/product/limiteddiscounttask/list/get"
 LIMITED_DISCOUNT_STOP_PATH = "/channels/ec/product/limiteddiscounttask/stop"
 
 
+def _redact_sensitive_text(value: object) -> str:
+    text = str(value)
+    text = re.sub(
+        r"(?i)\b(access_token|token|appsecret|secret|password|"
+        r"cookie|authorization)\b\s*[:=]\s*[^&;\s,]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+",
+        "Bearer [REDACTED]",
+        text,
+    )
+    return re.sub(r"https?://[^\s]+", "[URL]", text)
+
+
 class WechatApiError(RuntimeError):
-    def __init__(self, message: str, code: int | None = None, rid: str = ""):
+    def __init__(
+        self,
+        message: str,
+        code: int | None = None,
+        rid: str = "",
+        request_id: str = "",
+    ):
         super().__init__(message)
         self.code = code
         self.rid = rid
+        self.request_id = request_id
+
+    @property
+    def category(self) -> str:
+        if self.code in {40001, 40013, 40014, 42001}:
+            return "authentication"
+        if self.code in {-1, 45011}:
+            return "rate_limit"
+        if self.code in {-2, 50002}:
+            return "platform_temporary"
+        if self.code in {48001, 50001}:
+            return "permission"
+        if self.code is None:
+            return "transport"
+        return "api"
 
 
 class WechatTransportError(WechatApiError):
@@ -150,18 +190,20 @@ class HttpTransport:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read(300).decode("utf-8", "replace")
-            raise WechatApiError(f"HTTP {exc.code}: {detail}") from exc
+            raise WechatApiError(
+                f"HTTP {exc.code}: {_redact_sensitive_text(detail)}"
+            ) from exc
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 raise WechatTimeoutError(
-                    f"网络请求超时: {exc}"
+                    f"网络请求超时: {_redact_sensitive_text(exc)}"
                 ) from exc
             raise WechatNetworkError(
-                f"网络请求失败: {exc}"
+                f"网络请求失败: {_redact_sensitive_text(exc)}"
             ) from exc
         except (TimeoutError, socket.timeout) as exc:
             raise WechatTimeoutError(
-                f"网络请求超时: {exc}"
+                f"网络请求超时: {_redact_sensitive_text(exc)}"
             ) from exc
         try:
             result = json.loads(raw.decode("utf-8"))
@@ -187,6 +229,7 @@ class WechatShopClient:
         transport: Transport | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         min_request_interval: float | None = None,
+        call_observer: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.app_id = app_id.strip()
         self._secret = secret.strip()
@@ -202,6 +245,79 @@ class WechatShopClient:
             if min_request_interval is None
             else max(0.0, min_request_interval)
         )
+        self.call_observer = call_observer
+
+    def set_call_observer(
+        self,
+        observer: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        self.call_observer = observer
+
+    def _notify_api_call(
+        self,
+        *,
+        path: str,
+        method: str,
+        attempt_no: int,
+        request_id: str,
+        started_at: datetime,
+        started_perf: float,
+        result: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if self.call_observer is None:
+            return
+        finished_at = datetime.now(UTC)
+        errcode = None
+        rid = ""
+        if result is not None:
+            raw_code = result.get("errcode")
+            try:
+                errcode = int(raw_code or 0)
+            except (TypeError, ValueError):
+                errcode = None
+            rid = str(result.get("rid") or "")[:200]
+        outcome = (
+            "success"
+            if error is None and errcode in {None, 0}
+            else (
+                "api_error"
+                if error is None
+                else "transport_error"
+            )
+        )
+        safe_path = urlsplit(str(path)).path or "/"
+        payload = {
+            "call_id": uuid.uuid4().hex,
+            "store_app_id": self.app_id,
+            "request_id": request_id,
+            "method": method,
+            "path": safe_path,
+            "attempt_no": attempt_no,
+            "outcome": outcome,
+            "errcode": errcode,
+            "rid": rid,
+            "error_type": type(error).__name__ if error is not None else "",
+            "error_message": self._safe_error_text(error),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": max(
+                0,
+                int((time.perf_counter() - started_perf) * 1000),
+            ),
+        }
+        try:
+            self.call_observer(payload)
+        except Exception:
+            pass
+
+    def _safe_error_text(self, error: BaseException | None) -> str:
+        if error is None:
+            return ""
+        text = str(error)
+        if self._secret:
+            text = text.replace(self._secret, "[REDACTED]")
+        return _redact_sensitive_text(text)[:1000]
 
     def get_access_token(self, force_refresh: bool = False) -> str:
         with self._token_lock:
@@ -214,8 +330,39 @@ class WechatShopClient:
             }
             if force_refresh:
                 payload["force_refresh"] = True
-            result = self.transport.post_json(API_ROOT + TOKEN_PATH, payload)
-            self._raise_for_error(result)
+            request_id = uuid.uuid4().hex
+            started_at = datetime.now(UTC)
+            started_perf = time.perf_counter()
+            try:
+                result = self.transport.post_json(
+                    API_ROOT + TOKEN_PATH,
+                    payload,
+                )
+            except Exception as exc:
+                self._notify_api_call(
+                    path=TOKEN_PATH,
+                    method="POST",
+                    attempt_no=1,
+                    request_id=request_id,
+                    started_at=started_at,
+                    started_perf=started_perf,
+                    error=exc,
+                )
+                raise
+            self._notify_api_call(
+                path=TOKEN_PATH,
+                method="POST",
+                attempt_no=1,
+                request_id=request_id,
+                started_at=started_at,
+                started_perf=started_perf,
+                result=result,
+            )
+            try:
+                self._raise_for_error(result)
+            except WechatApiError as exc:
+                exc.request_id = request_id
+                raise
             token = str(result.get("access_token") or "")
             if not token:
                 raise WechatApiError("接口没有返回 access_token")
@@ -362,10 +509,16 @@ class WechatShopClient:
         result = self._post_api(PRODUCT_LIST_PATH, payload)
         if not isinstance(result.get("product_ids"), list):
             raise WechatApiError("微信商品目录返回格式异常")
+        next_key = str(result.get("next_key") or "")
+        has_more = bool(result.get("has_more", bool(next_key)))
+        if has_more and not next_key:
+            raise WechatApiError(
+                "商品分页返回 has_more=true 但缺少 next_key"
+            )
         return ApiListPage(
             ids=[str(value) for value in result.get("product_ids", [])],
-            next_key=str(result.get("next_key") or ""),
-            has_more=bool(result.get("next_key")),
+            next_key=next_key,
+            has_more=has_more,
         )
 
     def fetch_product_total(self, status: int | None = None) -> int:
@@ -1173,13 +1326,38 @@ class WechatShopClient:
         token_refreshed = False
         for attempt in range(3):
             self._wait_for_rate_limit()
-            result = self.transport.post_json(url, payload)
+            request_id = uuid.uuid4().hex
+            started_at = datetime.now(UTC)
+            started_perf = time.perf_counter()
+            try:
+                result = self.transport.post_json(url, payload)
+            except Exception as exc:
+                self._notify_api_call(
+                    path=path,
+                    method="POST",
+                    attempt_no=attempt + 1,
+                    request_id=request_id,
+                    started_at=started_at,
+                    started_perf=started_perf,
+                    error=exc,
+                )
+                raise
+            self._notify_api_call(
+                path=path,
+                method="POST",
+                attempt_no=attempt + 1,
+                request_id=request_id,
+                started_at=started_at,
+                started_perf=started_perf,
+                result=result,
+            )
             try:
                 self._raise_for_error(result)
                 return result
             except WechatApiError as exc:
+                exc.request_id = request_id
                 last_error = exc
-                if exc.code in {40001, 42001} and not token_refreshed:
+                if exc.code in TOKEN_INVALID_CODES and not token_refreshed:
                     self._invalidate_access_token()
                     token = self.get_access_token()
                     url = f"{API_ROOT}{path}?access_token={token}"
@@ -1197,13 +1375,38 @@ class WechatShopClient:
         token_refreshed = False
         for attempt in range(3):
             self._wait_for_rate_limit()
-            result = self.transport.get_json(url)
+            request_id = uuid.uuid4().hex
+            started_at = datetime.now(UTC)
+            started_perf = time.perf_counter()
+            try:
+                result = self.transport.get_json(url)
+            except Exception as exc:
+                self._notify_api_call(
+                    path=path,
+                    method="GET",
+                    attempt_no=attempt + 1,
+                    request_id=request_id,
+                    started_at=started_at,
+                    started_perf=started_perf,
+                    error=exc,
+                )
+                raise
+            self._notify_api_call(
+                path=path,
+                method="GET",
+                attempt_no=attempt + 1,
+                request_id=request_id,
+                started_at=started_at,
+                started_perf=started_perf,
+                result=result,
+            )
             try:
                 self._raise_for_error(result)
                 return result
             except WechatApiError as exc:
+                exc.request_id = request_id
                 last_error = exc
-                if exc.code in {40001, 42001} and not token_refreshed:
+                if exc.code in TOKEN_INVALID_CODES and not token_refreshed:
                     self._invalidate_access_token()
                     token = self.get_access_token()
                     url = f"{API_ROOT}{path}?access_token={token}"

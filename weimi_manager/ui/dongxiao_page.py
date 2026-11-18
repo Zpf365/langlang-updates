@@ -13,6 +13,10 @@ from ..dongxiao.application.catalog_service import ProductCatalogService
 from ..dongxiao.application.import_service import ProductImportService
 from ..dongxiao.application.order_service import DongxiaoOrderService
 from ..dongxiao.application.pool_service import ProductPoolService
+from ..dongxiao.application.preflight_service import (
+    PLATFORM_READ_AUTHORIZATION,
+    DongxiaoPreflightService,
+)
 from ..dongxiao.application.task_service import DongxiaoTaskService
 from ..dongxiao.domain.catalog import (
     CatalogFreshness,
@@ -27,6 +31,7 @@ from ..dongxiao.domain.enums import (
     ProductState,
     TaskStatus,
 )
+from ..dongxiao.domain.operations import PreflightState
 from ..dongxiao.domain.queries import ProductFilter, ProductPage
 from ..dongxiao.domain.rules import (
     SkuSelection,
@@ -160,9 +165,13 @@ class DongxiaoPage(BasePage):
             self.order_service = self.runtime.order_service
             self.aftersale_service = self.runtime.aftersale_service
             self.task_scheduler = self.runtime.scheduler
+            self.preflight_service = self.runtime.preflight_service
         else:
             platform = OfficialDongxiaoPlatformAdapter(self.window.service)
-            self.task_service = DongxiaoTaskService(self.repository)
+            self.task_service = DongxiaoTaskService(
+                self.repository,
+                platform_write_gate=lambda: False,
+            )
             self.order_service = DongxiaoOrderService(
                 self.repository,
                 platform,
@@ -170,8 +179,16 @@ class DongxiaoPage(BasePage):
             self.aftersale_service = DongxiaoAftersaleService(
                 self.repository,
                 platform,
+                task_service=self.task_service,
             )
             self.task_scheduler = None
+            self.preflight_service = DongxiaoPreflightService(
+                self.repository,
+                runtime=None,
+                sync_service=self.window.service,
+                database_path=database_path,
+                backup_dir=database_path.parent / "backups",
+            )
         self.official_catalog_service = ProductCatalogService(
             self.repository,
             build_catalog_adapter(
@@ -209,6 +226,10 @@ class DongxiaoPage(BasePage):
         self.order_status_var = tk.StringVar(value="真实订单尚未同步")
         self.aftersale_status_var = tk.StringVar(value="售后工单尚未同步")
         self.audit_status_var = tk.StringVar(value="审计日志尚未读取")
+        self.preflight_status_var = tk.StringVar(value="实盘检查尚未运行")
+        self.platform_write_status_var = tk.StringVar(
+            value="平台写操作：检查中"
+        )
         self.overview_stats_vars = {
             "stores": tk.StringVar(value="—"),
             "products": tk.StringVar(value="—"),
@@ -333,9 +354,31 @@ class DongxiaoPage(BasePage):
             )
             nav_button.pack(fill="x", padx=7, pady=1)
             self.section_buttons[section.key] = nav_button
+        self.platform_write_button = tk.Button(
+            navigation,
+            textvariable=self.platform_write_status_var,
+            command=self._disable_platform_writes_now,
+            bg="#FBE9E7",
+            fg="#A33A2B",
+            activebackground="#F5D4CF",
+            activeforeground="#7C271C",
+            relief="flat",
+            bd=0,
+            anchor="w",
+            justify="left",
+            wraplength=145,
+            padx=16,
+            pady=9,
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 8, "bold"),
+        )
+        self.platform_write_button.pack(side="bottom", fill="x")
         tk.Label(
             navigation,
-            text="只读商品同步与本地管理。\n不会加入购物车或下单。",
+            text=(
+                "买卖双方真实数据严格隔离。\n"
+                "平台写操作默认关闭。"
+            ),
             bg=PANEL,
             fg=MUTED,
             justify="left",
@@ -363,6 +406,7 @@ class DongxiaoPage(BasePage):
         self.section_views["orders"] = self._build_order_view()
         self.section_views["aftersales"] = self._build_aftersale_view()
         self.section_views["audit"] = self._build_audit_view()
+        self.section_views["preflight"] = self._build_preflight_view()
         for view in self.section_views.values():
             view.grid(row=0, column=0, sticky="nsew")
             view.grid_remove()
@@ -1092,6 +1136,125 @@ class DongxiaoPage(BasePage):
         ).grid(row=2, column=0, sticky="w", pady=(0, 6))
         return view
 
+    def _build_preflight_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(5, weight=1)
+        view.rowconfigure(8, weight=1)
+
+        heading = ttk.Frame(view, style="Panel.TFrame")
+        heading.grid(row=0, column=0, sticky="ew")
+        heading.columnconfigure(0, weight=1)
+        ttk.Label(
+            heading,
+            text="实盘前检查",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            heading,
+            textvariable=self.platform_write_status_var,
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        actions = ttk.Frame(view, style="Panel.TFrame")
+        actions.grid(row=1, column=0, sticky="ew", pady=(12, 8))
+        self.preflight_local_button = button(
+            actions,
+            "运行本地检查",
+            self._run_preflight_local,
+            "Primary",
+        )
+        self.preflight_local_button.pack(side="left", padx=(0, 6))
+        self.preflight_platform_button = button(
+            actions,
+            "手动真实只读检查",
+            self._run_preflight_platform,
+        )
+        self.preflight_platform_button.pack(side="left", padx=(0, 6))
+        self.preflight_report_button = button(
+            actions,
+            "保存中文报告",
+            self._save_preflight_report,
+        )
+        self.preflight_report_button.pack(side="left", padx=(0, 6))
+        self.enable_platform_write_button = button(
+            actions,
+            "开启平台写操作",
+            self._enable_platform_writes,
+        )
+        self.enable_platform_write_button.pack(side="left")
+
+        ttk.Label(
+            view,
+            text=(
+                "真实只读检查只会在本次点击、二次确认并具备权限后执行；"
+                "不会同意售后、拒绝售后、退款或修改平台数据。"
+            ),
+            style="Subtitle.TLabel",
+            wraplength=900,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 8))
+
+        ttk.Label(
+            view,
+            textvariable=self.preflight_status_var,
+            style="Subtitle.TLabel",
+        ).grid(row=3, column=0, sticky="w", pady=(0, 5))
+
+        self.preflight_tree = ttk.Treeview(
+            view,
+            columns=("state", "check", "message"),
+            show="headings",
+            height=9,
+        )
+        for key, label, width in (
+            ("state", "状态", 110),
+            ("check", "检查项", 150),
+            ("message", "说明", 620),
+        ):
+            self.preflight_tree.heading(key, text=label)
+            self.preflight_tree.column(key, width=width, anchor="w")
+        self.preflight_tree.grid(row=5, column=0, sticky="nsew")
+
+        ttk.Label(
+            view,
+            text="最近 API 调用（路径已去除查询参数和凭据）",
+            style="Subtitle.TLabel",
+        ).grid(row=6, column=0, sticky="w", pady=(10, 5))
+        api_actions = ttk.Frame(view, style="Panel.TFrame")
+        api_actions.grid(row=7, column=0, sticky="ew", pady=(0, 4))
+        button(
+            api_actions,
+            "刷新调用记录",
+            self._load_api_calls,
+        ).pack(side="left")
+        self.api_call_tree = ttk.Treeview(
+            view,
+            columns=(
+                "time",
+                "method",
+                "path",
+                "outcome",
+                "request_id",
+                "duration",
+            ),
+            show="headings",
+            height=7,
+        )
+        for key, label, width in (
+            ("time", "时间", 145),
+            ("method", "方法", 65),
+            ("path", "路径", 300),
+            ("outcome", "结果", 105),
+            ("request_id", "请求 ID", 235),
+            ("duration", "耗时", 75),
+        ):
+            self.api_call_tree.heading(key, text=label)
+            self.api_call_tree.column(key, width=width, anchor="w")
+        self.api_call_tree.grid(row=8, column=0, sticky="nsew")
+        self._update_platform_write_status()
+        return view
+
     def _build_placeholder(self, key: str) -> ttk.Frame:
         view = ttk.Frame(self.section_host, style="Panel.TFrame")
         section = next(
@@ -1127,7 +1290,7 @@ class DongxiaoPage(BasePage):
         self.section_title_var.set(section.label)
         self.section_description_var.set(section.description)
         self.section_stage_var.set(
-            "第 4 阶段：任务、订单、售后、审批、审计和后台执行。"
+            "第 5 阶段：实盘候选、接口审计、资金安全与后台恢复。"
         )
         for view_key, view in self.section_views.items():
             view.grid_remove()
@@ -1150,6 +1313,9 @@ class DongxiaoPage(BasePage):
             self._load_aftersales()
         elif section.key == "audit":
             self._load_audit()
+        elif section.key == "preflight":
+            self._update_platform_write_status()
+            self._load_api_calls()
 
     def refresh(self) -> None:
         self._load_stores()
@@ -2458,6 +2624,16 @@ class DongxiaoPage(BasePage):
             dialog = tk.Toplevel(self)
             dialog.title(f"任务详情 · {task.task_id}")
             dialog.geometry("980x560")
+            if task is not None:
+                ttk.Label(
+                    dialog,
+                    text=(
+                        f"状态：{self._task_status_label(task.status)}  "
+                        f"执行模式：{task.execution_mode}  "
+                        f"租约：{task.lease_owner or '无'}  "
+                        f"心跳：{_date_time(task.last_heartbeat_at)}"
+                    ),
+                ).pack(anchor="w", padx=12, pady=(12, 0))
             table = ttk.Treeview(
                 dialog,
                 columns=("type", "subject", "status", "attempts", "error"),
@@ -3231,6 +3407,290 @@ class DongxiaoPage(BasePage):
         self.window.set_status(
             f"动销审计日志已读取 {len(rows)} 条",
             busy=False,
+        )
+
+    def _run_preflight_local(self) -> None:
+        window = self.window
+        window.run_task(
+            lambda _progress: self.preflight_service.run_local(
+                actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
+            ),
+            self._preflight_completed,
+            self._preflight_failed,
+            progress=lambda message, _current, _total: (
+                self.preflight_status_var.set(message)
+            ),
+            log_title="动销实盘前本地检查",
+            task_scope="dongxiao:preflight-local",
+        )
+
+    def _run_preflight_platform(self) -> None:
+        store = self._current_store()
+        if store is None:
+            messagebox.showwarning(
+                "实盘前检查",
+                "请先选择当前店铺。",
+                parent=self,
+            )
+            return
+        if not self._permission_checker(
+            "dongxiao_preflight_platform_read"
+        ):
+            messagebox.showwarning(
+                "实盘前检查",
+                "当前账号没有真实平台只读检查权限。",
+                parent=self,
+            )
+            return
+        confirmed = messagebox.askyesno(
+            "确认真实只读检查",
+            (
+                f"将对店铺“{store.name}”执行一次真实平台只读检查。\n\n"
+                "检查会获取 Token，并读取商品列表第一页、"
+                "最近 24 小时订单和售后列表。\n"
+                "不会同意售后、拒绝售后、退款或修改平台数据。\n\n"
+                "是否仅授权本次手动检查？"
+            ),
+            parent=self,
+        )
+        if not confirmed:
+            return
+        self.window.run_task(
+            lambda _progress: self.preflight_service.run_platform_readonly(
+                store,
+                actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
+                authorization_text=PLATFORM_READ_AUTHORIZATION,
+            ),
+            self._preflight_completed,
+            self._preflight_failed,
+            progress=lambda message, _current, _total: (
+                self.preflight_status_var.set(message)
+            ),
+            log_title="动销真实平台手动只读检查",
+            task_scope=f"dongxiao:preflight-platform:{store.id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _preflight_completed(self, report) -> None:
+        self._last_preflight_report = report
+        for item_id in self.preflight_tree.get_children():
+            self.preflight_tree.delete(item_id)
+        labels = {
+            PreflightState.PASSED: "已通过",
+            PreflightState.FAILED: "未通过",
+            PreflightState.NOT_VERIFIED: "未验证",
+            PreflightState.MANUAL_AUTHORIZATION_REQUIRED: "需要人工授权",
+        }
+        for check in report.checks:
+            self.preflight_tree.insert(
+                "",
+                "end",
+                values=(
+                    labels[check.state],
+                    check.label,
+                    check.message,
+                ),
+            )
+        counts = report.counts
+        self.preflight_status_var.set(
+            "检查完成："
+            f"通过 {counts['passed']}，"
+            f"未通过 {counts['failed']}，"
+            f"未验证 {counts['not_verified']}，"
+            f"需人工授权 {counts['manual_authorization_required']}；"
+            f"是否可放行：{'是' if report.release_ready else '否'}"
+        )
+        self._update_platform_write_status()
+        self._load_api_calls()
+        self.window.set_status(
+            "动销实盘前检查完成",
+            busy=False,
+        )
+
+    def _preflight_failed(self, error: str) -> None:
+        self.preflight_status_var.set(f"检查失败：{error}")
+        messagebox.showerror(
+            "实盘前检查失败",
+            error,
+            parent=self,
+        )
+
+    def _save_preflight_report(self) -> None:
+        report = getattr(self, "_last_preflight_report", None)
+        if report is None:
+            messagebox.showwarning(
+                "保存验收报告",
+                "请先运行实盘前检查。",
+                parent=self,
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="保存动销实盘前验收报告",
+            defaultextension=".txt",
+            filetypes=(("文本文件", "*.txt"), ("全部文件", "*.*")),
+            initialfile="Dongxiao_Phase5_Preflight.txt",
+        )
+        if not path:
+            return
+        Path(path).write_text(
+            self.preflight_service.format_report(report),
+            encoding="utf-8",
+        )
+        self.window.set_status("动销实盘前验收报告已保存", busy=False)
+
+    def _disable_platform_writes_now(self) -> None:
+        if not getattr(self, "preflight_service", None):
+            return
+        self.platform_write_status_var.set("平台写操作：正在禁止")
+        runtime = self.runtime
+        if runtime is None:
+            ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
+            runtime = ensure() if callable(ensure) else None
+        if runtime is None:
+            self.platform_write_status_var.set("平台写操作：禁止失败")
+            messagebox.showerror(
+                "平台写操作",
+                "动销 Runtime 未初始化，无法更新总开关。",
+                parent=self,
+            )
+            return
+        self.window.run_task(
+            lambda _progress: runtime.set_platform_writes_enabled(
+                False,
+                actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
+            ),
+            lambda _result: self._platform_gate_completed(False),
+            self._platform_gate_failed,
+            log_title="立即禁止动销平台写操作",
+            task_scope="dongxiao:platform-write-disable",
+        )
+
+    def _enable_platform_writes(self) -> None:
+        if not self._permission_checker(
+            "dongxiao_platform_write_switch"
+        ):
+            messagebox.showwarning(
+                "平台写操作",
+                "当前账号没有修改平台写操作总开关的权限。",
+                parent=self,
+            )
+            return
+        first = messagebox.askyesno(
+            "开启平台写操作",
+            (
+                "开启后只允许创建“已经完成人工审批”的平台写任务，"
+                "不会自动同意、拒绝或退款。\n\n"
+                "是否进入准备状态？"
+            ),
+            parent=self,
+        )
+        if not first:
+            return
+        second = messagebox.askyesno(
+            "二次确认",
+            "确认开启平台写操作总开关？建议仅在实盘前检查全部通过后开启。",
+            parent=self,
+        )
+        if not second:
+            return
+        runtime = self.runtime
+        if runtime is None:
+            ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
+            runtime = ensure() if callable(ensure) else None
+        if runtime is None:
+            messagebox.showerror(
+                "平台写操作",
+                "动销 Runtime 未初始化，禁止开启平台写操作。",
+                parent=self,
+            )
+            return
+        self.window.run_task(
+            lambda _progress: runtime.set_platform_writes_enabled(
+                True,
+                actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
+            ),
+            lambda _result: self._platform_gate_completed(True),
+            self._platform_gate_failed,
+            log_title="开启动销平台写操作",
+            task_scope="dongxiao:platform-write-enable",
+        )
+
+    def _platform_gate_completed(self, enabled: bool) -> None:
+        self.platform_write_status_var.set(
+            "平台写操作：已开启（需逐单人工确认）"
+            if enabled
+            else "平台写操作：已禁止"
+        )
+        self.window.set_status(
+            "动销平台写操作已开启"
+            if enabled
+            else "已立即禁止所有新的动销平台写操作",
+            busy=False,
+        )
+
+    def _platform_gate_failed(self, error: str) -> None:
+        self.platform_write_status_var.set("平台写操作：状态更新失败")
+        messagebox.showerror(
+            "平台写操作",
+            error,
+            parent=self,
+        )
+
+    def _update_platform_write_status(self) -> None:
+        runtime = self.runtime
+        if runtime is None:
+            self.platform_write_status_var.set("平台写操作：已禁止")
+            return
+        try:
+            enabled = runtime.platform_writes_enabled()
+        except Exception:
+            self.platform_write_status_var.set("平台写操作：状态读取失败")
+            return
+        self.platform_write_status_var.set(
+            "平台写操作：已开启（需逐单人工确认）"
+            if enabled
+            else "平台写操作：已禁止"
+        )
+
+    def _load_api_calls(self) -> None:
+        store = self._current_store()
+        store_app_id = str(store.app_id) if store is not None else ""
+
+        def done(rows: list[dict[str, Any]]) -> None:
+            for item_id in self.api_call_tree.get_children():
+                self.api_call_tree.delete(item_id)
+            for row in rows:
+                self.api_call_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        str(row.get("started_at") or ""),
+                        str(row.get("method") or ""),
+                        str(row.get("path") or ""),
+                        str(row.get("outcome") or ""),
+                        str(row.get("request_id") or ""),
+                        f"{int(row.get('duration_ms') or 0)} ms",
+                    ),
+                )
+
+        self.window.run_task(
+            lambda _progress: self.repository.list_api_calls(
+                store_app_id,
+                limit=200,
+            ),
+            done,
+            lambda error: self.window.set_status(
+                f"API 调用记录读取失败：{error}",
+                busy=False,
+            ),
+            log_title="读取动销 API 调用记录",
+            task_scope=f"dongxiao:api-calls:{store_app_id or 'all'}",
+            store_app_id=store_app_id,
         )
 
     def _actor_id(self) -> str:

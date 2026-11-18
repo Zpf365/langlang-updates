@@ -18,6 +18,7 @@ browser_runtime/
 *.spec
 !LangLang.spec
 .pytest_cache/
+artifacts/
 supabase/.temp/
 
 # Local delivery artifacts are versioned by directory, not tracked by Git.

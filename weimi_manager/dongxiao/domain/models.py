@@ -437,6 +437,7 @@ class Task:
     next_run_at: datetime | None = None
     lease_owner: str = ""
     lease_expires_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     last_error: str = ""
@@ -486,6 +487,7 @@ class Task:
         for field_name, value in (
             ("任务下次运行时间", self.next_run_at),
             ("任务租约到期时间", self.lease_expires_at),
+            ("任务心跳时间", self.last_heartbeat_at),
             ("任务开始时间", self.started_at),
             ("任务结束时间", self.finished_at),
         ):
@@ -495,6 +497,7 @@ class Task:
                     {
                         "任务下次运行时间": "next_run_at",
                         "任务租约到期时间": "lease_expires_at",
+                        "任务心跳时间": "last_heartbeat_at",
                         "任务开始时间": "started_at",
                         "任务结束时间": "finished_at",
                     }[field_name],

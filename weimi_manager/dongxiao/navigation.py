@@ -20,4 +20,9 @@ DONGXIAO_SECTIONS = (
     DongxiaoSection("orders", "真实订单", "平台真实订单查询与核验"),
     DongxiaoSection("aftersales", "售后工单", "试算、审批、执行与回查"),
     DongxiaoSection("audit", "日志审计", "操作人、店铺、请求与结果记录"),
+    DongxiaoSection(
+        "preflight",
+        "实盘前检查",
+        "数据库、授权、接口、调度器与资金安全验收",
+    ),
 )

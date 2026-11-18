@@ -32,10 +32,12 @@ class DongxiaoAftersaleService:
         repository: DongxiaoRepository,
         adapter: DongxiaoPlatformAdapter,
         *,
+        task_service: DongxiaoTaskService | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
         self.adapter = adapter
+        self.task_service = task_service or DongxiaoTaskService(repository)
         self.clock = clock or (lambda: datetime.now(UTC))
 
     def sync_aftersales(
@@ -396,9 +398,7 @@ class DongxiaoAftersaleService:
             case,
             approved_amount_cents=case.approved_amount_cents,
         )
-        return DongxiaoTaskService(
-            self.repository
-        ).create_aftersale_decision_task(
+        return self.task_service.create_aftersale_decision_task(
             store,
             case.case_id,
             action=action,

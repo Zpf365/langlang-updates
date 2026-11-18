@@ -6,7 +6,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Callable, Protocol
 
 from ..domain.enums import (
     TaskAttemptStatus,
@@ -60,6 +60,7 @@ class DongxiaoTaskScheduler:
         retry_policy: RetryPolicy | None = None,
         worker_id: str = "",
         poll_interval_seconds: float = 0.2,
+        platform_write_gate: Callable[[], bool] | None = None,
     ) -> None:
         self.repository = repository
         self.executor = executor
@@ -68,6 +69,7 @@ class DongxiaoTaskScheduler:
         self.retry_policy = retry_policy or RetryPolicy()
         self.worker_id = str(worker_id or uuid.uuid4().hex)
         self.poll_interval_seconds = max(0.02, float(poll_interval_seconds))
+        self.platform_write_gate = platform_write_gate
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_concurrent_tasks,
             thread_name_prefix="dongxiao-task",
@@ -78,6 +80,22 @@ class DongxiaoTaskScheduler:
         self._stopping = threading.Event()
         self._wake = threading.Event()
         self._dispatcher: threading.Thread | None = None
+
+    def _platform_write_allowed(self) -> bool:
+        return bool(
+            self.platform_write_gate is None
+            or self.platform_write_gate()
+        )
+
+    def is_healthy(self) -> bool:
+        return bool(
+            self._dispatcher is not None
+            and self._dispatcher.is_alive()
+        )
+
+    def active_task_count(self) -> int:
+        with self._lock:
+            return len(self._active)
 
     def start(self) -> None:
         self.repository.recover_interrupted_tasks()
@@ -239,6 +257,11 @@ class DongxiaoTaskScheduler:
         for task in self.repository.list_runnable_tasks(limit=100):
             if task.task_id in active_task_ids:
                 continue
+            if (
+                task.execution_mode == "platform_write"
+                and not self._platform_write_allowed()
+            ):
+                continue
             if active_by_store.get(task.store_id, 0) >= self.max_tasks_per_store:
                 continue
             future = self._executor.submit(self._execute_task, task)
@@ -317,6 +340,11 @@ class DongxiaoTaskScheduler:
             store_app_id=task.store_app_id,
         )
         if current is None:
+            return
+        if (
+            current.execution_mode == "platform_write"
+            and not self._platform_write_allowed()
+        ):
             return
         if current.status is TaskStatus.PENDING:
             current = self.repository.transition_task(
@@ -400,6 +428,19 @@ class DongxiaoTaskScheduler:
                 TaskStatus.CANCELLED,
                 TaskStatus.UNKNOWN,
             }:
+                return
+            if (
+                latest.execution_mode == "platform_write"
+                and not self._platform_write_allowed()
+            ):
+                self.repository.transition_task(
+                    latest.task_id,
+                    store_id=latest.store_id,
+                    store_app_id=latest.store_app_id,
+                    event="pause",
+                    actor_id="platform-write-guard",
+                    reason="平台写操作总开关已关闭，任务在下一批写入前暂停",
+                )
                 return
             if callable(batch_execute):
                 batch = self.repository.claim_pending_execution_items(
