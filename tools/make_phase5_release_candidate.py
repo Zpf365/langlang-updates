@@ -141,7 +141,7 @@ def _git_report() -> tuple[str, str]:
 """
     modifications = f"""# 第 5 阶段修改文件清单
 
-基线：{BASELINE}  
+基线：{BASELINE}
 当前 HEAD：{commit}
 
 ```text

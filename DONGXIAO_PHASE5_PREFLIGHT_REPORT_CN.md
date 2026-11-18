@@ -1,8 +1,8 @@
 # 动销中心实盘前检查报告
 
-检查时间：2026-11-18 15:50 UTC  
-检查环境：隔离 SQLite 数据库，非真实用户库  
-检查方式：实际运行 `DongxiaoPreflightService.run_local`  
+检查时间：2026-11-18 15:50 UTC
+检查环境：隔离 SQLite 数据库，非真实用户库
+检查方式：实际运行 `DongxiaoPreflightService.run_local`
 真实店铺：未连接，等待用户明确授权
 
 ## 1. 汇总
