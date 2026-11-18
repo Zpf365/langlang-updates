@@ -1,23 +1,31 @@
 from __future__ import annotations
 
+import json
 import tkinter as tk
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
 from ..dongxiao import DONGXIAO_SECTIONS
+from ..dongxiao.application.aftersale_service import DongxiaoAftersaleService
 from ..dongxiao.application.catalog_service import ProductCatalogService
 from ..dongxiao.application.import_service import ProductImportService
+from ..dongxiao.application.order_service import DongxiaoOrderService
 from ..dongxiao.application.pool_service import ProductPoolService
+from ..dongxiao.application.task_service import DongxiaoTaskService
 from ..dongxiao.domain.catalog import (
     CatalogFreshness,
     classify_catalog_freshness,
 )
 from ..dongxiao.domain.enums import (
+    AftersaleStatus,
+    ApprovalStatus,
     DataSource,
+    OrderStatus,
     ProductImportStatus,
     ProductState,
+    TaskStatus,
 )
 from ..dongxiao.domain.queries import ProductFilter, ProductPage
 from ..dongxiao.domain.rules import (
@@ -29,6 +37,9 @@ from ..dongxiao.domain.rules import (
 from ..dongxiao.infrastructure.catalog import (
     CatalogAdapterMode,
     build_catalog_adapter,
+)
+from ..dongxiao.infrastructure.platform import (
+    OfficialDongxiaoPlatformAdapter,
 )
 from ..dongxiao.infrastructure.repository import DongxiaoRepository
 from .pages import BasePage
@@ -53,6 +64,21 @@ STATE_LABELS = {
     ProductState.INACTIVE: "下架",
     ProductState.UNKNOWN: "未知",
 }
+AUDIT_ACTION_LABELS = {
+    "task_created": "创建任务",
+    "task_status_changed": "任务状态变更",
+    "aftersale_status_changed": "售后状态变更",
+    "approval_decided": "审批决定",
+    "order_synced": "同步真实订单",
+    "aftersale_synced": "同步真实售后",
+}
+AUDIT_ENTITY_LABELS = {
+    "task": "任务",
+    "order": "订单",
+    "aftersale": "售后",
+    "approval": "审批",
+    "store": "店铺",
+}
 
 
 def _money(cents: int | None) -> str:
@@ -74,9 +100,34 @@ def _day_end(value: date) -> datetime:
     return datetime.combine(value, time.max, tzinfo=UTC)
 
 
+def _audit_detail_text(value: str) -> str:
+    try:
+        payload = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return str(value)
+    if not isinstance(payload, dict):
+        return str(payload)
+    labels = {
+        "from": "原状态",
+        "to": "新状态",
+        "event": "事件",
+        "reason": "原因",
+        "status": "状态",
+        "platform_status": "平台状态",
+        "item_count": "商品项",
+        "total_amount_cents": "实付金额（分）",
+        "requested_amount_cents": "申请金额（分）",
+        "idempotency_key": "幂等键",
+    }
+    return "；".join(
+        f"{labels.get(str(key), str(key))}：{item}"
+        for key, item in payload.items()
+    )[:500]
+
+
 class DongxiaoPage(BasePage):
     title = "动销中心"
-    subtitle = "商品目录、SKU 规则与商品池"
+    subtitle = "商品、任务、订单、售后与审计一体化工作台"
 
     def __init__(self, parent: tk.Widget, window) -> None:
         super().__init__(parent, window)
@@ -94,9 +145,31 @@ class DongxiaoPage(BasePage):
         self._page_count = 1
 
         database_path = Path(getattr(self.db, "path"))
-        self.repository = DongxiaoRepository(database_path)
+        self.runtime = getattr(window, "dongxiao_runtime", None)
+        self.repository = (
+            self.runtime.repository
+            if self.runtime is not None
+            else DongxiaoRepository(database_path)
+        )
         self.pool_service = ProductPoolService(self.repository)
         self.import_service = ProductImportService(self.repository)
+        if self.runtime is not None:
+            self.task_service = self.runtime.task_service
+            self.order_service = self.runtime.order_service
+            self.aftersale_service = self.runtime.aftersale_service
+            self.task_scheduler = self.runtime.scheduler
+        else:
+            platform = OfficialDongxiaoPlatformAdapter(self.window.service)
+            self.task_service = DongxiaoTaskService(self.repository)
+            self.order_service = DongxiaoOrderService(
+                self.repository,
+                platform,
+            )
+            self.aftersale_service = DongxiaoAftersaleService(
+                self.repository,
+                platform,
+            )
+            self.task_scheduler = None
         self.official_catalog_service = ProductCatalogService(
             self.repository,
             build_catalog_adapter(
@@ -123,6 +196,16 @@ class DongxiaoPage(BasePage):
         self.product_page_var = tk.StringVar(value="商品 0 条")
         self.pool_stats_var = tk.StringVar(value="商品池尚未选择")
         self.sku_result_var = tk.StringVar(value="请选择商品后核验 SKU")
+        self.task_stats_var = tk.StringVar(value="任务统计待读取")
+        self.order_status_var = tk.StringVar(value="真实订单尚未同步")
+        self.aftersale_status_var = tk.StringVar(value="售后工单尚未同步")
+        self.audit_status_var = tk.StringVar(value="审计日志尚未读取")
+        self.overview_stats_vars = {
+            "stores": tk.StringVar(value="—"),
+            "products": tk.StringVar(value="—"),
+            "pools": tk.StringVar(value="—"),
+            "tasks": tk.StringVar(value="—"),
+        }
 
         self.filter_keyword_var = tk.StringVar()
         self.filter_state_var = tk.StringVar(value="全部状态")
@@ -141,10 +224,22 @@ class DongxiaoPage(BasePage):
         self.pool_name_var = tk.StringVar()
         self.pool_group_var = tk.StringVar()
         self.pool_choice_var = tk.StringVar()
+        today = date.today()
+        self.order_start_var = tk.StringVar(
+            value=(today - timedelta(days=6)).isoformat()
+        )
+        self.order_end_var = tk.StringVar(value=today.isoformat())
+        self.order_id_var = tk.StringVar()
+        self.aftersale_start_var = tk.StringVar(
+            value=(today - timedelta(days=1)).isoformat()
+        )
+        self.aftersale_end_var = tk.StringVar(value=today.isoformat())
+        self.aftersale_amount_var = tk.StringVar()
 
         self._build_header()
         self._build_workspace()
         self.show_section("overview")
+        self.after(2000, self._task_activity_tick)
 
     def _build_header(self) -> None:
         header = ttk.Frame(self, style="Panel.TFrame", padding=(20, 15))
@@ -255,8 +350,10 @@ class DongxiaoPage(BasePage):
         self.section_views["products"] = self._build_product_view()
         self.section_views["pools"] = self._build_pool_view()
         self.section_views["sku_rules"] = self._build_sku_view()
-        for key in ("tasks", "orders", "aftersales", "audit"):
-            self.section_views[key] = self._build_placeholder(key)
+        self.section_views["tasks"] = self._build_task_view()
+        self.section_views["orders"] = self._build_order_view()
+        self.section_views["aftersales"] = self._build_aftersale_view()
+        self.section_views["audit"] = self._build_audit_view()
         for view in self.section_views.values():
             view.grid(row=0, column=0, sticky="nsew")
             view.grid_remove()
@@ -277,12 +374,12 @@ class DongxiaoPage(BasePage):
 
         cards = ttk.Frame(view, style="Panel.TFrame")
         cards.grid(row=2, column=0, sticky="ew")
-        for index, (label, value) in enumerate(
+        for index, (label, variable_key) in enumerate(
             (
-                ("店铺", "—"),
-                ("已缓存商品", "—"),
-                ("商品池", "—"),
-                ("可信销量字段", "待同步"),
+                ("店铺", "stores"),
+                ("已缓存商品", "products"),
+                ("商品池", "pools"),
+                ("任务/异常", "tasks"),
             )
         ):
             cards.columnconfigure(index, weight=1)
@@ -300,7 +397,7 @@ class DongxiaoPage(BasePage):
             ttk.Label(card, text=label, style="Subtitle.TLabel").pack(anchor="w")
             ttk.Label(
                 card,
-                text=value,
+                textvariable=self.overview_stats_vars[variable_key],
                 style="Section.TLabel",
                 font=("Microsoft YaHei UI", 16, "bold"),
             ).pack(anchor="w", pady=(6, 0))
@@ -665,6 +762,317 @@ class DongxiaoPage(BasePage):
         ).grid(row=3, column=0, sticky="w", pady=(18, 0))
         return view
 
+    def _build_task_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(3, weight=1)
+        ttk.Label(
+            view,
+            text="任务中心",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        toolbar = ttk.Frame(view, style="Panel.TFrame")
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(10, 6))
+        button(
+            toolbar,
+            "刷新",
+            self._load_tasks,
+        ).pack(side="left")
+        button(
+            toolbar,
+            "从当前商品池建任务",
+            self._create_pool_task,
+            "Primary",
+        ).pack(side="left", padx=5)
+        button(toolbar, "暂停", self._pause_task).pack(side="left")
+        button(toolbar, "恢复", self._resume_task).pack(
+            side="left",
+            padx=5,
+        )
+        button(toolbar, "取消", self._cancel_task).pack(side="left")
+        button(toolbar, "重试失败项", self._retry_task).pack(
+            side="left",
+            padx=5,
+        )
+        button(toolbar, "任务详情", self._show_task_details).pack(
+            side="left"
+        )
+        button(
+            toolbar,
+            "核验未知结果",
+            self._verify_unknown_task,
+        ).pack(side="left", padx=(5, 0))
+        ttk.Label(
+            view,
+            textvariable=self.task_stats_var,
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        self.task_tree = ttk.Treeview(
+            view,
+            columns=(
+                "created",
+                "task_id",
+                "type",
+                "status",
+                "progress",
+                "error",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label, width in (
+            ("created", "创建时间", 150),
+            ("task_id", "任务 ID", 190),
+            ("type", "类型", 180),
+            ("status", "状态", 105),
+            ("progress", "进度", 100),
+            ("error", "最后错误", 260),
+        ):
+            self.task_tree.heading(key, text=label)
+            self.task_tree.column(key, width=width, anchor="w")
+        self.task_tree.grid(row=3, column=0, sticky="nsew")
+        return view
+
+    def _build_order_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(3, weight=1)
+        ttk.Label(
+            view,
+            text="真实订单",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        toolbar = ttk.Frame(view, style="Panel.TFrame")
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(10, 6))
+        ttk.Label(toolbar, text="开始").pack(side="left")
+        ttk.Entry(
+            toolbar,
+            textvariable=self.order_start_var,
+            width=12,
+        ).pack(side="left", padx=(4, 10))
+        ttk.Label(toolbar, text="结束").pack(side="left")
+        ttk.Entry(
+            toolbar,
+            textvariable=self.order_end_var,
+            width=12,
+        ).pack(side="left", padx=(4, 10))
+        button(
+            toolbar,
+            "同步真实订单",
+            self._sync_orders,
+            "Primary",
+        ).pack(side="left")
+        button(toolbar, "刷新本地", self._load_orders).pack(
+            side="left",
+            padx=5,
+        )
+        button(
+            toolbar,
+            "选中订单核验任务",
+            self._create_order_task,
+        ).pack(side="left")
+        ttk.Label(toolbar, text="订单号").pack(side="left", padx=(8, 2))
+        ttk.Entry(
+            toolbar,
+            textvariable=self.order_id_var,
+            width=22,
+        ).pack(side="left")
+        button(
+            toolbar,
+            "按号核验",
+            self._sync_order_by_id,
+        ).pack(side="left", padx=(4, 0))
+        button(
+            toolbar,
+            "状态历史",
+            self._show_order_history,
+        ).pack(side="left", padx=(5, 0))
+        ttk.Label(
+            view,
+            textvariable=self.order_status_var,
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        self.order_tree = ttk.Treeview(
+            view,
+            columns=(
+                "order_id",
+                "status",
+                "total",
+                "items",
+                "created",
+                "updated",
+                "synced",
+            ),
+            show="headings",
+            selectmode="extended",
+        )
+        for key, label, width in (
+            ("order_id", "订单号", 185),
+            ("status", "状态", 95),
+            ("total", "实付", 90),
+            ("items", "商品项", 70),
+            ("created", "创建时间", 135),
+            ("updated", "更新时间", 135),
+            ("synced", "最近核验", 135),
+        ):
+            self.order_tree.heading(key, text=label)
+            self.order_tree.column(key, width=width, anchor="w")
+        self.order_tree.grid(row=3, column=0, sticky="nsew")
+        return view
+
+    def _build_aftersale_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(4, weight=1)
+        ttk.Label(
+            view,
+            text="售后工单",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        sync_bar = ttk.Frame(view, style="Panel.TFrame")
+        sync_bar.grid(row=1, column=0, sticky="ew", pady=(10, 5))
+        ttk.Label(sync_bar, text="开始").pack(side="left")
+        ttk.Entry(
+            sync_bar,
+            textvariable=self.aftersale_start_var,
+            width=12,
+        ).pack(side="left", padx=(4, 10))
+        ttk.Label(sync_bar, text="结束").pack(side="left")
+        ttk.Entry(
+            sync_bar,
+            textvariable=self.aftersale_end_var,
+            width=12,
+        ).pack(side="left", padx=(4, 10))
+        button(
+            sync_bar,
+            "同步真实售后",
+            self._sync_aftersales,
+            "Primary",
+        ).pack(side="left")
+        button(sync_bar, "刷新本地", self._load_aftersales).pack(
+            side="left",
+            padx=5,
+        )
+        button(
+            sync_bar,
+            "选中售后核验任务",
+            self._create_aftersale_task,
+        ).pack(side="left")
+        workflow = ttk.Frame(view, style="Panel.TFrame")
+        workflow.grid(row=2, column=0, sticky="ew", pady=5)
+        ttk.Label(workflow, text="审批金额").pack(side="left")
+        ttk.Entry(
+            workflow,
+            textvariable=self.aftersale_amount_var,
+            width=12,
+        ).pack(side="left", padx=(4, 8))
+        button(
+            workflow,
+            "申请审批",
+            self._request_aftersale_approval,
+        ).pack(side="left")
+        button(
+            workflow,
+            "审批通过",
+            lambda: self._decide_aftersale_approval(True),
+        ).pack(side="left", padx=5)
+        button(
+            workflow,
+            "审批驳回",
+            lambda: self._decide_aftersale_approval(False),
+        ).pack(side="left")
+        button(
+            workflow,
+            "审批记录",
+            self._show_aftersale_approvals,
+        ).pack(side="left", padx=5)
+        button(
+            workflow,
+            "提交同意售后",
+            lambda: self._submit_aftersale_decision("accept"),
+        ).pack(side="left", padx=5)
+        button(
+            workflow,
+            "提交拒绝售后",
+            lambda: self._submit_aftersale_decision("reject"),
+        ).pack(side="left")
+        ttk.Label(
+            view,
+            textvariable=self.aftersale_status_var,
+            style="Subtitle.TLabel",
+        ).grid(row=3, column=0, sticky="w", pady=(0, 6))
+        self.aftersale_tree = ttk.Treeview(
+            view,
+            columns=(
+                "case_id",
+                "order_id",
+                "status",
+                "requested",
+                "approved",
+                "paid",
+                "remaining",
+                "deadline",
+                "synced",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label, width in (
+            ("case_id", "售后单号", 150),
+            ("order_id", "订单号", 150),
+            ("status", "状态", 95),
+            ("requested", "申请金额", 90),
+            ("approved", "审批金额", 90),
+            ("paid", "订单实付", 90),
+            ("remaining", "剩余可退", 90),
+            ("deadline", "处理截止", 130),
+            ("synced", "最近同步", 130),
+        ):
+            self.aftersale_tree.heading(key, text=label)
+            self.aftersale_tree.column(key, width=width, anchor="w")
+        self.aftersale_tree.grid(row=4, column=0, sticky="nsew")
+        return view
+
+    def _build_audit_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(3, weight=1)
+        ttk.Label(
+            view,
+            text="执行日志与审计",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            view,
+            text=(
+                "展示任务、审批、售后和订单操作审计。"
+                "敏感字段及凭证不会写入普通日志。"
+            ),
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 6))
+        self.audit_tree = ttk.Treeview(
+            view,
+            columns=("time", "action", "entity", "result", "detail"),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label, width in (
+            ("time", "时间", 145),
+            ("action", "动作", 150),
+            ("entity", "对象", 210),
+            ("result", "结果", 80),
+            ("detail", "说明", 320),
+        ):
+            self.audit_tree.heading(key, text=label)
+            self.audit_tree.column(key, width=width, anchor="w")
+        self.audit_tree.grid(row=3, column=0, sticky="nsew")
+        ttk.Label(
+            view,
+            textvariable=self.audit_status_var,
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        return view
+
     def _build_placeholder(self, key: str) -> ttk.Frame:
         view = ttk.Frame(self.section_host, style="Panel.TFrame")
         section = next(
@@ -700,7 +1108,7 @@ class DongxiaoPage(BasePage):
         self.section_title_var.set(section.label)
         self.section_description_var.set(section.description)
         self.section_stage_var.set(
-            "第 3.5 阶段：商品目录专项验收、缓存状态和数据一致性补强。"
+            "第 4 阶段：任务、订单、售后、审批、审计和后台执行。"
         )
         for view_key, view in self.section_views.items():
             view.grid_remove()
@@ -715,9 +1123,34 @@ class DongxiaoPage(BasePage):
             self._apply_filters()
         elif section.key == "pools":
             self._load_pools()
+        elif section.key == "tasks":
+            self._load_tasks()
+        elif section.key == "orders":
+            self._load_orders()
+        elif section.key == "aftersales":
+            self._load_aftersales()
+        elif section.key == "audit":
+            self._load_audit()
 
     def refresh(self) -> None:
         self._load_stores()
+
+    def _task_activity_tick(self) -> None:
+        if not self.winfo_exists():
+            return
+        store = self._current_store()
+        scope = (
+            f"dongxiao:tasks-load:{store.id}"
+            if store is not None
+            else ""
+        )
+        if (
+            self._active_section == "tasks"
+            and scope
+            and not self.window.has_running_task(scope)
+        ):
+            self._load_tasks()
+        self.after(2000, self._task_activity_tick)
 
     def _current_store(self):
         label = self.store_var.get()
@@ -793,6 +1226,41 @@ class DongxiaoPage(BasePage):
         self._page = 1
         self._load_products()
         self._load_pools()
+        self._load_overview_stats()
+
+    def _load_overview_stats(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+
+        def work(_progress):
+            product_page = self.repository.query_products(
+                store.id,
+                ProductFilter(page_size=1),
+            )
+            return (
+                len(self._stores),
+                product_page.total,
+                len(self.pool_service.list_pools(store)),
+                self.task_service.statistics(store),
+            )
+
+        def done(result) -> None:
+            store_count, products, pools, task_stats = result
+            self.overview_stats_vars["stores"].set(str(store_count))
+            self.overview_stats_vars["products"].set(str(products))
+            self.overview_stats_vars["pools"].set(str(pools))
+            self.overview_stats_vars["tasks"].set(
+                f"{task_stats.running}/{task_stats.unknown}"
+            )
+
+        self.window.run_task(
+            work,
+            done,
+            lambda _error: None,
+            log_title="读取动销中心统计",
+            task_scope=f"dongxiao:overview:{store.id}",
+        )
 
     def _parse_optional_money(self, value: str, label: str) -> int | None:
         text = value.strip()
@@ -1689,6 +2157,1017 @@ class DongxiaoPage(BasePage):
             log_title="将 SKU 加入动销商品池",
             task_scope=f"dongxiao:pool-add-sku:{pool.pool_id}",
         )
+
+    @staticmethod
+    def _task_status_label(status: TaskStatus) -> str:
+        return {
+            TaskStatus.PENDING: "等待执行",
+            TaskStatus.PREPARING: "准备中",
+            TaskStatus.RUNNING: "执行中",
+            TaskStatus.PAUSED: "已暂停",
+            TaskStatus.COMPLETED: "已完成",
+            TaskStatus.PARTIALLY_FAILED: "部分失败",
+            TaskStatus.FAILED: "全部失败",
+            TaskStatus.CANCELLED: "已取消",
+            TaskStatus.UNKNOWN: "结果未知",
+        }.get(status, status.value)
+
+    @staticmethod
+    def _task_type_label(task_type: str) -> str:
+        return {
+            "product_sku_validation": "商品 SKU 批量核验",
+            "order_verification": "真实订单核验",
+            "aftersale_verification": "真实售后核验",
+            "aftersale_decision": "售后平台执行",
+        }.get(str(task_type), str(task_type))
+
+    @staticmethod
+    def _task_item_status_label(status: str) -> str:
+        return {
+            "pending": "等待",
+            "running": "执行中",
+            "succeeded": "成功",
+            "failed": "失败",
+            "skipped": "跳过",
+            "cancelled": "已取消",
+            "unknown": "结果未知",
+        }.get(str(status), str(status))
+
+    @staticmethod
+    def _aftersale_status_label(status: AftersaleStatus) -> str:
+        return {
+            AftersaleStatus.UNKNOWN: "未知",
+            AftersaleStatus.REQUESTED: "已申请",
+            AftersaleStatus.PENDING_REVIEW: "待审批",
+            AftersaleStatus.APPROVED: "已审批",
+            AftersaleStatus.REJECTED: "已驳回",
+            AftersaleStatus.PROCESSING: "处理中",
+            AftersaleStatus.COMPLETED: "已完成",
+            AftersaleStatus.FAILED: "失败",
+            AftersaleStatus.CANCELLED: "已取消",
+        }.get(status, status.value)
+
+    @staticmethod
+    def _order_status_label(status: OrderStatus | str) -> str:
+        try:
+            normalized = OrderStatus(status)
+        except ValueError:
+            return str(status)
+        return {
+            OrderStatus.UNKNOWN: "未知",
+            OrderStatus.PENDING_PAYMENT: "待付款",
+            OrderStatus.PAID: "已付款",
+            OrderStatus.SHIPPED: "已发货",
+            OrderStatus.COMPLETED: "已完成",
+            OrderStatus.CANCELLED: "已取消",
+            OrderStatus.REFUNDING: "退款中",
+            OrderStatus.REFUNDED: "已退款",
+        }[normalized]
+
+    def _selected_task_id(self) -> str:
+        rows = self.task_tree.selection()
+        return str(rows[0]) if rows else ""
+
+    def _load_tasks(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+
+        def work(_progress):
+            return (
+                self.task_service.list_tasks(store),
+                self.task_service.statistics(store),
+            )
+
+        self.window.run_task(
+            work,
+            self._render_tasks,
+            lambda error: messagebox.showerror(
+                "读取任务失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取动销任务中心",
+            task_scope=f"dongxiao:tasks-load:{store.id}",
+        )
+
+    def _render_tasks(self, result) -> None:
+        tasks, stats = result
+        for row in self.task_tree.get_children():
+            self.task_tree.delete(row)
+        for task in tasks:
+            self.task_tree.insert(
+                "",
+                "end",
+                iid=task.task_id,
+                values=(
+                    _date_time(task.created_at),
+                    task.task_id,
+                    self._task_type_label(task.task_type),
+                    self._task_status_label(task.status),
+                    f"{task.succeeded_items + task.failed_items}/{task.total_items}",
+                    task.last_error or task.status_reason or "—",
+                ),
+            )
+        self.task_stats_var.set(
+            f"任务 {stats.total} 个 · 运行中 {stats.running} · "
+            f"暂停 {stats.paused} · 完成 {stats.completed} · "
+            f"失败 {stats.failed} · 未知 {stats.unknown} · "
+            f"明细成功 {stats.succeeded_items} / "
+            f"失败 {stats.failed_items}"
+        )
+        self.window.set_status(
+            f"任务中心已读取 {stats.total} 个任务",
+            busy=False,
+        )
+
+    def _start_task_scheduler(self) -> None:
+        if self.runtime is not None and not self.runtime.started:
+            self.runtime.start()
+
+    def _create_pool_task(self) -> None:
+        store = self._current_store()
+        pool = self._current_pool()
+        if store is None or pool is None:
+            messagebox.showinfo(
+                "创建批量任务",
+                "请先选择店铺和商品池。",
+                parent=self,
+            )
+            return
+        task_key = (
+            f"pool-task:{pool.pool_id}:"
+            f"{int(datetime.now(UTC).timestamp())}"
+        )
+
+        def done(result) -> None:
+            task, created = result
+            self._start_task_scheduler()
+            if self.task_scheduler is not None:
+                self.task_scheduler.enqueue(task.task_id)
+            messagebox.showinfo(
+                "创建批量任务",
+                (
+                    "已创建"
+                    if created
+                    else "已识别重复请求，复用"
+                )
+                + f"任务 {task.task_id}，共 {task.total_items} 项。",
+                parent=self,
+            )
+            self._load_tasks()
+
+        self.window.run_task(
+            lambda _progress: self.task_service.create_pool_validation_task(
+                store,
+                pool.pool_id,
+                idempotency_key=task_key,
+                actor_id=self._actor_id(),
+                quantity=1,
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "创建批量任务失败",
+                error,
+                parent=self,
+            ),
+            log_title="创建动销批量任务",
+            task_scope=f"dongxiao:task-create:{store.id}",
+        )
+
+    def _pause_task(self) -> None:
+        self._task_control("pause")
+
+    def _resume_task(self) -> None:
+        self._task_control("resume")
+
+    def _cancel_task(self) -> None:
+        self._task_control("cancel")
+
+    def _retry_task(self) -> None:
+        self._task_control("retry")
+
+    def _task_control(self, action: str) -> None:
+        store = self._current_store()
+        task_id = self._selected_task_id()
+        if store is None or not task_id:
+            messagebox.showinfo(
+                "任务操作",
+                "请先选择任务。",
+                parent=self,
+            )
+            return
+        methods = {
+            "pause": self.task_service.pause,
+            "resume": self.task_service.resume,
+            "cancel": self.task_service.cancel,
+            "retry": self.task_service.retry_failed,
+        }
+        method = methods[action]
+
+        def done(task) -> None:
+            if action in {"resume", "retry"}:
+                self._start_task_scheduler()
+                if self.task_scheduler is not None:
+                    self.task_scheduler.enqueue(task.task_id)
+            self._load_tasks()
+
+        self.window.run_task(
+            lambda _progress: method(
+                store,
+                task_id,
+                actor_id=self._actor_id(),
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "任务操作失败",
+                error,
+                parent=self,
+            ),
+            log_title=f"动销任务操作：{action}",
+            task_scope=f"dongxiao:task-{action}:{task_id}",
+        )
+
+    def _show_task_details(self) -> None:
+        store = self._current_store()
+        task_id = self._selected_task_id()
+        if store is None or not task_id:
+            return
+
+        def show(result) -> None:
+            task, items, attempts = result
+            dialog = tk.Toplevel(self)
+            dialog.title(f"任务详情 · {task.task_id}")
+            dialog.geometry("980x560")
+            table = ttk.Treeview(
+                dialog,
+                columns=("type", "subject", "status", "attempts", "error"),
+                show="headings",
+            )
+            for key, label, width in (
+                ("type", "对象类型", 100),
+                ("subject", "对象 ID", 240),
+                ("status", "状态", 100),
+                ("attempts", "尝试", 70),
+                ("error", "错误", 360),
+            ):
+                table.heading(key, text=label)
+                table.column(key, width=width, anchor="w")
+            table.pack(fill="both", expand=True, padx=12, pady=(12, 4))
+            for item in items:
+                table.insert(
+                    "",
+                    "end",
+                    values=(
+                        item.subject_type,
+                        item.subject_id,
+                        self._task_item_status_label(item.status.value),
+                        f"{item.attempt_count}/{item.max_attempts}",
+                        item.last_error_message or "—",
+                    ),
+                )
+            ttk.Label(
+                dialog,
+                text=f"尝试记录 {len(attempts)} 条",
+            ).pack(anchor="w", padx=12, pady=8)
+
+        self.window.run_task(
+            lambda _progress: (
+                self.repository.get_task(
+                    task_id,
+                    store_app_id=store.app_id,
+                ),
+                self.task_service.list_items(task_id, store=store),
+                self.task_service.list_attempts(store, task_id),
+            ),
+            show,
+            lambda error: messagebox.showerror(
+                "读取任务详情失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取动销任务详情",
+            task_scope=f"dongxiao:task-detail:{task_id}",
+        )
+
+    def _verify_unknown_task(self) -> None:
+        store = self._current_store()
+        task_id = self._selected_task_id()
+        if (
+            store is None
+            or not task_id
+            or self.task_scheduler is None
+        ):
+            messagebox.showinfo(
+                "核验未知结果",
+                "请先选择结果未知任务。",
+                parent=self,
+            )
+            return
+
+        def done(result) -> None:
+            task, verified_count = result
+            messagebox.showinfo(
+                "核验未知结果",
+                f"已核验 {verified_count} 条，任务当前状态："
+                f"{self._task_status_label(task.status)}",
+                parent=self,
+            )
+            self._load_tasks()
+
+        self.window.run_task(
+            lambda _progress: self.task_scheduler.verify_unknown_task(
+                task_id,
+                store_app_id=store.app_id,
+                actor_id=self._actor_id(),
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "核验未知结果失败",
+                error,
+                parent=self,
+            ),
+            log_title="核验动销未知任务",
+            task_scope=f"dongxiao:task-verify:{task_id}",
+        )
+
+    def _date_range_timestamps(
+        self,
+        start_value: str,
+        end_value: str,
+        *,
+        max_seconds: int,
+    ) -> tuple[int, int]:
+        start = self._parse_optional_date(
+            start_value,
+            "开始日期",
+            end=False,
+        )
+        end = self._parse_optional_date(
+            end_value,
+            "结束日期",
+            end=True,
+        )
+        if start is None or end is None or end <= start:
+            raise ValueError("请填写有效的开始和结束日期")
+        start_ts = int(start.timestamp())
+        end_ts = int(end.timestamp())
+        if end_ts - start_ts > max_seconds:
+            raise ValueError("查询时间范围超过官方接口限制")
+        return start_ts, end_ts
+
+    def _load_orders(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+        self.window.run_task(
+            lambda _progress: self.order_service.list_orders(store),
+            self._render_orders,
+            lambda error: messagebox.showerror(
+                "读取订单失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取动销真实订单",
+            task_scope=f"dongxiao:orders-load:{store.id}",
+        )
+
+    def _render_orders(self, records) -> None:
+        for row in self.order_tree.get_children():
+            self.order_tree.delete(row)
+        for record in records:
+            self.order_tree.insert(
+                "",
+                "end",
+                iid=record.platform_order_id,
+                values=(
+                    record.platform_order_id,
+                    self._order_status_label(record.status),
+                    _money(record.total_amount_cents),
+                    record.item_count,
+                    _date_time(record.create_time),
+                    _date_time(record.update_time),
+                    _date_time(record.last_synced_at),
+                ),
+            )
+        self.order_status_var.set(
+            f"本地已核验真实订单 {len(records)} 条；"
+            "数据仅来自官方订单接口"
+        )
+        self.window.set_status(
+            f"真实订单已读取 {len(records)} 条",
+            busy=False,
+        )
+
+    def _sync_orders(self) -> None:
+        store = self._current_store()
+        if store is None:
+            messagebox.showinfo("同步订单", "请先选择店铺。", parent=self)
+            return
+        try:
+            start_ts, end_ts = self._date_range_timestamps(
+                self.order_start_var.get(),
+                self.order_end_var.get(),
+                max_seconds=7 * 86400,
+            )
+        except ValueError as exc:
+            messagebox.showwarning("订单日期错误", str(exc), parent=self)
+            return
+
+        def done(result) -> None:
+            self.order_status_var.set(
+                f"同步完成：发现 {result.discovered}，"
+                f"保存 {result.saved}，失败 {result.failed}"
+            )
+            if result.errors:
+                messagebox.showwarning(
+                    "订单同步部分完成",
+                    "\n".join(result.errors[:10]),
+                    parent=self,
+                )
+            self._load_orders()
+
+        self.window.run_task(
+            lambda progress: self.order_service.sync_orders(
+                store,
+                start_time=start_ts,
+                end_time=end_ts,
+                progress=progress,
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "同步真实订单失败",
+                error,
+                parent=self,
+            ),
+            log_title="同步动销真实订单",
+            task_scope=f"dongxiao:orders-sync:{store.id}",
+        )
+
+    def _create_order_task(self) -> None:
+        store = self._current_store()
+        order_ids = [
+            str(item) for item in self.order_tree.selection()
+        ]
+        if store is None or not order_ids:
+            messagebox.showinfo(
+                "订单核验任务",
+                "请选择至少一个订单。",
+                parent=self,
+            )
+            return
+        key = f"order-verify:{'|'.join(order_ids)}"
+
+        def done(result) -> None:
+            task, created = result
+            self._start_task_scheduler()
+            if self.task_scheduler is not None:
+                self.task_scheduler.enqueue(task.task_id)
+            messagebox.showinfo(
+                "订单核验任务",
+                ("已创建" if created else "已复用") + f"任务 {task.task_id}",
+                parent=self,
+            )
+
+        self.window.run_task(
+            lambda _progress: self.task_service.create_order_verification_task(
+                store,
+                order_ids,
+                idempotency_key=key,
+                actor_id=self._actor_id(),
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "创建订单核验任务失败",
+                error,
+                parent=self,
+            ),
+            log_title="创建真实订单核验任务",
+            task_scope=f"dongxiao:order-task:{store.id}",
+        )
+
+    def _sync_order_by_id(self) -> None:
+        store = self._current_store()
+        order_id = self.order_id_var.get().strip()
+        if store is None or not order_id:
+            messagebox.showinfo(
+                "核验订单",
+                "请先选择店铺并填写订单号。",
+                parent=self,
+            )
+            return
+
+        def done(record) -> None:
+            self.order_status_var.set(
+                f"订单 {record.platform_order_id} 已通过官方接口核验"
+            )
+            self._load_orders()
+
+        self.window.run_task(
+            lambda _progress: self.order_service.sync_order(
+                store,
+                order_id,
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "核验订单失败",
+                error,
+                parent=self,
+            ),
+            log_title="按订单号核验真实订单",
+            task_scope=f"dongxiao:order-get:{store.id}:{order_id}",
+        )
+
+    def _show_order_history(self) -> None:
+        store = self._current_store()
+        selected = self.order_tree.selection()
+        if store is None or not selected:
+            messagebox.showinfo(
+                "订单状态历史",
+                "请先选择一个订单。",
+                parent=self,
+            )
+            return
+        order_id = str(selected[0])
+
+        def show(rows) -> None:
+            dialog = tk.Toplevel(self)
+            dialog.title(f"订单状态历史 · {order_id}")
+            dialog.geometry("760x420")
+            table = ttk.Treeview(
+                dialog,
+                columns=("time", "status", "trusted", "request"),
+                show="headings",
+            )
+            for key, label, width in (
+                ("time", "核验时间", 170),
+                ("status", "状态", 120),
+                ("trusted", "可信", 70),
+                ("request", "请求标识", 260),
+            ):
+                table.heading(key, text=label)
+                table.column(key, width=width, anchor="w")
+            table.pack(fill="both", expand=True, padx=12, pady=12)
+            for row in rows:
+                table.insert(
+                    "",
+                    "end",
+                    values=(
+                        row["observed_at"],
+                        self._order_status_label(row["status"]),
+                        "是" if int(row["trusted"]) else "否",
+                        row["request_id"] or "—",
+                    ),
+                )
+
+        self.window.run_task(
+            lambda _progress: self.repository.list_order_snapshots(
+                store.app_id,
+                order_id,
+            ),
+            show,
+            lambda error: messagebox.showerror(
+                "读取订单历史失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取订单状态历史",
+            task_scope=f"dongxiao:order-history:{order_id}",
+        )
+
+    def _load_aftersales(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+        self.window.run_task(
+            lambda _progress: self.aftersale_service.list_cases(store),
+            self._render_aftersales,
+            lambda error: messagebox.showerror(
+                "读取售后工单失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取动销售后工单",
+            task_scope=f"dongxiao:aftersales-load:{store.id}",
+        )
+
+    def _render_aftersales(self, cases) -> None:
+        for row in self.aftersale_tree.get_children():
+            self.aftersale_tree.delete(row)
+        for case in cases:
+            self.aftersale_tree.insert(
+                "",
+                "end",
+                iid=case.case_id,
+                values=(
+                    case.platform_case_id,
+                    case.platform_order_id or "—",
+                    self._aftersale_status_label(case.status),
+                    _money(case.requested_amount_cents),
+                    _money(case.approved_amount_cents),
+                    _money(case.paid_amount_cents),
+                    _money(case.remaining_refundable_cents),
+                    _date_time(case.deadline),
+                    _date_time(case.last_synced_at),
+                ),
+            )
+        self.aftersale_status_var.set(
+            f"本地售后工单 {len(cases)} 条；"
+            "退款执行前必须有已通过审批"
+        )
+        self.window.set_status(
+            f"售后工单已读取 {len(cases)} 条",
+            busy=False,
+        )
+
+    def _sync_aftersales(self) -> None:
+        store = self._current_store()
+        if store is None:
+            messagebox.showinfo("同步售后", "请先选择店铺。", parent=self)
+            return
+        try:
+            start_ts, end_ts = self._date_range_timestamps(
+                self.aftersale_start_var.get(),
+                self.aftersale_end_var.get(),
+                max_seconds=86400,
+            )
+        except ValueError as exc:
+            messagebox.showwarning("售后日期错误", str(exc), parent=self)
+            return
+
+        def done(result) -> None:
+            self.aftersale_status_var.set(
+                f"同步完成：发现 {result.discovered}，"
+                f"保存 {result.saved}，失败 {result.failed}"
+            )
+            if result.errors:
+                messagebox.showwarning(
+                    "售后同步部分完成",
+                    "\n".join(result.errors[:10]),
+                    parent=self,
+                )
+            self._load_aftersales()
+
+        self.window.run_task(
+            lambda progress: self.aftersale_service.sync_aftersales(
+                store,
+                start_time=start_ts,
+                end_time=end_ts,
+                time_field="update",
+                progress=progress,
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "同步真实售后失败",
+                error,
+                parent=self,
+            ),
+            log_title="同步动销真实售后",
+            task_scope=f"dongxiao:aftersales-sync:{store.id}",
+        )
+
+    def _selected_aftersale(self):
+        rows = self.aftersale_tree.selection()
+        if not rows:
+            return None
+        store = self._current_store()
+        if store is None:
+            return None
+        return self.repository.get_aftersale_case(store.id, str(rows[0]))
+
+    def _request_aftersale_approval(self) -> None:
+        store = self._current_store()
+        case = self._selected_aftersale()
+        if store is None or case is None:
+            messagebox.showinfo(
+                "申请退款审批",
+                "请先选择售后工单。",
+                parent=self,
+            )
+            return
+        try:
+            amount = parse_yuan_to_cents(
+                self.aftersale_amount_var.get()
+                or f"{case.requested_amount_cents / 100:.2f}"
+            )
+        except ValueError as exc:
+            messagebox.showwarning("退款金额错误", str(exc), parent=self)
+            return
+        key = f"aftersale-request:{case.case_id}:{amount}"
+
+        def done(result) -> None:
+            approval, saved_case = result
+            self.aftersale_status_var.set(
+                f"审批已创建：{approval.approval_id}；"
+                f"剩余可退 {_money(saved_case.remaining_refundable_cents)}"
+            )
+            self._load_aftersales()
+
+        self.window.run_task(
+            lambda _progress: self.aftersale_service.create_approval(
+                store,
+                case.case_id,
+                approved_amount_cents=amount,
+                requested_by=self._actor_id(),
+                permission_checker=self._permission_checker,
+                idempotency_key=key,
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "创建退款审批失败",
+                error,
+                parent=self,
+            ),
+            log_title="创建动销退款审批",
+            task_scope=f"dongxiao:aftersale-request:{case.case_id}",
+        )
+
+    def _decide_aftersale_approval(self, approved: bool) -> None:
+        store = self._current_store()
+        case = self._selected_aftersale()
+        if store is None or case is None:
+            return
+        approvals = self.aftersale_service.list_approvals(
+            store,
+            case_id=case.case_id,
+        )
+        pending = next(
+            (
+                approval
+                for approval in approvals
+                if approval.status is ApprovalStatus.PENDING
+            ),
+            None,
+        )
+        if pending is None:
+            messagebox.showinfo(
+                "退款审批",
+                "当前售后没有待处理审批。",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "退款审批",
+            (
+                "确认通过"
+                if approved
+                else "确认驳回"
+            )
+            + f"审批 {pending.approval_id}？",
+            parent=self,
+        ):
+            return
+
+        def done(result) -> None:
+            approval, saved_case = result
+            self.aftersale_status_var.set(
+                f"审批结果：{'通过' if approved else '驳回'}；"
+                f"售后状态：{self._aftersale_status_label(saved_case.status)}"
+            )
+            self._load_aftersales()
+
+        self.window.run_task(
+            lambda _progress: self.aftersale_service.decide_approval(
+                store,
+                pending.approval_id,
+                approved=approved,
+                actor_id=self._actor_id(),
+                reason="页面人工审批",
+                permission_checker=self._permission_checker,
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "处理退款审批失败",
+                error,
+                parent=self,
+            ),
+            log_title="处理动销退款审批",
+            task_scope=f"dongxiao:aftersale-approve:{pending.approval_id}",
+        )
+
+    def _submit_aftersale_decision(self, action: str) -> None:
+        store = self._current_store()
+        case = self._selected_aftersale()
+        if store is None or case is None:
+            return
+        if not messagebox.askyesno(
+            "提交售后平台操作",
+            (
+                "将通过官方接口提交售后操作。"
+                "提交后若结果未知，系统只会核验，不会自动重复提交。\n\n"
+                f"售后单：{case.platform_case_id}\n"
+                f"审批金额：{_money(case.approved_amount_cents)}\n"
+                "是否继续？"
+            ),
+            parent=self,
+        ):
+            return
+        reason_type = 0
+        reason = ""
+        if action == "reject":
+            raw = simpledialog.askstring(
+                "拒绝售后",
+                "请输入官方拒绝原因类型编号（不能留空）：",
+                parent=self,
+            )
+            if raw is None:
+                return
+            try:
+                reason_type = int(raw)
+            except ValueError:
+                messagebox.showwarning(
+                    "拒绝原因错误",
+                    "拒绝原因类型必须是整数。",
+                    parent=self,
+                )
+                return
+            reason = simpledialog.askstring(
+                "拒绝售后",
+                "拒绝原因说明（可留空）：",
+                parent=self,
+            ) or ""
+        key = (
+            f"aftersale-{action}:{case.case_id}:"
+            f"{case.approved_amount_cents}"
+        )
+
+        def done(result) -> None:
+            task, created = result
+            self._start_task_scheduler()
+            if self.task_scheduler is not None:
+                self.task_scheduler.enqueue(task.task_id)
+            self.aftersale_status_var.set(
+                ("已创建" if created else "已复用")
+                + f"售后执行任务 {task.task_id}"
+            )
+
+        self.window.run_task(
+            lambda _progress: self.aftersale_service.create_decision_task(
+                store,
+                case.case_id,
+                action=action,
+                actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
+                idempotency_key=key,
+                reject_reason_type=reason_type,
+                reject_reason=reason,
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "创建售后执行任务失败",
+                error,
+                parent=self,
+            ),
+            log_title="创建动销售后执行任务",
+            task_scope=f"dongxiao:aftersale-execute:{case.case_id}",
+        )
+
+    def _show_aftersale_approvals(self) -> None:
+        store = self._current_store()
+        case = self._selected_aftersale()
+        if store is None or case is None:
+            return
+        approvals = self.aftersale_service.list_approvals(
+            store,
+            case_id=case.case_id,
+        )
+        dialog = tk.Toplevel(self)
+        dialog.title(f"售后审批记录 · {case.platform_case_id}")
+        dialog.geometry("820x400")
+        table = ttk.Treeview(
+            dialog,
+            columns=("time", "status", "requester", "approver", "reason"),
+            show="headings",
+        )
+        for key, label, width in (
+            ("time", "申请时间", 150),
+            ("status", "状态", 90),
+            ("requester", "申请人", 120),
+            ("approver", "审批人", 120),
+            ("reason", "说明", 300),
+        ):
+            table.heading(key, text=label)
+            table.column(key, width=width, anchor="w")
+        table.pack(fill="both", expand=True, padx=12, pady=12)
+        status_labels = {
+            ApprovalStatus.PENDING: "待审批",
+            ApprovalStatus.APPROVED: "已通过",
+            ApprovalStatus.REJECTED: "已驳回",
+            ApprovalStatus.EXPIRED: "已过期",
+            ApprovalStatus.CANCELLED: "已取消",
+        }
+        for approval in approvals:
+            table.insert(
+                "",
+                "end",
+                values=(
+                    approval.requested_at.strftime("%Y-%m-%d %H:%M"),
+                    status_labels.get(approval.status, approval.status.value),
+                    approval.requested_by,
+                    approval.decided_by or "—",
+                    approval.decision_reason or "—",
+                ),
+            )
+
+    def _create_aftersale_task(self) -> None:
+        store = self._current_store()
+        case = self._selected_aftersale()
+        if store is None or case is None:
+            return
+        task_key = f"aftersale-verify:{case.case_id}"
+
+        def done(result) -> None:
+            task, created = result
+            self._start_task_scheduler()
+            if self.task_scheduler is not None:
+                self.task_scheduler.enqueue(task.task_id)
+            messagebox.showinfo(
+                "售后核验任务",
+                ("已创建" if created else "已复用") + f"任务 {task.task_id}",
+                parent=self,
+            )
+
+        self.window.run_task(
+            lambda _progress: self.task_service.create_aftersale_verification_task(
+                store,
+                [case.case_id],
+                idempotency_key=task_key,
+                actor_id=self._actor_id(),
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "创建售后核验任务失败",
+                error,
+                parent=self,
+            ),
+            log_title="创建售后核验任务",
+            task_scope=f"dongxiao:aftersale-task:{case.case_id}",
+        )
+
+    def _load_audit(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+        self.window.run_task(
+            lambda _progress: self.repository.list_audit_events(
+                store_app_id=store.app_id
+            ),
+            self._render_audit,
+            lambda error: messagebox.showerror(
+                "读取审计日志失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取动销审计日志",
+            task_scope=f"dongxiao:audit:{store.id}",
+        )
+
+    def _render_audit(self, rows) -> None:
+        for row in self.audit_tree.get_children():
+            self.audit_tree.delete(row)
+        for index, row in enumerate(rows):
+            entity_label = AUDIT_ENTITY_LABELS.get(
+                row["entity_type"],
+                row["entity_type"],
+            )
+            self.audit_tree.insert(
+                "",
+                "end",
+                iid=f"audit-{index}",
+                values=(
+                    row["created_at"],
+                    AUDIT_ACTION_LABELS.get(
+                        row["action"],
+                        row["action"],
+                    ),
+                    f"{entity_label} · {row['entity_id']}",
+                    row["result"],
+                    _audit_detail_text(row["detail_json"]),
+                ),
+            )
+        self.audit_status_var.set(f"已读取 {len(rows)} 条审计事件")
+        self.window.set_status(
+            f"动销审计日志已读取 {len(rows)} 条",
+            busy=False,
+        )
+
+    def _actor_id(self) -> str:
+        context = getattr(self.window, "auth_context", None)
+        return str(
+            getattr(context, "username", "")
+            or getattr(context, "account_id", "")
+            or "local-user"
+        )
+
+    def _permission_checker(self, permission: str) -> bool:
+        context = getattr(self.window, "auth_context", None)
+        if context is None:
+            return False
+        role = str(getattr(context, "member_role", "") or "")
+        if role in {"owner", "admin"}:
+            return True
+        permissions = dict(getattr(context, "permissions", {}) or {})
+        return bool(permissions.get(permission))
 
 
 class ProductImportDialog(tk.Toplevel):

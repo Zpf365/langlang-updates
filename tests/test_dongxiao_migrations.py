@@ -12,6 +12,8 @@ from weimi_manager.dongxiao.infrastructure import migrations as migration_module
 from weimi_manager.dongxiao.infrastructure.migrations import (
     DONGXIAO_V1_CHECKSUM,
     DONGXIAO_V2_CHECKSUM,
+    DONGXIAO_V3_CHECKSUM,
+    DONGXIAO_V4_CHECKSUM,
     migrate_dongxiao_schema,
 )
 from weimi_manager.sales_related.migrations import (
@@ -36,6 +38,9 @@ REQUIRED_TABLES = {
     "dongxiao_product_imports",
     "dongxiao_product_pool_events",
     "dongxiao_catalog_sync_runs",
+    "dongxiao_task_execution_items",
+    "dongxiao_execution_attempts",
+    "dongxiao_order_details",
 }
 
 
@@ -72,10 +77,10 @@ def test_dongxiao_migration_creates_isolated_schema(
         }
         assert changed is True
         assert REQUIRED_TABLES.issubset(tables)
-        assert backups == ["pre-dongxiao-v3"]
+        assert backups == ["pre-dongxiao-v4"]
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations"
-        ).fetchall() == [(1,), (2,), (3,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
         product_columns = {
             str(row[1])
             for row in conn.execute(
@@ -161,7 +166,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
             lambda label: backups.append(label) or backup,
         )
 
-        assert backups == ["pre-dongxiao-v3"]
+        assert backups == ["pre-dongxiao-v4"]
         assert conn.execute(
             "SELECT COUNT(*) FROM sales_audit_logs"
         ).fetchone()[0] == 1
@@ -173,7 +178,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
         ).fetchone()[0] == old_checksum
         assert conn.execute(
             "SELECT COUNT(*) FROM dongxiao_schema_migrations"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == 4
     finally:
         conn.close()
 
@@ -245,6 +250,18 @@ def test_v2_checksum_is_frozen_for_published_migration() -> None:
     ).hexdigest() == DONGXIAO_V2_CHECKSUM
 
 
+def test_v3_checksum_is_frozen_for_published_migration() -> None:
+    assert hashlib.sha256(
+        migration_module._migration_v3_sql().encode("utf-8")
+    ).hexdigest() == DONGXIAO_V3_CHECKSUM
+
+
+def test_v4_checksum_is_frozen_for_published_migration() -> None:
+    assert hashlib.sha256(
+        migration_module._migration_v4_sql().encode("utf-8")
+    ).hexdigest() == DONGXIAO_V4_CHECKSUM
+
+
 def test_failed_v3_migration_rolls_back_only_v3_and_keeps_v2_complete(
     tmp_path: Path,
     monkeypatch,
@@ -280,13 +297,19 @@ def test_failed_v3_migration_rolls_back_only_v3_and_keeps_v2_complete(
             lambda _label: path.with_suffix(".backup"),
         )
         monkeypatch.undo()
+        failing_v3 = """
+            CREATE TABLE dongxiao_failure_probe_v3 (id INTEGER);
+            INSERT INTO table_that_does_not_exist(id) VALUES(1);
+        """
         monkeypatch.setattr(
             migration_module,
             "_migration_v3_sql",
-            lambda: """
-                CREATE TABLE dongxiao_failure_probe_v3 (id INTEGER);
-                INSERT INTO table_that_does_not_exist(id) VALUES(1);
-            """,
+            lambda: failing_v3,
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "DONGXIAO_V3_CHECKSUM",
+            hashlib.sha256(failing_v3.encode("utf-8")).hexdigest(),
         )
 
         with pytest.raises(sqlite3.OperationalError):
@@ -310,6 +333,77 @@ def test_failed_v3_migration_rolls_back_only_v3_and_keeps_v2_complete(
             "SELECT COUNT(*) FROM dongxiao_products"
         ).fetchone()[0] == 0
         assert original_v3
+    finally:
+        conn.close()
+
+
+def test_failed_v4_migration_rolls_back_only_v4_and_keeps_v3_complete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "rollback-v4.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE stores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id TEXT NOT NULL UNIQUE
+            );
+            INSERT INTO stores(app_id) VALUES('wx-store-11');
+            """
+        )
+        conn.commit()
+        migrations = list(migration_module._migrations())
+        monkeypatch.setattr(
+            migration_module,
+            "_migrations",
+            lambda: migrations[:3],
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "_verify_required_tables",
+            lambda _conn: None,
+        )
+        migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".backup"),
+        )
+        monkeypatch.undo()
+        failing_v4 = """
+            CREATE TABLE dongxiao_failure_probe_v4 (id INTEGER);
+            INSERT INTO table_that_does_not_exist(id) VALUES(1);
+        """
+        monkeypatch.setattr(
+            migration_module,
+            "_migration_v4_sql",
+            lambda: failing_v4,
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "DONGXIAO_V4_CHECKSUM",
+            hashlib.sha256(failing_v4.encode("utf-8")).hexdigest(),
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            migrate_dongxiao_schema(
+                conn,
+                path,
+                lambda _label: path.with_suffix(".backup"),
+            )
+
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "dongxiao_failure_probe_v4" not in tables
+        assert conn.execute(
+            "SELECT version FROM dongxiao_schema_migrations"
+        ).fetchall() == [(1,), (2,), (3,)]
+        assert "dongxiao_task_execution_items" not in tables
     finally:
         conn.close()
 

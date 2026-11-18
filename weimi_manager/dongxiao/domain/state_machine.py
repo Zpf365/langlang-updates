@@ -57,6 +57,8 @@ _TASK_TRANSITIONS: dict[tuple[TaskStatus, TaskEvent], TaskStatus] = {
         TaskStatus.PREPARING,
     (TaskStatus.PARTIALLY_FAILED, TaskEvent.CANCEL):
         TaskStatus.CANCELLED,
+    (TaskStatus.FAILED, TaskEvent.RESUME):
+        TaskStatus.PREPARING,
     (TaskStatus.UNKNOWN, TaskEvent.RECOVER_UNKNOWN):
         TaskStatus.PREPARING,
     (TaskStatus.UNKNOWN, TaskEvent.CANCEL):

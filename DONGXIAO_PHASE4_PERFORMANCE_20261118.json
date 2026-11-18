@@ -1,0 +1,49 @@
+{
+  "tested_at": "2026-11-18T13:26:05+00:00",
+  "timezone": "UTC",
+  "database": "temporary isolated SQLite",
+  "tasks": [
+    {
+      "products_and_items": 1000,
+      "batch_task_create_ms": 275.32,
+      "task_execute_1000_items_ms": 605.84,
+      "executed_items": 1000,
+      "peak_python_bytes": 2312864,
+      "peak_rss_delta_bytes": 4435968,
+      "rss_after_minus_before_bytes": 843776,
+      "errors": 0
+    },
+    {
+      "products_and_items": 10000,
+      "batch_task_create_ms": 2708.3,
+      "task_execute_1000_items_ms": null,
+      "executed_items": 0,
+      "peak_python_bytes": 21770596,
+      "peak_rss_delta_bytes": 45875200,
+      "rss_after_minus_before_bytes": 12554240,
+      "errors": 0
+    }
+  ],
+  "orders": {
+    "orders": 1000,
+    "order_sync_ms": 13376.84,
+    "saved": 1000,
+    "order_page_query_500_ms": 24.54,
+    "returned": 500,
+    "errors": 0
+  },
+  "aftersales": {
+    "calls": 10000,
+    "amount_preview_total_ms": 14.53,
+    "amount_preview_per_call_us": 1.45,
+    "errors": 0
+  },
+  "ui": {
+    "measured": true,
+    "task_items": 500,
+    "background_execute_ms": 369.86,
+    "event_loop_ticks": 18,
+    "max_gap_ms": 23.74,
+    "errors": 0
+  }
+}

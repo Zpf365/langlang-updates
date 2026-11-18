@@ -33,6 +33,10 @@ def test_task_state_machine_allows_declared_flow_only() -> None:
         is TaskStatus.RUNNING
     )
     assert (
+        transition_task(TaskStatus.FAILED, TaskEvent.RESUME)
+        is TaskStatus.PREPARING
+    )
+    assert (
         transition_task(TaskStatus.RUNNING, TaskEvent.PAUSE)
         is TaskStatus.PAUSED
     )

@@ -28,6 +28,7 @@ from ..cloud_commands import (
 from ..config import AppPaths
 from ..db import Database
 from ..diagnostics import DiagnosticManager
+from ..dongxiao.application.runtime import DongxiaoRuntime
 from ..service import SyncService
 from ..tester_channel import load_tester_channel
 from ..updater import (
@@ -325,6 +326,13 @@ class MainWindow(tk.Tk):
         else:
             self.service = base_service
             self.web_session = base_web_session
+        try:
+            self.dongxiao_runtime = DongxiaoRuntime(
+                self.base_db.path,
+                self.service,
+            )
+        except Exception:
+            self.dongxiao_runtime = None
         self._task_queue: queue.Queue[tuple[Callable[..., Any], tuple[Any, ...]]] = queue.Queue()
         self._nav_buttons: dict[str, tk.Button] = {}
         self._page_icon_names: dict[str, str] = {}
@@ -371,6 +379,7 @@ class MainWindow(tk.Tk):
         self._build_sidebar()
         self._build_content()
         self.after(80, self._drain_task_queue)
+        self.after(500, self._start_dongxiao_runtime)
         self.after(1000, self._diagnostic_heartbeat)
         self.after(5 * 60 * 1000, self._diagnostic_upload_tick)
         self.diagnostics.flush_async()
@@ -1805,6 +1814,12 @@ class MainWindow(tk.Tk):
             except Exception:
                 pass
         diagnostics = getattr(self, "diagnostics", None)
+        runtime = getattr(self, "dongxiao_runtime", None)
+        if runtime is not None:
+            try:
+                runtime.stop()
+            except Exception:
+                pass
         try:
             diagnostics.record(
                 "session_end",
@@ -1821,6 +1836,21 @@ class MainWindow(tk.Tk):
         except tk.TclError:
             pass
         self.destroy()
+
+    def _start_dongxiao_runtime(self) -> None:
+        runtime = getattr(self, "dongxiao_runtime", None)
+        if runtime is None:
+            return
+        try:
+            runtime.start_if_needed()
+        except Exception as exc:
+            diagnostics = getattr(self, "diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.capture_exception(
+                    exc,
+                    category="dongxiao_runtime",
+                    detail={"operation": "start"},
+                )
 
     def _toggle_auto_refresh(self) -> None:
         self.auto_refresh_enabled = bool(self.auto_refresh_var.get())

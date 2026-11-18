@@ -29,6 +29,8 @@ def test_formal_sales_related_route_opens_dongxiao_center(
 
         page = window.sales_related_page
         assert isinstance(page, DongxiaoPage)
+        assert window.dongxiao_runtime is not None
+        assert page.runtime is window.dongxiao_runtime
         assert window.title_var.get() == "动销中心"
         assert [
             button.cget("text")
@@ -67,6 +69,28 @@ def test_formal_sales_related_route_opens_dongxiao_center(
         assert page.apply_filter_button.cget("text") == "应用筛选"
         assert page.import_products_button.cget("text") == "批量导入"
         assert page.pool_combo.winfo_exists()
+        assert {
+            "created",
+            "task_id",
+            "type",
+            "status",
+            "progress",
+            "error",
+        } == set(page.task_tree["columns"])
+        assert {
+            "order_id",
+            "status",
+            "total",
+            "items",
+            "created",
+            "updated",
+            "synced",
+        } == set(page.order_tree["columns"])
+        assert "case_id" in page.aftersale_tree["columns"]
+        assert "action" in page.audit_tree["columns"]
+        page.section_buttons["orders"].invoke()
+        window.update_idletasks()
+        assert page.section_title_var.get() == "真实订单"
 
         store_id = window.base_db.add_store(
             "动销界面测试店铺",

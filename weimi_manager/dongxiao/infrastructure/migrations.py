@@ -23,13 +23,19 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 3
-DONGXIAO_MIGRATION_NAME = "dongxiao_catalog_consistency_v3"
+DONGXIAO_MIGRATION_VERSION = 4
+DONGXIAO_MIGRATION_NAME = "dongxiao_operations_v4"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
 )
 DONGXIAO_V2_CHECKSUM = (
     "9553158b15347f6c19d334091246348105f65e1547f714c7083effd065adc86f"
+)
+DONGXIAO_V3_CHECKSUM = (
+    "21c6a4ab8649fcb24be60d6ab3a2340270c8ed774dc0107c289e9931b9af0984"
+)
+DONGXIAO_V4_CHECKSUM = (
+    "e55a03bd7d8141579f33606961242e4756b242af2aabf7f13e828873038292d5"
 )
 
 
@@ -640,11 +646,230 @@ END;
 """
 
 
+def _migration_v4_sql() -> str:
+    item_states = _values(item.value for item in TaskItemStatus)
+    attempt_states = _values(item.value for item in TaskAttemptStatus)
+    order_states = _values(item.value for item in OrderStatus)
+    order_sources = _values(
+        item.value for item in OrderVerificationSource
+    )
+    statements = [
+        """
+ALTER TABLE dongxiao_tasks
+    ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+""",
+        """
+ALTER TABLE dongxiao_tasks
+    ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3
+        CHECK (max_attempts BETWEEN 1 AND 20);
+""",
+        """
+ALTER TABLE dongxiao_tasks ADD COLUMN next_run_at TEXT;
+""",
+        """
+ALTER TABLE dongxiao_tasks ADD COLUMN lease_owner TEXT NOT NULL DEFAULT '';
+""",
+        """
+ALTER TABLE dongxiao_tasks ADD COLUMN lease_expires_at TEXT;
+""",
+        """
+ALTER TABLE dongxiao_tasks ADD COLUMN started_at TEXT;
+""",
+        """
+ALTER TABLE dongxiao_tasks ADD COLUMN finished_at TEXT;
+""",
+        """
+ALTER TABLE dongxiao_tasks
+    ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+""",
+        """
+ALTER TABLE dongxiao_tasks
+    ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local_safe'
+        CHECK (execution_mode IN ('local_safe', 'official_read', 'platform_write'));
+""",
+        f"""
+CREATE TABLE IF NOT EXISTS dongxiao_task_execution_items (
+    item_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL
+        CHECK (subject_type IN ('product', 'order', 'aftersale')),
+    subject_id TEXT NOT NULL,
+    product_id TEXT NOT NULL DEFAULT '',
+    sku_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ({item_states})),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 3
+        CHECK (max_attempts BETWEEN 1 AND 20),
+    next_attempt_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{{}}',
+    result_json TEXT NOT NULL DEFAULT '{{}}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (
+        task_id, store_app_id, subject_type,
+        subject_id, product_id, sku_id
+    ),
+    UNIQUE (item_id, task_id, store_app_id),
+    FOREIGN KEY (task_id, store_app_id)
+        REFERENCES dongxiao_tasks(task_id, store_app_id)
+        ON DELETE CASCADE
+);
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_execution_items_task_v4
+    ON dongxiao_task_execution_items(task_id, status, next_attempt_at);
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_execution_items_subject_v4
+    ON dongxiao_task_execution_items(
+        store_app_id, subject_type, subject_id, updated_at DESC
+    );
+""",
+        f"""
+CREATE TABLE IF NOT EXISTS dongxiao_execution_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    status TEXT NOT NULL CHECK (status IN ({attempt_states})),
+    request_id TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    error_code TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL DEFAULT '{{}}',
+    CHECK (finished_at IS NULL OR finished_at >= started_at),
+    UNIQUE (task_id, item_id, attempt_no),
+    FOREIGN KEY (item_id, task_id, store_app_id)
+        REFERENCES dongxiao_task_execution_items(
+            item_id, task_id, store_app_id
+        )
+        ON DELETE CASCADE
+);
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_execution_attempts_task_v4
+    ON dongxiao_execution_attempts(task_id, started_at DESC);
+""",
+        f"""
+CREATE TABLE IF NOT EXISTS dongxiao_order_details (
+    order_ref_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    platform_order_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ({order_states})),
+    create_time TEXT,
+    update_time TEXT,
+    pay_time TEXT,
+    total_amount_cents INTEGER NOT NULL DEFAULT 0
+        CHECK (total_amount_cents >= 0),
+    product_amount_cents INTEGER NOT NULL DEFAULT 0
+        CHECK (product_amount_cents >= 0),
+    freight_amount_cents INTEGER NOT NULL DEFAULT 0
+        CHECK (freight_amount_cents >= 0),
+    discount_amount_cents INTEGER NOT NULL DEFAULT 0
+        CHECK (discount_amount_cents >= 0),
+    item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+    items_json TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL CHECK (source IN ({order_sources})),
+    last_synced_at TEXT NOT NULL,
+    PRIMARY KEY (order_ref_id, store_app_id),
+    UNIQUE (store_app_id, platform_order_id),
+    FOREIGN KEY (order_ref_id, store_app_id)
+        REFERENCES dongxiao_order_refs(order_ref_id, store_app_id)
+        ON DELETE CASCADE
+);
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_order_details_latest_v4
+    ON dongxiao_order_details(
+        store_app_id, update_time DESC, platform_order_id
+    );
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN platform_status TEXT NOT NULL DEFAULT '';
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN after_sale_type TEXT NOT NULL DEFAULT '';
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN paid_amount_cents INTEGER NOT NULL DEFAULT 0
+        CHECK (paid_amount_cents >= 0);
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN refunded_amount_cents INTEGER NOT NULL DEFAULT 0
+        CHECK (refunded_amount_cents >= 0);
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN inflight_amount_cents INTEGER NOT NULL DEFAULT 0
+        CHECK (inflight_amount_cents >= 0);
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases ADD COLUMN deadline TEXT;
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases ADD COLUMN complete_time TEXT;
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases
+    ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}';
+""",
+        """
+ALTER TABLE dongxiao_aftersale_cases ADD COLUMN last_synced_at TEXT;
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_aftersale_deadline_v4
+    ON dongxiao_aftersale_cases(
+        store_app_id, status, deadline, updated_at DESC
+    );
+""",
+        """
+CREATE TRIGGER IF NOT EXISTS execution_items_store_identity_insert_v4
+BEFORE INSERT ON dongxiao_task_execution_items
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+     WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'execution_items 店铺 ID 与 AppID 不一致');
+END;
+""",
+        """
+CREATE TRIGGER IF NOT EXISTS order_details_store_identity_insert_v4
+BEFORE INSERT ON dongxiao_order_details
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+     WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'order_details 店铺 ID 与 AppID 不一致');
+END;
+""",
+    ]
+    return "\n".join(statements)
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
         (2, "dongxiao_product_catalog_v2", _migration_v2_sql),
         (3, "dongxiao_catalog_consistency_v3", _migration_v3_sql),
+        (4, "dongxiao_operations_v4", _migration_v4_sql),
     )
 
 
@@ -719,6 +944,14 @@ def migrate_dongxiao_schema(
             raise sqlite3.IntegrityError(
                 "动销中心 v2 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
+        if version == 3 and current_checksum != DONGXIAO_V3_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v3 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
+        if version == 4 and current_checksum != DONGXIAO_V4_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v4 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
             conn.executescript(
@@ -782,6 +1015,9 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_product_imports",
         "dongxiao_product_pool_events",
         "dongxiao_catalog_sync_runs",
+        "dongxiao_task_execution_items",
+        "dongxiao_execution_attempts",
+        "dongxiao_order_details",
     }
     tables = {
         str(row[0])

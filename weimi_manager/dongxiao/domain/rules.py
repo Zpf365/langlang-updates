@@ -334,10 +334,17 @@ def select_sku(
     above_limit = False
     incomplete = False
     incomplete_reason = ""
+    specified_seen = False
     for candidate in sku_list:
         ensure_same_store(store_id, candidate.store_id, label="SKU")
         if str(candidate.product_id) != product_id:
             raise StoreIsolationError("SKU 不属于当前商品，禁止跨商品组合")
+        if (
+            selection_mode is SkuSelectionMode.SPECIFIED
+            and str(candidate.sku_id) != normalized_specified_sku
+        ):
+            continue
+        specified_seen = True
         if not bool(candidate.data_complete):
             incomplete = True
             if not incomplete_reason:
@@ -378,6 +385,15 @@ def select_sku(
         valid.append(candidate)
 
     if not valid:
+        if (
+            selection_mode is SkuSelectionMode.SPECIFIED
+            and not specified_seen
+        ):
+            return _sku_failure(
+                SkuSelectionFailure.SPECIFIED_NOT_FOUND,
+                quantity,
+                "指定 SKU 不存在",
+            )
         if price_changed:
             return _sku_failure(
                 SkuSelectionFailure.PRICE_CHANGED,

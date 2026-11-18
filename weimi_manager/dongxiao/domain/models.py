@@ -425,6 +425,16 @@ class Task:
     created_at: datetime
     updated_at: datetime
     metadata: Mapping[str, object] = field(default_factory=dict)
+    status_reason: str = ""
+    priority: int = 0
+    max_attempts: int = 3
+    next_run_at: datetime | None = None
+    lease_owner: str = ""
+    lease_expires_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    last_error: str = ""
+    execution_mode: str = "local_safe"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", _required_text(self.task_id, "任务 ID"))
@@ -457,6 +467,39 @@ class Task:
         object.__setattr__(self, "created_at", created)
         object.__setattr__(self, "updated_at", updated)
         object.__setattr__(self, "metadata", sanitize_audit_detail(dict(self.metadata)))
+        object.__setattr__(self, "status_reason", str(self.status_reason or "")[:1000])
+        object.__setattr__(self, "priority", int(self.priority))
+        maximum = _quantity(
+            self.max_attempts,
+            "任务最大尝试次数",
+            allow_zero=False,
+        )
+        if maximum > 20:
+            raise ValueError("任务最大尝试次数不能超过 20")
+        object.__setattr__(self, "max_attempts", maximum)
+        for field_name, value in (
+            ("任务下次运行时间", self.next_run_at),
+            ("任务租约到期时间", self.lease_expires_at),
+            ("任务开始时间", self.started_at),
+            ("任务结束时间", self.finished_at),
+        ):
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    {
+                        "任务下次运行时间": "next_run_at",
+                        "任务租约到期时间": "lease_expires_at",
+                        "任务开始时间": "started_at",
+                        "任务结束时间": "finished_at",
+                    }[field_name],
+                    ensure_utc(value, field=field_name),
+                )
+        object.__setattr__(self, "lease_owner", str(self.lease_owner or "")[:200])
+        object.__setattr__(self, "last_error", str(self.last_error or "")[:1000])
+        mode = str(self.execution_mode or "").strip()
+        if mode not in {"local_safe", "official_read", "platform_write"}:
+            raise ValueError("任务执行模式不受支持")
+        object.__setattr__(self, "execution_mode", mode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,6 +536,118 @@ class TaskItem:
         object.__setattr__(self, "created_at", created)
         object.__setattr__(self, "updated_at", updated)
         object.__setattr__(self, "reason", str(self.reason or "")[:1000])
+
+
+@dataclass(frozen=True, slots=True)
+class TaskExecutionItem:
+    item_id: str
+    task_id: str
+    store_id: int
+    store_app_id: str
+    subject_type: str
+    subject_id: str
+    status: TaskItemStatus
+    attempt_count: int
+    max_attempts: int
+    created_at: datetime
+    updated_at: datetime
+    product_id: str = ""
+    sku_id: str = ""
+    next_attempt_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    last_error_code: str = ""
+    last_error_message: str = ""
+    payload: Mapping[str, object] = field(default_factory=dict)
+    result: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "item_id",
+            _required_text(self.item_id, "执行明细 ID"),
+        )
+        object.__setattr__(
+            self,
+            "task_id",
+            _required_text(self.task_id, "任务 ID"),
+        )
+        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(
+            self,
+            "store_app_id",
+            _required_text(self.store_app_id, "店铺 AppID"),
+        )
+        subject_type = str(self.subject_type or "").strip()
+        if subject_type not in {"product", "order", "aftersale"}:
+            raise ValueError("任务执行对象类型不受支持")
+        object.__setattr__(self, "subject_type", subject_type)
+        object.__setattr__(
+            self,
+            "subject_id",
+            _required_text(self.subject_id, "执行对象 ID"),
+        )
+        object.__setattr__(
+            self,
+            "status",
+            TaskItemStatus(self.status),
+        )
+        object.__setattr__(
+            self,
+            "attempt_count",
+            _quantity(self.attempt_count, "执行尝试次数"),
+        )
+        maximum = _quantity(
+            self.max_attempts,
+            "执行最大尝试次数",
+            allow_zero=False,
+        )
+        if maximum > 20:
+            raise ValueError("执行最大尝试次数不能超过 20")
+        object.__setattr__(self, "max_attempts", maximum)
+        created = ensure_utc(self.created_at, field="执行明细创建时间")
+        updated = ensure_utc(self.updated_at, field="执行明细更新时间")
+        if updated < created:
+            raise ValueError("执行明细更新时间不能早于创建时间")
+        object.__setattr__(self, "created_at", created)
+        object.__setattr__(self, "updated_at", updated)
+        object.__setattr__(self, "product_id", str(self.product_id or "").strip())
+        object.__setattr__(self, "sku_id", str(self.sku_id or "").strip())
+        for name, value in (
+            ("下次重试时间", self.next_attempt_at),
+            ("执行开始时间", self.started_at),
+            ("执行结束时间", self.finished_at),
+        ):
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    {
+                        "下次重试时间": "next_attempt_at",
+                        "执行开始时间": "started_at",
+                        "执行结束时间": "finished_at",
+                    }[name],
+                    ensure_utc(value, field=name),
+                )
+        object.__setattr__(
+            self,
+            "last_error_code",
+            str(self.last_error_code or "")[:200],
+        )
+        object.__setattr__(
+            self,
+            "last_error_message",
+            str(self.last_error_message or "")[:1000],
+        )
+        object.__setattr__(
+            self,
+            "payload",
+            sanitize_audit_detail(dict(self.payload)),
+        )
+        object.__setattr__(
+            self,
+            "result",
+            sanitize_audit_detail(dict(self.result)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,6 +780,93 @@ class OrderStatusSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderRecord:
+    order_ref_id: str
+    store_id: int
+    store_app_id: str
+    platform_order_id: str
+    status: OrderStatus
+    total_amount_cents: int
+    product_amount_cents: int
+    freight_amount_cents: int
+    discount_amount_cents: int
+    item_count: int
+    source: OrderVerificationSource
+    last_synced_at: datetime
+    create_time: datetime | None = None
+    update_time: datetime | None = None
+    pay_time: datetime | None = None
+    items: tuple[Mapping[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "order_ref_id",
+            _required_text(self.order_ref_id, "订单引用 ID"),
+        )
+        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(
+            self,
+            "store_app_id",
+            _required_text(self.store_app_id, "店铺 AppID"),
+        )
+        object.__setattr__(
+            self,
+            "platform_order_id",
+            _required_text(self.platform_order_id, "平台订单号"),
+        )
+        object.__setattr__(self, "status", OrderStatus(self.status))
+        for name in (
+            "total_amount_cents",
+            "product_amount_cents",
+            "freight_amount_cents",
+            "discount_amount_cents",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                validate_money_cents(getattr(self, name), field="订单金额"),
+            )
+        object.__setattr__(
+            self,
+            "item_count",
+            _quantity(self.item_count, "订单商品项数"),
+        )
+        source = OrderVerificationSource(self.source)
+        if source is not OrderVerificationSource.PLATFORM_API:
+            raise OrderTrustError("动销订单记录只能保存官方平台订单")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(
+            self,
+            "last_synced_at",
+            ensure_utc(self.last_synced_at, field="订单同步时间"),
+        )
+        for field_name, value in (
+            ("订单创建时间", self.create_time),
+            ("订单更新时间", self.update_time),
+            ("订单支付时间", self.pay_time),
+        ):
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    {
+                        "订单创建时间": "create_time",
+                        "订单更新时间": "update_time",
+                        "订单支付时间": "pay_time",
+                    }[field_name],
+                    ensure_utc(value, field=field_name),
+                )
+        object.__setattr__(
+            self,
+            "items",
+            tuple(
+                sanitize_audit_detail(dict(item))
+                for item in self.items
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AftersaleCase:
     case_id: str
     store_id: int
@@ -639,6 +881,16 @@ class AftersaleCase:
     order_ref_id: str = ""
     source: str = "unknown"
     reason: str = ""
+    platform_status: str = ""
+    platform_order_id: str = ""
+    after_sale_type: str = ""
+    paid_amount_cents: int = 0
+    refunded_amount_cents: int = 0
+    inflight_amount_cents: int = 0
+    deadline: datetime | None = None
+    complete_time: datetime | None = None
+    details: Mapping[str, object] = field(default_factory=dict)
+    last_synced_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "case_id", _required_text(self.case_id, "售后工单 ID"))
@@ -676,6 +928,71 @@ class AftersaleCase:
         object.__setattr__(self, "order_ref_id", str(self.order_ref_id or "").strip())
         object.__setattr__(self, "source", _required_text(self.source, "售后来源"))
         object.__setattr__(self, "reason", str(self.reason or "")[:1000])
+        object.__setattr__(
+            self,
+            "platform_status",
+            str(self.platform_status or "")[:200],
+        )
+        object.__setattr__(
+            self,
+            "platform_order_id",
+            str(self.platform_order_id or ""),
+        )
+        object.__setattr__(
+            self,
+            "after_sale_type",
+            str(self.after_sale_type or "")[:100],
+        )
+        for name in (
+            "paid_amount_cents",
+            "refunded_amount_cents",
+            "inflight_amount_cents",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                validate_money_cents(getattr(self, name), field="售后金额"),
+            )
+        if self.paid_amount_cents > 0:
+            if (
+                self.refunded_amount_cents
+                + self.inflight_amount_cents
+                > self.paid_amount_cents
+            ):
+                raise ValueError("已退与在途退款金额不能超过订单实付金额")
+            if self.requested_amount_cents > self.paid_amount_cents:
+                raise ValueError("申请退款金额不能超过订单实付金额")
+        for field_name, value in (
+            ("售后截止时间", self.deadline),
+            ("售后完成时间", self.complete_time),
+            ("售后同步时间", self.last_synced_at),
+        ):
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    {
+                        "售后截止时间": "deadline",
+                        "售后完成时间": "complete_time",
+                        "售后同步时间": "last_synced_at",
+                    }[field_name],
+                    ensure_utc(value, field=field_name),
+                )
+        object.__setattr__(
+            self,
+            "details",
+            sanitize_audit_detail(dict(self.details)),
+        )
+
+    @property
+    def remaining_refundable_cents(self) -> int:
+        if self.paid_amount_cents <= 0:
+            return 0
+        return max(
+            0,
+            self.paid_amount_cents
+            - self.refunded_amount_cents
+            - self.inflight_amount_cents,
+        )
 
 
 @dataclass(frozen=True, slots=True)
