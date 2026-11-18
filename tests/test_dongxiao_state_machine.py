@@ -14,6 +14,7 @@ from weimi_manager.dongxiao.domain.enums import (
 )
 from weimi_manager.dongxiao.domain.state_machine import (
     InvalidStateTransition,
+    UnknownResultRequiresVerification,
     allowed_task_transitions,
     transition_aftersale,
     transition_approval,
@@ -133,3 +134,19 @@ def test_every_required_task_state_exposes_explicit_destinations() -> None:
         TaskStatus.RUNNING
     )
     assert allowed_task_transitions(TaskStatus.COMPLETED) == ()
+
+
+def test_unknown_task_recovery_requires_remote_verification() -> None:
+    with pytest.raises(UnknownResultRequiresVerification):
+        transition_task(
+            TaskStatus.UNKNOWN,
+            TaskEvent.RECOVER_UNKNOWN,
+        )
+    assert (
+        transition_task(
+            TaskStatus.UNKNOWN,
+            TaskEvent.RECOVER_UNKNOWN,
+            remote_result_verified=True,
+        )
+        is TaskStatus.PREPARING
+    )
