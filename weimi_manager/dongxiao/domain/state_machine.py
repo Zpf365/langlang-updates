@@ -16,6 +16,10 @@ class InvalidStateTransition(ValueError):
     pass
 
 
+class UnknownResultRequiresVerification(InvalidStateTransition):
+    pass
+
+
 _TASK_TRANSITIONS: dict[tuple[TaskStatus, TaskEvent], TaskStatus] = {
     (TaskStatus.PENDING, TaskEvent.START_PREPARING):
         TaskStatus.PREPARING,
@@ -206,7 +210,23 @@ def _transition(
 def transition_task(
     current: TaskStatus | str,
     event: TaskEvent | str,
+    *,
+    remote_result_verified: bool = False,
 ) -> TaskStatus:
+    try:
+        current_status = TaskStatus(current)
+        task_event = TaskEvent(event)
+    except ValueError:
+        current_status = None
+        task_event = None
+    if (
+        current_status is TaskStatus.UNKNOWN
+        and task_event is TaskEvent.RECOVER_UNKNOWN
+        and not remote_result_verified
+    ):
+        raise UnknownResultRequiresVerification(
+            "结果未知的任务必须先完成远端状态核验"
+        )
     return _transition(
         current,
         event,

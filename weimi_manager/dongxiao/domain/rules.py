@@ -4,12 +4,14 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import TYPE_CHECKING, Iterable, Mapping, Protocol
 
 if TYPE_CHECKING:
     from .models import Sku
 
+from .enums import ProductState
 
 MAX_MONEY_CENTS = 999_999_999_999
 SENSITIVE_KEY_PARTS = (
@@ -44,6 +46,20 @@ class SkuSelectionFailure(StrEnum):
     OVER_PRICE_CAP = "over_price_cap"
     BELOW_LIMIT = "below_limit"
     ABOVE_LIMIT = "above_limit"
+    INCOMPLETE_DATA = "incomplete_data"
+    PRODUCT_INACTIVE = "product_inactive"
+    SPECIFIED_MISSING = "specified_missing"
+    SPECIFIED_NOT_FOUND = "specified_not_found"
+    DEFAULT_MISSING = "default_missing"
+    DEFAULT_AMBIGUOUS = "default_ambiguous"
+
+
+class SkuSelectionMode(StrEnum):
+    ANY = "any"
+    LOWEST_PRICE = "lowest_price"
+    HIGHEST_PRICE = "highest_price"
+    SPECIFIED = "specified"
+    PRODUCT_DEFAULT = "product_default"
 
 
 class SkuLike(Protocol):
@@ -55,6 +71,8 @@ class SkuLike(Protocol):
     available: bool
     purchase_min: int
     purchase_max: int | None
+    is_default: bool
+    data_complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +133,25 @@ def validate_money_cents(
     if value > MAX_MONEY_CENTS:
         raise ValueError(f"{field}超过允许的最大值")
     return value
+
+
+def parse_yuan_to_cents(value: str) -> int:
+    text = str(value or "").strip().replace(",", "").replace("¥", "")
+    text = text.replace("￥", "")
+    if not text:
+        raise ValueError("金额不能为空")
+    try:
+        amount = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError("金额格式不正确") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("金额必须是大于等于 0 的有效数字")
+    if amount.as_tuple().exponent < -2:
+        raise ValueError("金额最多保留两位小数")
+    return validate_money_cents(
+        int(amount * Decimal(100)),
+        field="金额",
+    )
 
 
 def utc_now() -> datetime:
@@ -221,6 +258,9 @@ def select_sku(
     quantity: int,
     expected_price_cents: int | None = None,
     max_price_cents: int | None = None,
+    mode: SkuSelectionMode | str = SkuSelectionMode.ANY,
+    specified_sku_id: str = "",
+    product_state: ProductState | str | None = None,
 ) -> SkuSelection:
     store_id = _validate_store_id(store_id)
     product_id = _required_product_id(product_id)
@@ -235,6 +275,25 @@ def select_sku(
         if max_price_cents is not None
         else None
     )
+    selection_mode = SkuSelectionMode(mode)
+    if product_state is not None and ProductState(product_state) is (
+        ProductState.INACTIVE
+    ):
+        return _sku_failure(
+            SkuSelectionFailure.PRODUCT_INACTIVE,
+            quantity,
+            "商品已下架，不能选择 SKU",
+        )
+    normalized_specified_sku = str(specified_sku_id or "").strip()
+    if (
+        selection_mode is SkuSelectionMode.SPECIFIED
+        and not normalized_specified_sku
+    ):
+        return _sku_failure(
+            SkuSelectionFailure.SPECIFIED_MISSING,
+            quantity,
+            "指定 SKU 模式必须填写 SKU ID",
+        )
 
     sku_list = list(candidates)
     if not sku_list:
@@ -248,10 +307,14 @@ def select_sku(
     over_price_cap = False
     below_limit = False
     above_limit = False
+    incomplete = False
     for candidate in sku_list:
         ensure_same_store(store_id, candidate.store_id, label="SKU")
         if str(candidate.product_id) != product_id:
             raise StoreIsolationError("SKU 不属于当前商品，禁止跨商品组合")
+        if not bool(candidate.data_complete):
+            incomplete = True
+            continue
         if expected is not None and int(candidate.price_cents) != expected:
             price_changed = True
             continue
@@ -324,12 +387,54 @@ def select_sku(
                 quantity,
                 "购买数量低于 SKU 起购数量",
             )
+        if incomplete:
+            return _sku_failure(
+                SkuSelectionFailure.INCOMPLETE_DATA,
+                quantity,
+                "SKU 价格、库存或限购数据不完整，无法确定",
+            )
         return _sku_failure(SkuSelectionFailure.NO_SKU, quantity)
 
-    selected = min(
-        valid,
-        key=lambda item: (int(item.price_cents), str(item.sku_id)),
-    )
+    if selection_mode is SkuSelectionMode.LOWEST_PRICE:
+        selected = min(
+            valid,
+            key=lambda item: (int(item.price_cents), str(item.sku_id)),
+        )
+    elif selection_mode is SkuSelectionMode.HIGHEST_PRICE:
+        selected = max(
+            valid,
+            key=lambda item: (int(item.price_cents), str(item.sku_id)),
+        )
+    elif selection_mode is SkuSelectionMode.PRODUCT_DEFAULT:
+        defaults = [item for item in valid if bool(item.is_default)]
+        if not defaults:
+            return _sku_failure(
+                SkuSelectionFailure.DEFAULT_MISSING,
+                quantity,
+                "商品没有可验证的默认 SKU",
+            )
+        if len(defaults) > 1:
+            return _sku_failure(
+                SkuSelectionFailure.DEFAULT_AMBIGUOUS,
+                quantity,
+                "商品返回多个默认 SKU，必须人工确认",
+            )
+        selected = defaults[0]
+    elif selection_mode is SkuSelectionMode.SPECIFIED:
+        matches = [
+            item
+            for item in valid
+            if str(item.sku_id) == normalized_specified_sku
+        ]
+        if not matches:
+            return _sku_failure(
+                SkuSelectionFailure.SPECIFIED_NOT_FOUND,
+                quantity,
+                "指定 SKU 当前不可购买",
+            )
+        selected = matches[0]
+    else:
+        selected = valid[0]
     return SkuSelection(selected=selected, quantity=quantity)
 
 

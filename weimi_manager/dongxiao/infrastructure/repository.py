@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -8,13 +10,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from ..domain.catalog import CatalogProductData
 from ..domain.enums import (
     AuditResult,
+    DataSource,
     ProductPoolStatus,
     ProductState,
     TaskEvent,
     TaskStatus,
 )
+from ..domain.imports import ProductImportPreview
 from ..domain.models import (
     AftersaleCase,
     Approval,
@@ -22,6 +27,7 @@ from ..domain.models import (
     OrderStatusSnapshot,
     Product,
     ProductPool,
+    ProductPoolEvent,
     ProductPoolItem,
     ProductSnapshot,
     RealOrderReference,
@@ -29,6 +35,11 @@ from ..domain.models import (
     Task,
     TaskAttempt,
     TaskItem,
+)
+from ..domain.queries import (
+    ProductFilter,
+    ProductPage,
+    ProductSortField,
 )
 from ..domain.rules import (
     StoreIsolationError,
@@ -124,8 +135,10 @@ class DongxiaoRepository:
                 INSERT INTO dongxiao_products(
                     store_id, store_app_id, product_id, title, state,
                     min_price_cents, stock_total, observed_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, sales_count, sales_source,
+                    listing_time, listing_source, data_source,
+                    from_cache, last_synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(store_app_id, product_id) DO UPDATE SET
                     store_id=excluded.store_id,
                     title=excluded.title,
@@ -133,7 +146,14 @@ class DongxiaoRepository:
                     min_price_cents=excluded.min_price_cents,
                     stock_total=excluded.stock_total,
                     observed_at=excluded.observed_at,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    sales_count=excluded.sales_count,
+                    sales_source=excluded.sales_source,
+                    listing_time=excluded.listing_time,
+                    listing_source=excluded.listing_source,
+                    data_source=excluded.data_source,
+                    from_cache=excluded.from_cache,
+                    last_synced_at=excluded.last_synced_at
                 """,
                 (
                     product.store_id,
@@ -146,6 +166,29 @@ class DongxiaoRepository:
                     to_utc_iso(product.observed_at),
                     now,
                     now,
+                    product.sales_count,
+                    (
+                        product.sales_source.value
+                        if product.sales_source is not None
+                        else None
+                    ),
+                    (
+                        to_utc_iso(product.listing_time)
+                        if product.listing_time is not None
+                        else None
+                    ),
+                    (
+                        product.listing_source.value
+                        if product.listing_source is not None
+                        else None
+                    ),
+                    product.data_source.value,
+                    1 if product.from_cache else 0,
+                    (
+                        to_utc_iso(product.last_synced_at)
+                        if product.last_synced_at is not None
+                        else None
+                    ),
                 ),
             )
         saved = self.get_product(product.store_id, product.product_id)
@@ -180,6 +223,236 @@ class DongxiaoRepository:
             ).fetchall()
         return [self._product_from_row(row) for row in rows]
 
+    def query_products(
+        self,
+        store_id: int,
+        filters: ProductFilter,
+    ) -> ProductPage:
+        conditions = ["store_id=?"]
+        args: list[Any] = [int(store_id)]
+        if filters.keyword:
+            escaped = (
+                filters.keyword.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            conditions.append("title LIKE ? ESCAPE '\\'")
+            args.append(f"%{escaped}%")
+        if filters.states:
+            placeholders = ",".join("?" for _ in filters.states)
+            conditions.append(f"state IN ({placeholders})")
+            args.extend(item.value for item in filters.states)
+        if filters.product_ids:
+            placeholders = ",".join("?" for _ in filters.product_ids)
+            conditions.append(f"product_id IN ({placeholders})")
+            args.extend(filters.product_ids)
+        if filters.min_price_cents is not None:
+            conditions.append("min_price_cents >= ?")
+            args.append(filters.min_price_cents)
+        if filters.max_price_cents is not None:
+            conditions.append("min_price_cents <= ?")
+            args.append(filters.max_price_cents)
+        if (
+            filters.zero_sales
+            or filters.sales_min is not None
+            or filters.sales_max is not None
+        ):
+            conditions.extend(
+                (
+                    "sales_count IS NOT NULL",
+                    "sales_source='official_api'",
+                )
+            )
+        if filters.zero_sales:
+            conditions.append("sales_count=0")
+        if filters.sales_min is not None:
+            conditions.append("sales_count >= ?")
+            args.append(filters.sales_min)
+        if filters.sales_max is not None:
+            conditions.append("sales_count <= ?")
+            args.append(filters.sales_max)
+        if filters.listed_from is not None or filters.listed_to is not None:
+            conditions.extend(
+                (
+                    "listing_time IS NOT NULL",
+                    "listing_source='official_api'",
+                )
+            )
+        if filters.listed_from is not None:
+            conditions.append("listing_time >= ?")
+            args.append(to_utc_iso(filters.listed_from))
+        if filters.listed_to is not None:
+            conditions.append("listing_time <= ?")
+            args.append(to_utc_iso(filters.listed_to))
+
+        direction = "DESC" if filters.sort_desc else "ASC"
+        order_by = {
+            ProductSortField.PRODUCT_ID: f"product_id {direction}",
+            ProductSortField.TITLE: f"title COLLATE NOCASE {direction}",
+            ProductSortField.PRICE:
+                f"min_price_cents {direction}, product_id",
+            ProductSortField.SALES:
+                "CASE WHEN sales_count IS NULL THEN 1 ELSE 0 END, "
+                f"sales_count {direction}, product_id",
+            ProductSortField.LISTING_TIME:
+                "CASE WHEN listing_time IS NULL THEN 1 ELSE 0 END, "
+                f"listing_time {direction}, product_id",
+            ProductSortField.UPDATED_AT:
+                f"updated_at {direction}, product_id",
+        }[filters.sort_by]
+        where = " AND ".join(conditions)
+        with self.connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM dongxiao_products WHERE {where}",
+                    args,
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT * FROM dongxiao_products
+                WHERE {where}
+                ORDER BY {order_by}
+                LIMIT ? OFFSET ?
+                """,
+                (
+                    *args,
+                    filters.page_size,
+                    (filters.page - 1) * filters.page_size,
+                ),
+            ).fetchall()
+            trusted_sales = bool(
+                conn.execute(
+                    """
+                    SELECT 1 FROM dongxiao_products
+                    WHERE store_id=?
+                      AND sales_count IS NOT NULL
+                      AND sales_source='official_api'
+                    LIMIT 1
+                    """,
+                    (int(store_id),),
+                ).fetchone()
+            )
+            trusted_listing = bool(
+                conn.execute(
+                    """
+                    SELECT 1 FROM dongxiao_products
+                    WHERE store_id=?
+                      AND listing_time IS NOT NULL
+                      AND listing_source='official_api'
+                    LIMIT 1
+                    """,
+                    (int(store_id),),
+                ).fetchone()
+            )
+            source_summary = tuple(
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT data_source
+                    FROM dongxiao_products
+                    WHERE store_id=?
+                    ORDER BY data_source
+                    """,
+                    (int(store_id),),
+                ).fetchall()
+            )
+        unavailable: list[str] = []
+        if not trusted_sales:
+            unavailable.append("sales")
+        if not trusted_listing:
+            unavailable.append("listing_time")
+        return ProductPage(
+            items=tuple(self._product_from_row(row) for row in rows),
+            total=total,
+            page=filters.page,
+            page_size=filters.page_size,
+            page_count=math.ceil(total / filters.page_size),
+            unavailable_fields=tuple(unavailable),
+            source_summary=source_summary,
+        )
+
+    def save_import_preview(
+        self,
+        store,
+        preview: ProductImportPreview,
+    ) -> dict[str, int]:
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, int(store.id), str(store.app_id))
+            for item in preview.items:
+                if item.status.value == "duplicate":
+                    dedupe_key = (
+                        f"duplicate:{item.line_number}:{item.dedupe_key}"
+                    )
+                elif item.dedupe_key:
+                    dedupe_key = item.dedupe_key
+                else:
+                    digest = hashlib.sha256(
+                        item.raw_text.encode("utf-8")
+                    ).hexdigest()
+                    dedupe_key = (
+                        f"invalid:{item.line_number}:{digest[:24]}"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO dongxiao_product_imports(
+                        import_id, store_id, store_app_id, raw_text,
+                        dedupe_key, product_id, canonical_url, status,
+                        reason, source_kind, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
+                    ON CONFLICT(store_app_id, dedupe_key) DO UPDATE SET
+                        raw_text=excluded.raw_text,
+                        product_id=excluded.product_id,
+                        canonical_url=excluded.canonical_url,
+                        status=excluded.status,
+                        reason=excluded.reason,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        int(store.id),
+                        str(store.app_id),
+                        item.raw_text,
+                        dedupe_key,
+                        item.product_id,
+                        item.canonical_url or None,
+                        item.status.value,
+                        item.reason,
+                        now,
+                        now,
+                    ),
+                )
+        return {
+            "saved": len(preview.items),
+            "duplicates": preview.duplicate_count,
+            "ready": preview.ready_count,
+            "pending": preview.pending_count,
+            "invalid": preview.invalid_count,
+        }
+
+    def list_import_items(
+        self,
+        store_id: int,
+        *,
+        status: str = "",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT * FROM dongxiao_product_imports
+            WHERE store_id=?
+        """
+        args: list[Any] = [int(store_id)]
+        if status:
+            sql += " AND status=?"
+            args.append(str(status))
+        sql += " ORDER BY created_at DESC, import_id DESC LIMIT ?"
+        args.append(max(1, min(5000, int(limit))))
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [dict(row) for row in rows]
+
     def upsert_sku(self, sku: Sku) -> Sku:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -199,8 +472,9 @@ class DongxiaoRepository:
                 INSERT INTO dongxiao_skus(
                     store_id, store_app_id, product_id, sku_id, specs_json,
                     price_cents, stock, available, purchase_min, purchase_max,
-                    is_default, observed_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_default, observed_at, created_at, updated_at,
+                    data_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(store_app_id, product_id, sku_id) DO UPDATE SET
                     store_id=excluded.store_id,
                     specs_json=excluded.specs_json,
@@ -211,7 +485,8 @@ class DongxiaoRepository:
                     purchase_max=excluded.purchase_max,
                     is_default=excluded.is_default,
                     observed_at=excluded.observed_at,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    data_complete=excluded.data_complete
                 """,
                 (
                     sku.store_id,
@@ -228,12 +503,204 @@ class DongxiaoRepository:
                     to_utc_iso(sku.observed_at),
                     now,
                     now,
+                    1 if sku.data_complete else 0,
                 ),
             )
         saved = self.get_sku(sku.store_id, sku.product_id, sku.sku_id)
         if saved is None:
             raise RepositoryError("SKU 保存后无法读取")
         return saved
+
+    def upsert_catalog_items(
+        self,
+        items: list[CatalogProductData],
+    ) -> int:
+        if not items:
+            return 0
+        now = to_utc_iso(datetime.now(UTC))
+        product_rows: list[tuple[Any, ...]] = []
+        sku_rows: list[tuple[Any, ...]] = []
+        snapshot_rows: list[tuple[Any, ...]] = []
+        stores: set[tuple[int, str]] = set()
+        for item in items:
+            product = item.product
+            stores.add((product.store_id, product.store_app_id))
+            product_rows.append(
+                (
+                    product.store_id,
+                    product.store_app_id,
+                    product.product_id,
+                    product.title,
+                    product.state.value,
+                    product.min_price_cents,
+                    product.stock_total,
+                    to_utc_iso(product.observed_at),
+                    now,
+                    now,
+                    product.sales_count,
+                    (
+                        product.sales_source.value
+                        if product.sales_source is not None
+                        else None
+                    ),
+                    (
+                        to_utc_iso(product.listing_time)
+                        if product.listing_time is not None
+                        else None
+                    ),
+                    (
+                        product.listing_source.value
+                        if product.listing_source is not None
+                        else None
+                    ),
+                    product.data_source.value,
+                    1 if product.from_cache else 0,
+                    (
+                        to_utc_iso(product.last_synced_at)
+                        if product.last_synced_at is not None
+                        else None
+                    ),
+                )
+            )
+            snapshot_rows.append(
+                (
+                    uuid.uuid4().hex,
+                    product.store_id,
+                    product.store_app_id,
+                    product.product_id,
+                    "",
+                    product.title,
+                    product.min_price_cents,
+                    product.stock_total,
+                    1 if product.state is ProductState.ACTIVE else 0,
+                    product.data_source.value,
+                    _json(
+                        {
+                            "data_source": product.data_source.value,
+                            "from_cache": product.from_cache,
+                            "sales_available": product.sales_count is not None,
+                            "listing_available": product.listing_time is not None,
+                        }
+                    ),
+                    to_utc_iso(product.observed_at),
+                )
+            )
+            for sku in item.skus:
+                ensure_same_store(
+                    product.store_id,
+                    sku.store_id,
+                    label="SKU",
+                )
+                if sku.store_app_id != product.store_app_id:
+                    raise StoreIsolationError("SKU 与商品店铺不一致")
+                if sku.product_id != product.product_id:
+                    raise StoreIsolationError("SKU 与商品 ID 不一致")
+                sku_rows.append(
+                    (
+                        sku.store_id,
+                        sku.store_app_id,
+                        sku.product_id,
+                        sku.sku_id,
+                        _json(sku.specs),
+                        sku.price_cents,
+                        sku.stock,
+                        1 if sku.available else 0,
+                        sku.purchase_min,
+                        sku.purchase_max,
+                        1 if sku.is_default else 0,
+                        to_utc_iso(sku.observed_at),
+                        now,
+                        now,
+                        1 if sku.data_complete else 0,
+                    )
+                )
+                snapshot_rows.append(
+                    (
+                        uuid.uuid4().hex,
+                        sku.store_id,
+                        sku.store_app_id,
+                        sku.product_id,
+                        sku.sku_id,
+                        product.title,
+                        sku.price_cents,
+                        sku.stock,
+                        1 if sku.available else 0,
+                        product.data_source.value,
+                        _json(
+                            {
+                                "data_source": product.data_source.value,
+                                "data_complete": sku.data_complete,
+                            }
+                        ),
+                        to_utc_iso(sku.observed_at),
+                    )
+                )
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for store_id, store_app_id in stores:
+                self._ensure_store(conn, store_id, store_app_id)
+            conn.executemany(
+                """
+                INSERT INTO dongxiao_products(
+                    store_id, store_app_id, product_id, title, state,
+                    min_price_cents, stock_total, observed_at,
+                    created_at, updated_at, sales_count, sales_source,
+                    listing_time, listing_source, data_source,
+                    from_cache, last_synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_app_id, product_id) DO UPDATE SET
+                    store_id=excluded.store_id,
+                    title=excluded.title,
+                    state=excluded.state,
+                    min_price_cents=excluded.min_price_cents,
+                    stock_total=excluded.stock_total,
+                    observed_at=excluded.observed_at,
+                    updated_at=excluded.updated_at,
+                    sales_count=excluded.sales_count,
+                    sales_source=excluded.sales_source,
+                    listing_time=excluded.listing_time,
+                    listing_source=excluded.listing_source,
+                    data_source=excluded.data_source,
+                    from_cache=excluded.from_cache,
+                    last_synced_at=excluded.last_synced_at
+                """,
+                product_rows,
+            )
+            conn.executemany(
+                """
+                INSERT INTO dongxiao_skus(
+                    store_id, store_app_id, product_id, sku_id, specs_json,
+                    price_cents, stock, available, purchase_min, purchase_max,
+                    is_default, observed_at, created_at, updated_at,
+                    data_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_app_id, product_id, sku_id) DO UPDATE SET
+                    store_id=excluded.store_id,
+                    specs_json=excluded.specs_json,
+                    price_cents=excluded.price_cents,
+                    stock=excluded.stock,
+                    available=excluded.available,
+                    purchase_min=excluded.purchase_min,
+                    purchase_max=excluded.purchase_max,
+                    is_default=excluded.is_default,
+                    observed_at=excluded.observed_at,
+                    updated_at=excluded.updated_at,
+                    data_complete=excluded.data_complete
+                """,
+                sku_rows,
+            )
+            conn.executemany(
+                """
+                INSERT INTO dongxiao_product_snapshots(
+                    snapshot_id, store_id, store_app_id, product_id, sku_id,
+                    title, price_cents, stock, available, source,
+                    details_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                snapshot_rows,
+            )
+        return len(product_rows)
 
     def get_sku(
         self,
@@ -312,8 +779,9 @@ class DongxiaoRepository:
                 """
                 INSERT INTO dongxiao_product_pools(
                     pool_id, store_id, store_app_id, name, status,
-                    idempotency_key, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    idempotency_key, created_at, updated_at, group_name,
+                    copied_from_pool_id, version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pool.pool_id,
@@ -324,7 +792,21 @@ class DongxiaoRepository:
                     pool.idempotency_key,
                     to_utc_iso(pool.created_at),
                     to_utc_iso(pool.updated_at),
+                    pool.group_name,
+                    pool.copied_from_pool_id or None,
+                    pool.version,
                 ),
+            )
+            self._append_pool_event(
+                conn,
+                pool_id=pool.pool_id,
+                store_id=pool.store_id,
+                store_app_id=pool.store_app_id,
+                action="pool_created",
+                detail={
+                    "name": pool.name,
+                    "group_name": pool.group_name,
+                },
             )
         return pool, True
 
@@ -348,6 +830,474 @@ class DongxiaoRepository:
                     item.sku_id,
                     item.position,
                     to_utc_iso(item.created_at),
+                ),
+            )
+            self._append_pool_event(
+                conn,
+                pool_id=item.pool_id,
+                store_id=item.store_id,
+                store_app_id=item.store_app_id,
+                action="item_added",
+                product_id=item.product_id,
+                sku_id=item.sku_id,
+            )
+
+    def get_pool(
+        self,
+        pool_id: str,
+        *,
+        store_id: int,
+    ) -> ProductPool | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM dongxiao_product_pools
+                WHERE pool_id=? AND store_id=?
+                """,
+                (str(pool_id), int(store_id)),
+            ).fetchone()
+        return self._pool_from_row(row) if row else None
+
+    def list_pools(self, store_id: int) -> list[ProductPool]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dongxiao_product_pools
+                WHERE store_id=?
+                ORDER BY group_name COLLATE NOCASE, name COLLATE NOCASE,
+                         updated_at DESC
+                """,
+                (int(store_id),),
+            ).fetchall()
+        return [self._pool_from_row(row) for row in rows]
+
+    def rename_pool(
+        self,
+        pool_id: str,
+        *,
+        store_id: int,
+        store_app_id: str,
+        name: str,
+        group_name: str,
+    ) -> ProductPool:
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise ValueError("商品池名称不能为空")
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, store_id, store_app_id)
+            cursor = conn.execute(
+                """
+                UPDATE dongxiao_product_pools
+                SET name=?, group_name=?, version=version+1, updated_at=?
+                WHERE pool_id=? AND store_id=? AND store_app_id=?
+                """,
+                (
+                    normalized_name,
+                    str(group_name or "").strip()[:200],
+                    now,
+                    str(pool_id),
+                    int(store_id),
+                    str(store_app_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise EntityNotFound("商品池不存在")
+            self._append_pool_event(
+                conn,
+                pool_id=pool_id,
+                store_id=store_id,
+                store_app_id=store_app_id,
+                action="pool_renamed",
+                detail={
+                    "name": normalized_name,
+                    "group_name": str(group_name or "").strip()[:200],
+                },
+            )
+        pool = self.get_pool(pool_id, store_id=store_id)
+        if pool is None:
+            raise RepositoryError("商品池更新后无法读取")
+        return pool
+
+    def add_pool_products(
+        self,
+        pool_id: str,
+        *,
+        store_id: int,
+        store_app_id: str,
+        products: list[tuple[str, str]],
+    ) -> dict[str, int]:
+        now = to_utc_iso(datetime.now(UTC))
+        added = 0
+        skipped = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, store_id, store_app_id)
+            pool = conn.execute(
+                """
+                SELECT 1 FROM dongxiao_product_pools
+                WHERE pool_id=? AND store_id=? AND store_app_id=?
+                """,
+                (str(pool_id), int(store_id), str(store_app_id)),
+            ).fetchone()
+            if pool is None:
+                raise EntityNotFound("商品池不存在")
+            for raw_product_id, raw_sku_id in products:
+                product_id = str(raw_product_id or "").strip()
+                sku_id = str(raw_sku_id or "").strip()
+                if not product_id:
+                    skipped += 1
+                    continue
+                exists = conn.execute(
+                    """
+                    SELECT 1 FROM dongxiao_products
+                    WHERE store_id=? AND store_app_id=? AND product_id=?
+                    """,
+                    (int(store_id), str(store_app_id), product_id),
+                ).fetchone()
+                if exists is None:
+                    skipped += 1
+                    continue
+                if sku_id:
+                    sku_exists = conn.execute(
+                        """
+                        SELECT 1 FROM dongxiao_skus
+                        WHERE store_id=? AND store_app_id=?
+                          AND product_id=? AND sku_id=?
+                        """,
+                        (
+                            int(store_id),
+                            str(store_app_id),
+                            product_id,
+                            sku_id,
+                        ),
+                    ).fetchone()
+                    if sku_exists is None:
+                        skipped += 1
+                        continue
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO dongxiao_product_pool_items(
+                        item_id, pool_id, store_id, store_app_id, product_id,
+                        sku_id, position, created_at
+                    )
+                    SELECT ?, ?, ?, ?, ?, ?,
+                           COALESCE(MAX(position), -1) + 1, ?
+                    FROM dongxiao_product_pool_items
+                    WHERE pool_id=?
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        str(pool_id),
+                        int(store_id),
+                        str(store_app_id),
+                        product_id,
+                        sku_id,
+                        now,
+                        str(pool_id),
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    added += 1
+                    self._append_pool_event(
+                        conn,
+                        pool_id=pool_id,
+                        store_id=store_id,
+                        store_app_id=store_app_id,
+                        action="item_added",
+                        product_id=product_id,
+                        sku_id=sku_id,
+                    )
+                else:
+                    skipped += 1
+        return {"added": added, "skipped": skipped}
+
+    def remove_pool_item(
+        self,
+        pool_id: str,
+        item_id: str,
+        *,
+        store_id: int,
+        store_app_id: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, store_id, store_app_id)
+            row = conn.execute(
+                """
+                SELECT product_id, sku_id
+                FROM dongxiao_product_pool_items
+                WHERE item_id=? AND pool_id=? AND store_id=? AND store_app_id=?
+                """,
+                (
+                    str(item_id),
+                    str(pool_id),
+                    int(store_id),
+                    str(store_app_id),
+                ),
+            ).fetchone()
+            if row is None:
+                raise EntityNotFound("商品池明细不存在")
+            conn.execute(
+                """
+                DELETE FROM dongxiao_product_pool_items
+                WHERE item_id=? AND pool_id=? AND store_id=? AND store_app_id=?
+                """,
+                (
+                    str(item_id),
+                    str(pool_id),
+                    int(store_id),
+                    str(store_app_id),
+                ),
+            )
+            self._append_pool_event(
+                conn,
+                pool_id=pool_id,
+                store_id=store_id,
+                store_app_id=store_app_id,
+                action="item_removed",
+                product_id=str(row["product_id"]),
+                sku_id=str(row["sku_id"]),
+            )
+
+    def reorder_pool_items(
+        self,
+        pool_id: str,
+        item_ids: list[str],
+        *,
+        store_id: int,
+        store_app_id: str,
+    ) -> None:
+        ordered = list(dict.fromkeys(str(item).strip() for item in item_ids))
+        if not ordered or any(not item for item in ordered):
+            raise ValueError("商品池排序列表不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, store_id, store_app_id)
+            existing = {
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT item_id FROM dongxiao_product_pool_items
+                    WHERE pool_id=? AND store_id=? AND store_app_id=?
+                    """,
+                    (str(pool_id), int(store_id), str(store_app_id)),
+                ).fetchall()
+            }
+            if set(ordered) != existing:
+                raise ValueError("排序列表必须包含商品池中的全部明细")
+            conn.executemany(
+                """
+                UPDATE dongxiao_product_pool_items
+                SET position=?
+                WHERE item_id=? AND pool_id=? AND store_id=? AND store_app_id=?
+                """,
+                [
+                    (
+                        position,
+                        item_id,
+                        str(pool_id),
+                        int(store_id),
+                        str(store_app_id),
+                    )
+                    for position, item_id in enumerate(ordered)
+                ],
+            )
+            self._append_pool_event(
+                conn,
+                pool_id=pool_id,
+                store_id=store_id,
+                store_app_id=store_app_id,
+                action="items_reordered",
+                detail={"item_ids": ordered},
+            )
+
+    def list_pool_items(
+        self,
+        pool_id: str,
+        *,
+        store_id: int,
+        store_app_id: str,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            self._ensure_store(conn, store_id, store_app_id)
+            rows = conn.execute(
+                """
+                SELECT item_id, pool_id, product_id, sku_id, position,
+                       created_at
+                FROM dongxiao_product_pool_items
+                WHERE pool_id=? AND store_id=? AND store_app_id=?
+                ORDER BY position, item_id
+                """,
+                (str(pool_id), int(store_id), str(store_app_id)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def copy_pool(
+        self,
+        source_pool_id: str,
+        *,
+        new_pool_id: str,
+        store_id: int,
+        store_app_id: str,
+        new_name: str,
+        group_name: str = "",
+    ) -> ProductPool:
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(conn, store_id, store_app_id)
+            source = conn.execute(
+                """
+                SELECT * FROM dongxiao_product_pools
+                WHERE pool_id=? AND store_id=? AND store_app_id=?
+                """,
+                (str(source_pool_id), int(store_id), str(store_app_id)),
+            ).fetchone()
+            if source is None:
+                raise EntityNotFound("源商品池不存在")
+            normalized_name = str(new_name or "").strip()
+            if not normalized_name:
+                raise ValueError("新商品池名称不能为空")
+            conn.execute(
+                """
+                INSERT INTO dongxiao_product_pools(
+                    pool_id, store_id, store_app_id, name, status,
+                    idempotency_key, created_at, updated_at, group_name,
+                    copied_from_pool_id, version
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    str(new_pool_id),
+                    int(store_id),
+                    str(store_app_id),
+                    normalized_name,
+                    f"copy:{uuid.uuid4().hex}",
+                    now,
+                    now,
+                    str(group_name or "").strip()[:200],
+                    str(source_pool_id),
+                ),
+            )
+            items = conn.execute(
+                """
+                SELECT product_id, sku_id, position
+                FROM dongxiao_product_pool_items
+                WHERE pool_id=? AND store_id=? AND store_app_id=?
+                ORDER BY position, item_id
+                """,
+                (str(source_pool_id), int(store_id), str(store_app_id)),
+            ).fetchall()
+            conn.executemany(
+                """
+                INSERT INTO dongxiao_product_pool_items(
+                    item_id, pool_id, store_id, store_app_id, product_id,
+                    sku_id, position, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        uuid.uuid4().hex,
+                        str(new_pool_id),
+                        int(store_id),
+                        str(store_app_id),
+                        str(row["product_id"]),
+                        str(row["sku_id"]),
+                        int(row["position"]),
+                        now,
+                    )
+                    for row in items
+                ],
+            )
+            self._append_pool_event(
+                conn,
+                pool_id=new_pool_id,
+                store_id=store_id,
+                store_app_id=store_app_id,
+                action="pool_copied",
+                detail={"source_pool_id": source_pool_id},
+            )
+        pool = self.get_pool(new_pool_id, store_id=store_id)
+        if pool is None:
+            raise RepositoryError("复制后的商品池无法读取")
+        return pool
+
+    def pool_stats(
+        self,
+        pool_id: str,
+        *,
+        store_id: int,
+        store_app_id: str,
+    ) -> dict[str, int]:
+        with self.connect() as conn:
+            self._ensure_store(conn, store_id, store_app_id)
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS item_count,
+                    COUNT(DISTINCT product_id) AS product_count,
+                    SUM(
+                        CASE WHEN length(trim(sku_id)) > 0 THEN 1 ELSE 0 END
+                    ) AS sku_level_count,
+                    SUM(
+                        CASE WHEN length(trim(sku_id)) = 0 THEN 1 ELSE 0 END
+                    ) AS product_level_count
+                FROM dongxiao_product_pool_items
+                WHERE pool_id=? AND store_id=? AND store_app_id=?
+                """,
+                (str(pool_id), int(store_id), str(store_app_id)),
+            ).fetchone()
+        assert row is not None
+        return {
+            "item_count": int(row["item_count"] or 0),
+            "product_count": int(row["product_count"] or 0),
+            "sku_level_count": int(row["sku_level_count"] or 0),
+            "product_level_count": int(row["product_level_count"] or 0),
+        }
+
+    def list_pool_events(
+        self,
+        pool_id: str,
+        *,
+        store_id: int,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dongxiao_product_pool_events
+                WHERE pool_id=? AND store_id=?
+                ORDER BY created_at DESC, event_id DESC
+                """,
+                (str(pool_id), int(store_id)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def append_pool_event(self, event: ProductPoolEvent) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_store(
+                conn,
+                event.store_id,
+                event.store_app_id,
+            )
+            conn.execute(
+                """
+                INSERT INTO dongxiao_product_pool_events(
+                    event_id, pool_id, store_id, store_app_id, action,
+                    product_id, sku_id, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_id,
+                    event.pool_id,
+                    event.store_id,
+                    event.store_app_id,
+                    event.action,
+                    event.product_id,
+                    event.sku_id,
+                    _json(event.detail),
+                    to_utc_iso(event.created_at),
                 ),
             )
 
@@ -447,6 +1397,7 @@ class DongxiaoRepository:
         event: TaskEvent | str,
         actor_id: str = "",
         reason: str = "",
+        remote_result_verified: bool = False,
     ) -> Task:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -467,7 +1418,11 @@ class DongxiaoRepository:
             )
             if str(row["store_app_id"]) != str(store_app_id):
                 raise StoreIsolationError("任务不属于当前店铺")
-            target = transition_task(str(row["status"]), event)
+            target = transition_task(
+                str(row["status"]),
+                event,
+                remote_result_verified=remote_result_verified,
+            )
             now = to_utc_iso(datetime.now(UTC))
             conn.execute(
                 """
@@ -813,6 +1768,38 @@ class DongxiaoRepository:
         )
 
     @staticmethod
+    def _append_pool_event(
+        conn: sqlite3.Connection,
+        *,
+        pool_id: str,
+        store_id: int,
+        store_app_id: str,
+        action: str,
+        product_id: str = "",
+        sku_id: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO dongxiao_product_pool_events(
+                event_id, pool_id, store_id, store_app_id, action,
+                product_id, sku_id, detail_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                str(pool_id),
+                int(store_id),
+                str(store_app_id),
+                str(action),
+                str(product_id or ""),
+                str(sku_id or ""),
+                _json(detail or {}),
+                to_utc_iso(datetime.now(UTC)),
+            ),
+        )
+
+    @staticmethod
     def _get_task_in_connection(
         conn: sqlite3.Connection,
         task_id: str,
@@ -838,6 +1825,33 @@ class DongxiaoRepository:
             min_price_cents=int(row["min_price_cents"]),
             stock_total=int(row["stock_total"]),
             observed_at=parse_utc_iso(row["observed_at"]),
+            sales_count=(
+                int(row["sales_count"])
+                if row["sales_count"] is not None
+                else None
+            ),
+            sales_source=(
+                DataSource(row["sales_source"])
+                if row["sales_source"]
+                else None
+            ),
+            listing_time=(
+                parse_utc_iso(row["listing_time"])
+                if row["listing_time"]
+                else None
+            ),
+            listing_source=(
+                DataSource(row["listing_source"])
+                if row["listing_source"]
+                else None
+            ),
+            data_source=DataSource(row["data_source"]),
+            from_cache=bool(row["from_cache"]),
+            last_synced_at=(
+                parse_utc_iso(row["last_synced_at"])
+                if row["last_synced_at"]
+                else None
+            ),
         )
 
     @staticmethod
@@ -864,6 +1878,7 @@ class DongxiaoRepository:
             ),
             is_default=bool(row["is_default"]),
             observed_at=parse_utc_iso(row["observed_at"]),
+            data_complete=bool(row["data_complete"]),
         )
 
     @staticmethod
@@ -877,6 +1892,9 @@ class DongxiaoRepository:
             idempotency_key=str(row["idempotency_key"]),
             created_at=parse_utc_iso(row["created_at"]),
             updated_at=parse_utc_iso(row["updated_at"]),
+            group_name=str(row["group_name"] or ""),
+            copied_from_pool_id=str(row["copied_from_pool_id"] or ""),
+            version=int(row["version"] or 1),
         )
 
     @staticmethod

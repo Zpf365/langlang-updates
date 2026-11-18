@@ -9,6 +9,7 @@ from .enums import (
     ApprovalStatus,
     ApprovalSubjectType,
     AuditResult,
+    DataSource,
     OrderStatus,
     OrderVerificationSource,
     ProductPoolStatus,
@@ -77,6 +78,13 @@ class Product:
     min_price_cents: int
     stock_total: int
     observed_at: datetime
+    sales_count: int | None = None
+    sales_source: DataSource | None = None
+    listing_time: datetime | None = None
+    listing_source: DataSource | None = None
+    data_source: DataSource = DataSource.UNKNOWN
+    from_cache: bool = False
+    last_synced_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_id", _store_id(self.store_id))
@@ -107,6 +115,56 @@ class Product:
             "observed_at",
             ensure_utc(self.observed_at, field="商品观测时间"),
         )
+        if self.sales_count is not None:
+            object.__setattr__(
+                self,
+                "sales_count",
+                _quantity(self.sales_count, "商品销量"),
+            )
+            if self.sales_source is None:
+                raise ValueError("商品销量必须记录数据来源")
+        if self.sales_source is not None:
+            object.__setattr__(
+                self,
+                "sales_source",
+                DataSource(self.sales_source),
+            )
+        if self.listing_time is not None:
+            object.__setattr__(
+                self,
+                "listing_time",
+                ensure_utc(self.listing_time, field="商品上架时间"),
+            )
+            if self.listing_source is None:
+                raise ValueError("商品上架时间必须记录数据来源")
+        if self.listing_source is not None:
+            object.__setattr__(
+                self,
+                "listing_source",
+                DataSource(self.listing_source),
+            )
+        object.__setattr__(self, "data_source", DataSource(self.data_source))
+        object.__setattr__(self, "from_cache", bool(self.from_cache))
+        synced_at = self.last_synced_at or self.observed_at
+        object.__setattr__(
+            self,
+            "last_synced_at",
+            ensure_utc(synced_at, field="商品最后同步时间"),
+        )
+
+    @property
+    def trusted_sales(self) -> bool:
+        return (
+            self.sales_count is not None
+            and self.sales_source is DataSource.OFFICIAL_API
+        )
+
+    @property
+    def trusted_listing_time(self) -> bool:
+        return (
+            self.listing_time is not None
+            and self.listing_source is DataSource.OFFICIAL_API
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +181,7 @@ class Sku:
     purchase_max: int | None = None
     is_default: bool = False
     observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    data_complete: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "store_id", _store_id(self.store_id))
@@ -138,15 +197,19 @@ class Sku:
         )
         object.__setattr__(self, "sku_id", _required_text(self.sku_id, "SKU ID"))
         object.__setattr__(self, "specs", _specs(self.specs))
-        object.__setattr__(
-            self,
-            "price_cents",
-            validate_money_cents(
+        object.__setattr__(self, "data_complete", bool(self.data_complete))
+        if self.data_complete:
+            price = validate_money_cents(
                 self.price_cents,
                 field="SKU 价格",
                 allow_zero=False,
-            ),
-        )
+            )
+        else:
+            price = validate_money_cents(
+                self.price_cents,
+                field="SKU 价格",
+            )
+        object.__setattr__(self, "price_cents", price)
         object.__setattr__(self, "stock", _quantity(self.stock, "SKU 库存"))
         object.__setattr__(self, "available", bool(self.available))
         minimum = _quantity(
@@ -221,6 +284,9 @@ class ProductPool:
     idempotency_key: str
     created_at: datetime
     updated_at: datetime
+    group_name: str = ""
+    copied_from_pool_id: str = ""
+    version: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "pool_id", _required_text(self.pool_id, "商品池 ID"))
@@ -239,6 +305,21 @@ class ProductPool:
             raise ValueError("商品池更新时间不能早于创建时间")
         object.__setattr__(self, "created_at", created)
         object.__setattr__(self, "updated_at", updated)
+        object.__setattr__(
+            self,
+            "group_name",
+            str(self.group_name or "").strip()[:200],
+        )
+        object.__setattr__(
+            self,
+            "copied_from_pool_id",
+            str(self.copied_from_pool_id or "").strip(),
+        )
+        object.__setattr__(
+            self,
+            "version",
+            _quantity(self.version, "商品池版本", allow_zero=False),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +346,34 @@ class ProductPoolItem:
             "created_at",
             ensure_utc(self.created_at, field="商品池明细创建时间"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductPoolEvent:
+    event_id: str
+    pool_id: str
+    store_id: int
+    store_app_id: str
+    action: str
+    created_at: datetime
+    product_id: str = ""
+    sku_id: str = ""
+    detail: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "event_id", _required_text(self.event_id, "商品池事件 ID"))
+        object.__setattr__(self, "pool_id", _required_text(self.pool_id, "商品池 ID"))
+        object.__setattr__(self, "store_id", _store_id(self.store_id))
+        object.__setattr__(self, "store_app_id", _required_text(self.store_app_id, "店铺 AppID"))
+        object.__setattr__(self, "action", _required_text(self.action, "商品池动作"))
+        object.__setattr__(
+            self,
+            "created_at",
+            ensure_utc(self.created_at, field="商品池事件时间"),
+        )
+        object.__setattr__(self, "product_id", str(self.product_id or "").strip())
+        object.__setattr__(self, "sku_id", str(self.sku_id or "").strip())
+        object.__setattr__(self, "detail", sanitize_audit_detail(dict(self.detail)))
 
 
 @dataclass(frozen=True, slots=True)

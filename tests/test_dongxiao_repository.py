@@ -41,6 +41,9 @@ from weimi_manager.dongxiao.domain.rules import (
     StoreIsolationError,
     require_permission,
 )
+from weimi_manager.dongxiao.domain.state_machine import (
+    UnknownResultRequiresVerification,
+)
 from weimi_manager.dongxiao.infrastructure.repository import (
     DongxiaoRepository,
     EntityNotFound,
@@ -121,6 +124,52 @@ def test_task_creation_is_idempotent_and_rejects_conflicting_request(
                 now=now,
             )
         )
+
+
+def test_unknown_task_requires_remote_verification_before_recovery(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "unknown.db")
+    store = _store(db, "未知任务店铺", "wx-unknown-task")
+    repo = DongxiaoRepository(db.path)
+    now = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
+    task, _ = repo.create_task(
+        _task(
+            task_id="unknown-task",
+            store=store,
+            idempotency_key="unknown-idem",
+            request_id="unknown-request",
+            now=now,
+        )
+    )
+    for event in ("start_preparing", "start_running", "mark_unknown"):
+        task = repo.transition_task(
+            task.task_id,
+            store_id=store.id,
+            store_app_id=store.app_id,
+            event=event,
+        )
+    assert task.status is TaskStatus.UNKNOWN
+
+    with pytest.raises(UnknownResultRequiresVerification):
+        repo.transition_task(
+            task.task_id,
+            store_id=store.id,
+            store_app_id=store.app_id,
+            event="recover_unknown",
+        )
+    unchanged = repo.get_task(task.task_id, store_app_id=store.app_id)
+    assert unchanged is not None
+    assert unchanged.status is TaskStatus.UNKNOWN
+
+    recovered = repo.transition_task(
+        task.task_id,
+        store_id=store.id,
+        store_app_id=store.app_id,
+        event="recover_unknown",
+        remote_result_verified=True,
+    )
+    assert recovered.status is TaskStatus.PREPARING
 
 
 def test_repository_enforces_product_task_and_store_isolation(

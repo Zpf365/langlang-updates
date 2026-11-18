@@ -9,9 +9,24 @@ class ProductState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DataSource(StrEnum):
+    OFFICIAL_API = "official_api"
+    WEB_BACKEND = "web_backend"
+    LOCAL_CACHE = "local_cache"
+    MOCK = "mock"
+    UNKNOWN = "unknown"
+
+
 class ProductPoolStatus(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
+
+
+class ProductImportStatus(StrEnum):
+    READY = "ready"
+    PENDING_RESOLUTION = "pending_resolution"
+    INVALID = "invalid"
+    DUPLICATE = "duplicate"
 
 
 class TaskStatus(StrEnum):

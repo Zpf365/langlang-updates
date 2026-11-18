@@ -16,7 +16,9 @@ from weimi_manager.dongxiao.domain.models import (
 )
 from weimi_manager.dongxiao.domain.rules import (
     SkuSelectionFailure,
+    SkuSelectionMode,
     normalize_product_ids,
+    parse_yuan_to_cents,
     select_sku,
     validate_money_cents,
 )
@@ -47,6 +49,9 @@ def test_money_validation_uses_integer_cents_and_bounds() -> None:
             validate_money_cents(invalid)
     with pytest.raises(ValueError):
         validate_money_cents(1_000_000_000_000)
+    assert parse_yuan_to_cents("12.34") == 1234
+    with pytest.raises(ValueError):
+        parse_yuan_to_cents("1.234")
 
 
 def test_product_sku_and_real_order_validate_store_and_trust() -> None:
@@ -172,6 +177,28 @@ def test_sku_selection_checks_stock_price_and_limits() -> None:
         purchase_max=2,
         observed_at=observed_at,
     )
+    default_sku = Sku(
+        store_id=11,
+        store_app_id="wx-store-11",
+        product_id="prod-1",
+        sku_id="sku-default",
+        price_cents=550,
+        stock=10,
+        available=True,
+        is_default=True,
+        observed_at=observed_at,
+    )
+    incomplete = Sku(
+        store_id=11,
+        store_app_id="wx-store-11",
+        product_id="prod-1",
+        sku_id="sku-incomplete",
+        price_cents=0,
+        stock=0,
+        available=True,
+        observed_at=observed_at,
+        data_complete=False,
+    )
 
     assert select_sku(
         store_id=11,
@@ -242,3 +269,47 @@ def test_sku_selection_checks_stock_price_and_limits() -> None:
             candidates=(available,),
             quantity=0,
         )
+
+    assert select_sku(
+        store_id=11,
+        product_id="prod-1",
+        candidates=(higher_stock, available),
+        quantity=1,
+        expected_price_cents=None,
+        mode=SkuSelectionMode.LOWEST_PRICE,
+    ).selected == available
+    assert select_sku(
+        store_id=11,
+        product_id="prod-1",
+        candidates=(higher_stock, available),
+        quantity=1,
+        mode=SkuSelectionMode.HIGHEST_PRICE,
+    ).selected == higher_stock
+    assert select_sku(
+        store_id=11,
+        product_id="prod-1",
+        candidates=(higher_stock, default_sku),
+        quantity=1,
+        mode=SkuSelectionMode.PRODUCT_DEFAULT,
+    ).selected == default_sku
+    assert select_sku(
+        store_id=11,
+        product_id="prod-1",
+        candidates=(higher_stock,),
+        quantity=1,
+        mode=SkuSelectionMode.SPECIFIED,
+        specified_sku_id="sku-missing",
+    ).failure is SkuSelectionFailure.SPECIFIED_NOT_FOUND
+    assert select_sku(
+        store_id=11,
+        product_id="prod-1",
+        candidates=(incomplete,),
+        quantity=1,
+    ).failure is SkuSelectionFailure.INCOMPLETE_DATA
+    assert select_sku(
+        store_id=11,
+        product_id="prod-1",
+        candidates=(available,),
+        quantity=1,
+        product_state=ProductState.INACTIVE,
+    ).failure is SkuSelectionFailure.PRODUCT_INACTIVE

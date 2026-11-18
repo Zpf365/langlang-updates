@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from weimi_manager.config import AppPaths
+from weimi_manager.dongxiao.domain.catalog import CatalogSyncResult
+from weimi_manager.dongxiao.domain.enums import DataSource
 from weimi_manager.ui.app import MainWindow
 from weimi_manager.ui.dongxiao_page import DongxiaoPage
 
@@ -34,6 +38,7 @@ def test_formal_sales_related_route_opens_dongxiao_center(
             "店铺连接",
             "商品池",
             "商品筛选",
+            "SKU 规则",
             "任务中心",
             "真实订单",
             "售后工单",
@@ -43,6 +48,74 @@ def test_formal_sales_related_route_opens_dongxiao_center(
         page.section_buttons["tasks"].invoke()
         window.update_idletasks()
         assert page.section_title_var.get() == "任务中心"
+
+        assert page.store_combo.winfo_exists()
+        assert page.product_tree.winfo_exists()
+        assert str(page.product_tree.cget("selectmode")) == "extended"
+        assert set(page.product_tree["columns"]) == {
+            "product_id",
+            "title",
+            "state",
+            "price",
+            "stock",
+            "sales",
+            "listed",
+            "source",
+            "synced_at",
+        }
+        assert page.sync_products_button.cget("text") == "同步商品"
+        assert page.apply_filter_button.cget("text") == "应用筛选"
+        assert page.import_products_button.cget("text") == "批量导入"
+        assert page.pool_combo.winfo_exists()
+
+        store_id = window.base_db.add_store(
+            "动销界面测试店铺",
+            "wx-dongxiao-ui-test",
+            "x" * 32,
+        )
+        store = window.base_db.get_store(store_id)
+        assert store is not None
+        page._stores = [store]
+        page.store_var.set(f"{store.name} · {store.app_id}")
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingCatalogService:
+            @staticmethod
+            def sync_store(_store, **_kwargs):
+                started.set()
+                release.wait(2)
+                return CatalogSyncResult(
+                    store_id=store.id,
+                    discovered=0,
+                    products_saved=0,
+                    failed=0,
+                    source=DataSource.MOCK,
+                    last_synced_at="2026-11-18T10:00:00+00:00",
+                )
+
+        page.official_catalog_service = BlockingCatalogService()
+        page._load_products = lambda: None
+        with mock.patch(
+            "weimi_manager.ui.dongxiao_page.messagebox.showinfo"
+        ):
+            page._sync_products()
+            assert started.wait(1)
+            page._sync_products()
+            assert str(page.sync_products_button["state"]) == "disabled"
+            window.show_page("stores")
+            window.update_idletasks()
+            release.set()
+            deadline = time.monotonic() + 3
+            scope = f"dongxiao:sync-products:{store.id}"
+            while (
+                window.has_running_task(scope)
+                and time.monotonic() < deadline
+            ):
+                window.update()
+                time.sleep(0.01)
+        assert window._active_page == "stores"
+        assert not window.has_running_task(scope)
     finally:
         window.destroy()
 

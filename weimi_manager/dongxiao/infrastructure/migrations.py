@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -11,8 +12,10 @@ from ..domain.enums import (
     ApprovalStatus,
     ApprovalSubjectType,
     AuditResult,
+    DataSource,
     OrderStatus,
     OrderVerificationSource,
+    ProductImportStatus,
     ProductPoolStatus,
     ProductState,
     TaskAttemptStatus,
@@ -20,8 +23,11 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 1
-DONGXIAO_MIGRATION_NAME = "dongxiao_core_v1"
+DONGXIAO_MIGRATION_VERSION = 2
+DONGXIAO_MIGRATION_NAME = "dongxiao_product_catalog_v2"
+DONGXIAO_V1_CHECKSUM = (
+    "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
+)
 
 
 def _values(values) -> str:
@@ -354,62 +360,332 @@ END;
 """
 
 
+def _migration_v2_sql() -> str:
+    sources = _values(
+        item.value
+        for item in (
+            DataSource.OFFICIAL_API,
+            DataSource.WEB_BACKEND,
+            DataSource.LOCAL_CACHE,
+            DataSource.MOCK,
+            DataSource.UNKNOWN,
+        )
+    )
+    import_statuses = _values(item.value for item in ProductImportStatus)
+    statements = [
+        """
+ALTER TABLE dongxiao_products
+    ADD COLUMN sales_count INTEGER
+        CHECK (sales_count IS NULL OR sales_count >= 0);
+""",
+        """
+ALTER TABLE dongxiao_products ADD COLUMN sales_source TEXT;
+""",
+        """
+ALTER TABLE dongxiao_products ADD COLUMN listing_time TEXT;
+""",
+        """
+ALTER TABLE dongxiao_products ADD COLUMN listing_source TEXT;
+""",
+        f"""
+ALTER TABLE dongxiao_products
+    ADD COLUMN data_source TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (data_source IN ({sources}));
+""",
+        """
+ALTER TABLE dongxiao_products ADD COLUMN from_cache INTEGER NOT NULL DEFAULT 0
+    CHECK (from_cache IN (0, 1));
+""",
+        """
+ALTER TABLE dongxiao_products ADD COLUMN last_synced_at TEXT;
+""",
+        """
+ALTER TABLE dongxiao_skus ADD COLUMN data_complete INTEGER NOT NULL DEFAULT 1
+    CHECK (data_complete IN (0, 1));
+""",
+        """
+ALTER TABLE dongxiao_product_pools
+    ADD COLUMN group_name TEXT NOT NULL DEFAULT '';
+""",
+        """
+ALTER TABLE dongxiao_product_pools ADD COLUMN copied_from_pool_id TEXT;
+""",
+        """
+ALTER TABLE dongxiao_product_pools
+    ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0);
+""",
+        """
+UPDATE dongxiao_products
+SET last_synced_at=observed_at
+WHERE last_synced_at IS NULL;
+""",
+        """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dongxiao_products_normalized_v2
+    ON dongxiao_products(store_app_id, trim(product_id));
+""",
+        """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dongxiao_skus_normalized_v2
+    ON dongxiao_skus(
+        store_app_id, trim(product_id), trim(COALESCE(sku_id, ''))
+    );
+""",
+        """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dongxiao_pool_items_normalized_v2
+    ON dongxiao_product_pool_items(
+        pool_id, store_app_id, trim(product_id),
+        trim(COALESCE(sku_id, ''))
+    );
+""",
+        """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dongxiao_task_items_normalized_v2
+    ON dongxiao_task_items(
+        task_id, store_app_id, trim(product_id),
+        trim(COALESCE(sku_id, ''))
+    );
+""",
+        f"""
+CREATE TABLE IF NOT EXISTS dongxiao_product_imports (
+    import_id TEXT PRIMARY KEY,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    raw_text TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    product_id TEXT,
+    canonical_url TEXT,
+    status TEXT NOT NULL CHECK (status IN ({import_statuses})),
+    reason TEXT NOT NULL DEFAULT '',
+    source_kind TEXT NOT NULL DEFAULT 'unknown',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (store_app_id, dedupe_key)
+);
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_imports_store_status
+    ON dongxiao_product_imports(store_app_id, status, created_at DESC);
+""",
+        """
+CREATE TABLE IF NOT EXISTS dongxiao_product_pool_events (
+    event_id TEXT PRIMARY KEY,
+    pool_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    product_id TEXT NOT NULL DEFAULT '',
+    sku_id TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (pool_id, store_app_id)
+        REFERENCES dongxiao_product_pools(pool_id, store_app_id)
+        ON DELETE CASCADE
+);
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_pool_events_pool
+    ON dongxiao_product_pool_events(pool_id, created_at DESC);
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_products_filter_v2
+    ON dongxiao_products(
+        store_app_id, state, min_price_cents,
+        sales_count, listing_time, product_id
+    );
+""",
+        """
+CREATE INDEX IF NOT EXISTS idx_dongxiao_products_title_v2
+    ON dongxiao_products(store_app_id, title);
+""",
+        """
+CREATE TRIGGER IF NOT EXISTS require_dongxiao_sku_business_key_insert
+BEFORE INSERT ON dongxiao_skus
+WHEN length(trim(COALESCE(NEW.product_id, ''))) = 0
+  OR length(trim(COALESCE(NEW.sku_id, ''))) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'SKU 商品 ID 和 SKU ID 不能为空');
+END;
+""",
+        """
+CREATE TRIGGER IF NOT EXISTS require_dongxiao_sku_business_key_update
+BEFORE UPDATE OF product_id, sku_id ON dongxiao_skus
+WHEN length(trim(COALESCE(NEW.product_id, ''))) = 0
+  OR length(trim(COALESCE(NEW.sku_id, ''))) = 0
+BEGIN
+    SELECT RAISE(ABORT, 'SKU 商品 ID 和 SKU ID 不能为空');
+END;
+""",
+        """
+CREATE TRIGGER IF NOT EXISTS require_dongxiao_product_key_insert
+BEFORE INSERT ON dongxiao_products
+WHEN length(trim(COALESCE(NEW.product_id, ''))) = 0
+BEGIN
+    SELECT RAISE(ABORT, '商品 ID 不能为空');
+END;
+""",
+    ]
+    for table in (
+        "dongxiao_products",
+        "dongxiao_skus",
+        "dongxiao_product_snapshots",
+        "dongxiao_product_pools",
+        "dongxiao_product_pool_items",
+        "dongxiao_tasks",
+        "dongxiao_task_items",
+        "dongxiao_task_attempts",
+        "dongxiao_order_refs",
+        "dongxiao_order_status_snapshots",
+        "dongxiao_aftersale_cases",
+        "dongxiao_approvals",
+        "dongxiao_audit_events",
+        "dongxiao_product_imports",
+        "dongxiao_product_pool_events",
+    ):
+        statements.extend(
+            (
+                f"""
+CREATE TRIGGER IF NOT EXISTS {table}_store_identity_insert_v2
+BEFORE INSERT ON {table}
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+     WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, '{table} 店铺 ID 与 AppID 不一致');
+END;
+""",
+                f"""
+CREATE TRIGGER IF NOT EXISTS {table}_store_identity_update_v2
+BEFORE UPDATE OF store_id, store_app_id ON {table}
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+     WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, '{table} 店铺 ID 与 AppID 不一致');
+END;
+""",
+            )
+        )
+    return "\n".join(statements)
+
+
+def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
+    return (
+        (1, "dongxiao_core_v1", _migration_sql),
+        (2, "dongxiao_product_catalog_v2", _migration_v2_sql),
+    )
+
+
 def migrate_dongxiao_schema(
     conn: sqlite3.Connection,
     database_path: Path,
     backup_callback: Callable[[str], Path],
 ) -> bool:
+    if conn.in_transaction:
+        raise sqlite3.OperationalError(
+            "动销中心迁移不能在已打开的事务中执行"
+        )
+
+    migrations = _migrations()
     migration_table = conn.execute(
         """
         SELECT 1 FROM sqlite_master
         WHERE type='table' AND name='dongxiao_schema_migrations'
         """
     ).fetchone()
+    applied_versions: dict[int, str] = {}
     if migration_table is not None:
-        applied = conn.execute(
+        rows = conn.execute(
             """
-            SELECT checksum FROM dongxiao_schema_migrations
-            WHERE version=?
-            """,
-            (DONGXIAO_MIGRATION_VERSION,),
-        ).fetchone()
-        if applied is not None:
-            current_checksum = hashlib.sha256(
-                _migration_sql().encode("utf-8")
-            ).hexdigest()
-            if str(applied[0]) != current_checksum:
-                raise sqlite3.IntegrityError(
-                    "已应用的动销中心迁移内容被修改"
-                )
-            _verify_required_tables(conn)
-            return False
+            SELECT version, checksum FROM dongxiao_schema_migrations
+            ORDER BY version
+            """
+        ).fetchall()
+        applied_versions = {
+            int(row[0]): str(row[1])
+            for row in rows
+        }
 
-    if database_path.exists() and database_path.stat().st_size > 0:
-        backup_callback("pre-dongxiao-v1")
-
-    sql = _migration_sql()
-    checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-    applied_at = datetime.now(UTC).isoformat(timespec="seconds")
-    try:
-        conn.executescript(
-            "BEGIN IMMEDIATE;\n"
-            + sql
-            + "\nINSERT INTO dongxiao_schema_migrations("
-            + "version, name, checksum, applied_at"
-            + f") VALUES({DONGXIAO_MIGRATION_VERSION}, "
-            + f"'{DONGXIAO_MIGRATION_NAME}', '{checksum}', '{applied_at}');"
-            + "\nCOMMIT;"
+    known_versions = {version: (name, loader) for version, name, loader in migrations}
+    unknown_versions = sorted(set(applied_versions) - set(known_versions))
+    if unknown_versions:
+        raise sqlite3.IntegrityError(
+            "数据库包含当前源码不认识的动销迁移版本："
+            + ", ".join(str(item) for item in unknown_versions)
         )
-    except Exception:
+    for version, checksum in applied_versions.items():
+        _name, loader = known_versions[version]
+        current_checksum = hashlib.sha256(
+            loader().encode("utf-8")
+        ).hexdigest()
+        if checksum != current_checksum:
+            raise sqlite3.IntegrityError(
+                f"已应用的动销中心迁移 v{version} 内容被修改"
+            )
+
+    pending = [
+        (version, name, loader)
+        for version, name, loader in migrations
+        if version not in applied_versions
+    ]
+    if not pending:
+        _verify_required_tables(conn)
+        return False
+
+    _ensure_disk_space(database_path)
+    if database_path.exists() and database_path.stat().st_size > 0:
+        backup_callback(f"pre-dongxiao-v{pending[-1][0]}")
+
+    for version, name, loader in pending:
+        sql = loader()
+        current_checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+        if version == 1 and current_checksum != DONGXIAO_V1_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v1 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
+        applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise
+            conn.executescript(
+                "BEGIN IMMEDIATE;\n"
+                + sql
+                + "\nINSERT INTO dongxiao_schema_migrations("
+                + "version, name, checksum, applied_at"
+                + f") VALUES({version}, '{name}', "
+                + f"'{current_checksum}', '{applied_at}');"
+                + "\nCOMMIT;"
+            )
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
     _verify_required_tables(conn)
     if database_path.exists() and database_path.stat().st_size <= 0:
         raise sqlite3.IntegrityError("动销中心数据库文件无效")
     return True
+
+
+def _ensure_disk_space(database_path: Path) -> None:
+    try:
+        usage = shutil.disk_usage(database_path.parent)
+    except OSError as exc:
+        raise sqlite3.OperationalError(
+            "无法确认动销中心迁移所需的磁盘空间"
+        ) from exc
+    current_size = (
+        database_path.stat().st_size
+        if database_path.exists()
+        else 0
+    )
+    minimum = 32 * 1024 * 1024
+    required = max(minimum, current_size * 2)
+    if usage.free < required:
+        raise sqlite3.OperationalError(
+            f"磁盘可用空间不足，动销迁移至少需要 {required} 字节"
+        )
 
 
 def _verify_required_tables(conn: sqlite3.Connection) -> None:
@@ -428,6 +704,8 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_aftersale_cases",
         "dongxiao_approvals",
         "dongxiao_audit_events",
+        "dongxiao_product_imports",
+        "dongxiao_product_pool_events",
     }
     tables = {
         str(row[0])
