@@ -67,3 +67,16 @@ visible_identity=""
 
 该结果证明软件没有猜测或伪造微信身份。真实扫码、账号切换和身份确认
 仍必须由用户本人在实际 Windows 微信中完成。
+
+## 最终 ZIP 独立启动
+
+从最终交付 ZIP 解压到独立目录后启动：
+
+```text
+MainWindowTitle=澜琅 · 登录 重构1.8.50
+正常关闭=通过
+```
+
+Windows 运行目录包含 Chromium、ONNX Runtime、RapidOCR、
+pywinauto/UI Automation 和 pywin32 运行依赖。正式目录
+`D:\WG\LangLang` 未在本任务中修改。
