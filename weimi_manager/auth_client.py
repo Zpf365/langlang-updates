@@ -216,6 +216,17 @@ class SupabaseAuthClient:
                     logger.exception("保存刷新后的登录会话失败")
             return refreshed
 
+    def refresh_current_session(
+        self,
+        failed_access_token: str = "",
+    ) -> SessionTokens:
+        """Refresh the bound login after an authenticated request gets 401."""
+        current = self._session_tokens
+        failed = failed_access_token or (
+            current.access_token if current is not None else ""
+        )
+        return self._refresh_bound_session(failed)
+
     def _request(
         self,
         method: str,

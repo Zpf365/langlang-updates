@@ -75,6 +75,8 @@ class DiagnosticManager:
         device_hash: str = "",
         upload_url: str = "",
         access_token: str = "",
+        access_token_provider: Callable[[], str] | None = None,
+        access_token_refresher: Callable[[str], str] | None = None,
         tester_key: str = "",
         auto_upload: bool = True,
         crash_log_path: Path | None = None,
@@ -96,6 +98,8 @@ class DiagnosticManager:
         self.device_hash = device_hash
         self.upload_url = upload_url
         self.access_token = access_token
+        self.access_token_provider = access_token_provider
+        self.access_token_refresher = access_token_refresher
         self.tester_key = tester_key
         self.auto_upload = auto_upload
         self.context_provider: Callable[[], dict[str, Any]] | None = None
@@ -124,8 +128,33 @@ class DiagnosticManager:
     def upload_ready(self) -> bool:
         """Return whether the remote receiver and a credential are configured."""
         return bool(
-            self.upload_url and (self.access_token or self.tester_key)
+            self.upload_url
+            and (self._current_access_token() or self.tester_key)
         )
+
+    def _current_access_token(self) -> str:
+        if self.access_token_provider is not None:
+            try:
+                current = str(self.access_token_provider() or "").strip()
+            except Exception:
+                current = ""
+            if current:
+                self.access_token = current
+                return current
+        return str(self.access_token or "").strip()
+
+    def _refresh_access_token(self, failed_token: str) -> str:
+        if self.access_token_refresher is None:
+            return ""
+        try:
+            current = str(
+                self.access_token_refresher(failed_token) or ""
+            ).strip()
+        except Exception:
+            return ""
+        if current:
+            self.access_token = current
+        return current
 
     @staticmethod
     def _process_metrics() -> dict[str, Any]:
@@ -433,16 +462,18 @@ class DiagnosticManager:
         return result
 
     def flush(self, timeout: float = 8.0) -> int:
-        if not self.upload_ready:
-            return 0
         uploaded = 0
+        access_token = self._current_access_token()
+        if not self.upload_url or not (access_token or self.tester_key):
+            return 0
+        refreshed = False
         for path in sorted(self.outbox.glob("*.json")):
             try:
                 report = json.loads(path.read_text(encoding="utf-8"))
                 headers = {"Content-Type": "application/json"}
-                if self.access_token:
+                if access_token:
                     headers["Authorization"] = (
-                        f"Bearer {self.access_token}"
+                        f"Bearer {access_token}"
                     )
                 if self.tester_key:
                     headers["X-LangLang-Tester-Key"] = self.tester_key
@@ -452,6 +483,30 @@ class DiagnosticManager:
                     headers=headers,
                     timeout=(4, timeout),
                 )
+                if (
+                    response.status_code == 401
+                    and not refreshed
+                    and self.access_token_refresher is not None
+                    and access_token
+                ):
+                    access_token = self._refresh_access_token(
+                        access_token
+                    )
+                    if not access_token:
+                        break
+                    refreshed = True
+                    retry_headers = dict(headers)
+                    retry_headers["Authorization"] = (
+                        f"Bearer {access_token}"
+                    )
+                    response = requests.post(
+                        self.upload_url,
+                        json={"report": report},
+                        headers=retry_headers,
+                        timeout=(4, timeout),
+                    )
+                if response.status_code == 401:
+                    break
                 response.raise_for_status()
             except (OSError, ValueError, requests.RequestException):
                 break

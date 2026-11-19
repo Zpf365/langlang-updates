@@ -29,6 +29,7 @@ SOURCE_ROOTS = (
     "tools",
     "supabase",
     "assets",
+    "buyer_miniprogram",
 )
 SOURCE_ROOT_FILES = (
     "launcher.py",
@@ -42,6 +43,10 @@ SOURCE_ROOT_FILES = (
     "BROWSER_RUNTIME_IMPLEMENTATION.md",
     "ORDER_LIST_VIRTUALIZATION_REPORT.md",
     "TUOKE_ACCOUNT_AUTH_RESEARCH_CN.md",
+    "FEATURE_REGRESSION_CHECKLIST_CN.md",
+    "PACKAGE-INSTRUCTIONS.txt",
+    "buyer_assistant.env.example",
+    "buyer_assistant.example.json",
     "update_manifest.json",
 )
 SOURCE_EXCLUDED_NAMES = {
@@ -119,6 +124,7 @@ def source_files() -> list[Path]:
     )
     for pattern in (
         "HANDOFF_*.md",
+        "DONGXIAO_*.md",
         "MODIFICATION_LIST_*.md",
         "TEST_REPORT_*.md",
         "BUILD_LOG_*.txt",

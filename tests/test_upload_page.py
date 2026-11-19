@@ -653,7 +653,7 @@ class UploadPageContractTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     page.batch_tree.set("bad-stock", "stock"),
-                    "0",
+                    "未知",
                 )
             finally:
                 root.destroy()
@@ -1093,6 +1093,240 @@ class UploadPageContractTests(unittest.TestCase):
         self.assertEqual(rows[0]["source_product_id"], "658035244243")
         self.assertEqual(rows[0]["price"], 3900)
         self.assertEqual(rows[0]["platform"], "淘宝")
+
+    def test_parse_taobao_sku_quantity_as_stock(self) -> None:
+        payload = {
+            "productId": "REPRO-TB-1",
+            "productName": "淘宝库存解析复现",
+            "productUrl": "https://item.taobao.com/item.htm?id=REPRO-TB-1",
+            "price": "39.90",
+            "skus": [
+                {"skuId": "S1", "price": "3990", "quantity": 21},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "taobao-sku-stock.txt"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            rows = UploadPage._parse_package(None, path)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["price"], 3990)
+        self.assertEqual(rows[0]["stock"], 21)
+        self.assertTrue(rows[0]["stock_known"])
+
+    def test_parse_taobao_nested_sku_list_stock_is_summed(self) -> None:
+        payload = {
+            "uniqueId": "TAOBAO-SKU-LIST",
+            "title": "淘宝多规格商品",
+            "skuList": {
+                "skuInfo": [
+                    {"skuId": "RED", "price": 1999, "stockNum": 3},
+                    {"skuId": "BLUE", "price": 2099, "amountOnSale": "7"},
+                ]
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "taobao-sku-list.txt"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            rows = UploadPage._parse_package(None, path)
+
+        self.assertEqual(rows[0]["stock"], 10)
+        self.assertTrue(rows[0]["stock_known"])
+
+    def test_parse_taobao_sku_base_and_sku_core_stock(self) -> None:
+        payload = {
+            "productId": "TAOBAO-SKU-CORE",
+            "productName": "淘宝新版规格数据",
+            "priceLow": "12.50",
+            "skuBase": {
+                "skus": [
+                    {"skuId": "A"},
+                    {"skuId": "B"},
+                ]
+            },
+            "skuCore": {
+                "sku2info": {
+                    "A": {"quantity": 4},
+                    "B": {"quantity": 6},
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "taobao-sku-core.txt"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            rows = UploadPage._parse_package(None, path)
+
+        self.assertEqual(rows[0]["stock"], 10)
+        self.assertTrue(rows[0]["stock_known"])
+
+    def test_missing_stock_stays_unknown_until_template_is_applied(self) -> None:
+        payload = {
+            "productId": "TAOBAO-NO-STOCK",
+            "productName": "库存字段缺失商品",
+            "price": "18.80",
+            "skus": [{"skuId": "ONLY", "price": "1880"}],
+            "itemImgs": ["https://example.test/no-stock.jpg"],
+            "categoryId": "50007068",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "taobao-no-stock.txt"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            rows = UploadPage._parse_package(None, path)
+
+        self.assertIsNone(rows[0]["stock"])
+        self.assertFalse(rows[0]["stock_known"])
+        page = object.__new__(UploadPage)
+        result = page._upload_payload(
+            rows[0],
+            {"stock": 30, "price_multiplier": 1, "price_offset": 0},
+        )
+        self.assertEqual(result["skus"][0]["stock_num"], 30)
+
+    def test_explicit_all_zero_sku_stock_remains_known_zero(self) -> None:
+        payload = {
+            "productId": "TAOBAO-ZERO",
+            "productName": "真实零库存商品",
+            "price": "9.90",
+            "skus": [
+                {"skuId": "A", "quantity": 0},
+                {"skuId": "B", "quantity": 0},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "taobao-zero.txt"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            rows = UploadPage._parse_package(None, path)
+
+        self.assertEqual(rows[0]["stock"], 0)
+        self.assertTrue(rows[0]["stock_known"])
+
+    def test_old_taobao_batch_rows_are_renormalized_from_raw_skus(self) -> None:
+        page = object.__new__(UploadPage)
+        raw = {
+            "productId": "OLD-TAOBAO-ROW",
+            "productName": "旧批次淘宝商品",
+            "skus": [{"skuId": "S1", "quantity": 21}],
+        }
+        page._batch = [
+            {
+                "batch_id": "old-row",
+                "source_product_id": "OLD-TAOBAO-ROW",
+                "title": "旧批次淘宝商品",
+                "price": 3990,
+                "stock": 0,
+                "platform": "淘宝",
+                "payload": raw,
+                "raw": raw,
+            }
+        ]
+
+        page._normalize_batch_rows()
+
+        self.assertEqual(page._batch[0]["stock"], 21)
+        self.assertTrue(page._batch[0]["stock_known"])
+
+    def test_taobao_nested_and_unknown_stock_can_create_tasks(self) -> None:
+        class FakeWindow:
+            def __init__(self, db) -> None:
+                self.db = db
+
+            def set_status(self, *_args, **_kwargs) -> None:
+                pass
+
+        package_payload = {
+            "products": [
+                {
+                    "productId": "TAOBAO-NESTED-21",
+                    "productName": "淘宝嵌套库存商品",
+                    "price": "39.90",
+                    "itemImgs": ["https://example.test/nested.jpg"],
+                    "categoryId": "50007068",
+                    "skus": [
+                        {"skuId": "S1", "price": "3990", "quantity": 21}
+                    ],
+                },
+                {
+                    "productId": "TAOBAO-UNKNOWN",
+                    "productName": "淘宝未知库存商品",
+                    "price": "29.90",
+                    "itemImgs": ["https://example.test/unknown.jpg"],
+                    "categoryId": "50007068",
+                    "skus": [{"skuId": "S2", "price": "2990"}],
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "taobao-stock-task.db")
+            package = Path(tmp) / "taobao-stock-task.json"
+            package.write_text(
+                json.dumps(package_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            try:
+                root = tk.Tk()
+            except tk.TclError as exc:
+                self.skipTest(str(exc))
+            root.withdraw()
+            apply_theme(root)
+            try:
+                page = UploadPage(root, FakeWindow(db))
+                page._import_files([package])
+                self.assertEqual(
+                    [row["stock"] for row in page._batch],
+                    [21, None],
+                )
+                page._templates = [
+                    {
+                        "name": "淘宝默认库存模板",
+                        "price_multiplier": 1,
+                        "price_offset": 0,
+                        "stock": 30,
+                    }
+                ]
+                page.template_var.set("淘宝默认库存模板")
+                store = Store(
+                    id=1,
+                    name="淘宝测试店铺",
+                    app_id="wx-taobao-test",
+                    group_name="",
+                    status="正常",
+                    last_sync_at=None,
+                    created_at="",
+                )
+                with patch.object(
+                    page,
+                    "_choose_stores",
+                    return_value=[store],
+                ):
+                    page._create_tasks()
+                self.assertEqual(len(page._tasks), 1)
+                self.assertEqual(
+                    {
+                        item["title"]
+                        for item in page._tasks[0]["items"]
+                    },
+                    {
+                        "淘宝嵌套库存商品",
+                        "淘宝未知库存商品",
+                    },
+                )
+            finally:
+                root.destroy()
 
     def test_parse_wechat_source_package_price_and_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

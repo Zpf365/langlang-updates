@@ -5,6 +5,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from tools.generate_stable_release import source_files
 from tools.package_pyside import make_program_zip, unsafe_program_files
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -65,3 +66,14 @@ def test_browser_runtime_icu_data_is_allowed_but_root_icu_is_not() -> None:
 
         (program / "icudtl.dat").write_bytes(b"unexpected")
         assert unsafe_program_files(program) == [program / "icudtl.dat"]
+
+
+def test_stable_source_package_includes_buyer_assistant_sources() -> None:
+    files = {path.as_posix() for path in source_files()}
+
+    assert "buyer_miniprogram/app.json" in files
+    assert "buyer_miniprogram/pages/bind/index.js" in files
+    assert "supabase/functions/buyer-assistant-mini/index.ts" in files
+    assert "supabase/migrations/202611190001_buyer_assistant.sql" in files
+    assert "DONGXIAO_1_8_49_WECHAT_CONFIG_CN.md" in files
+    assert "buyer_assistant.env.example" in files

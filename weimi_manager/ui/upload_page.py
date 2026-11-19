@@ -14,6 +14,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import TYPE_CHECKING, Any, Callable
@@ -65,11 +66,136 @@ def _optional_non_negative_int(value: Any) -> int | None:
     return number
 
 
-def _row_stock(row: dict[str, Any]) -> int:
+_DIRECT_STOCK_KEYS = (
+    "stock",
+    "库存",
+    "totalStockNum",
+    "total_stock",
+    "totalStock",
+    "stockNum",
+    "stock_num",
+    "quantity",
+    "amountOnSale",
+    "canBookCount",
+    "sellableQuantity",
+    "availableQuantity",
+    "inventory",
+)
+_SKU_CONTAINER_KEYS = (
+    "skus",
+    "skuInfo",
+    "skuInfos",
+    "skuList",
+    "skuBase",
+    "skuCore",
+    "sku2info",
+)
+
+
+def _stock_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
     try:
-        return max(0, int(row.get("stock") or 0))
-    except (TypeError, ValueError):
-        return 0
+        number = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite():
+        return None
+    return max(0, int(number))
+
+
+def _direct_stock(mapping: dict[str, Any]) -> int | None:
+    for key in _DIRECT_STOCK_KEYS:
+        if key not in mapping:
+            continue
+        value = _stock_int(mapping.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _sku_container_total(value: Any) -> int | None:
+    values: list[int] = []
+    if isinstance(value, dict):
+        direct = _direct_stock(value)
+        if direct is not None:
+            values.append(direct)
+        else:
+            for item in value.values():
+                if not isinstance(item, dict):
+                    continue
+                stock = _direct_stock(item)
+                if stock is not None:
+                    values.append(stock)
+    elif isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            stock = _direct_stock(item)
+            if stock is not None:
+                values.append(stock)
+    return sum(values) if values else None
+
+
+def _nested_sku_stock_totals(
+    mapping: dict[str, Any],
+    *,
+    depth: int = 0,
+) -> list[int]:
+    if depth > 5:
+        return []
+    totals: list[int] = []
+    for key in _SKU_CONTAINER_KEYS:
+        if key not in mapping:
+            continue
+        value = mapping.get(key)
+        total = _sku_container_total(value)
+        if total is not None:
+            totals.append(total)
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                if child_key in _SKU_CONTAINER_KEYS:
+                    child_total = _sku_container_total(child)
+                    if child_total is not None:
+                        totals.append(child_total)
+    for value in mapping.values():
+        if isinstance(value, dict):
+            totals.extend(
+                _nested_sku_stock_totals(value, depth=depth + 1)
+            )
+    return totals
+
+
+def _normalized_stock(
+    row: dict[str, Any] | None,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int | None, bool]:
+    for mapping in (row, payload):
+        if not isinstance(mapping, dict):
+            continue
+        direct = _direct_stock(mapping)
+        if direct is not None:
+            return direct, True
+    totals: list[int] = []
+    for mapping in (row, payload):
+        if isinstance(mapping, dict):
+            totals.extend(_nested_sku_stock_totals(mapping))
+    if totals:
+        return max(totals), True
+    return None, False
+
+
+def _row_stock(row: dict[str, Any]) -> int:
+    return _stock_int(row.get("stock")) or 0
+
+
+def _row_stock_known(row: dict[str, Any]) -> bool:
+    if "stock_known" in row:
+        return bool(row.get("stock_known"))
+    return "stock" in row and _stock_int(row.get("stock")) is not None
 
 
 def _row_price_cents(row: dict[str, Any]) -> int:
@@ -202,6 +328,8 @@ def _filter_batch_rows(
             if term and term not in _sku_search_text(row):
                 continue
         elif normalized_mode == "库存范围":
+            if not _row_stock_known(row):
+                continue
             value = _row_stock(row)
             if min_value is not None and value < min_value:
                 continue
@@ -2580,6 +2708,22 @@ class UploadPage(ttk.Frame):
             )
             row["platform"] = str(row.get("platform") or "")
             row["source_file"] = str(row.get("source_file") or "")
+            if "stock_known" not in row:
+                raw = row.get("raw")
+                payload = row.get("payload")
+                stock, stock_known = _normalized_stock(
+                    raw if isinstance(raw, dict) else None,
+                    payload if isinstance(payload, dict) else None,
+                )
+                if stock_known:
+                    row["stock"] = stock
+                    row["stock_known"] = True
+                elif isinstance(raw, dict) or isinstance(payload, dict):
+                    row["stock"] = None
+                    row["stock_known"] = False
+                else:
+                    row["stock"] = _stock_int(row.get("stock"))
+                    row["stock_known"] = row["stock"] is not None
             rows.append(row)
         self._batch = rows
         return repaired
@@ -3800,7 +3944,6 @@ class UploadPage(ttk.Frame):
                 )
             )
             normalized_price: int | None = None
-            normalized_stock: int | None = None
             explicit_source_id = (
                 row.get("source_product_id")
                 or row.get("offerId")
@@ -3884,32 +4027,18 @@ class UploadPage(ttk.Frame):
                 if normalized_price is not None
                 else _price_cents(price_value)
             )
-            stock_value = row.get(
-                "stock",
-                row.get(
-                    "库存",
-                    row.get(
-                        "totalStockNum",
-                        (payload or {}).get("stock", 0),
-                    ),
-                ),
-            )
+            stock, stock_known = _normalized_stock(row, payload)
             if platform == "1688" and isinstance(payload, dict):
-                sku_stocks = [
-                    int(item.get("stock_num") or 0)
-                    for item in payload.get("skus") or []
-                    if isinstance(item, dict)
-                ]
+                sku_stocks = []
+                for item in payload.get("skus") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    value = _stock_int(item.get("stock_num"))
+                    if value is not None:
+                        sku_stocks.append(value)
                 if sku_stocks:
-                    normalized_stock = max(sku_stocks)
-            try:
-                stock = (
-                    normalized_stock
-                    if normalized_stock is not None
-                    else max(0, int(stock_value or 0))
-                )
-            except (TypeError, ValueError):
-                stock = 0
+                    stock = max(sku_stocks)
+                    stock_known = True
             output.append(
                 {
                     "batch_id": uuid.uuid4().hex,
@@ -3917,6 +4046,7 @@ class UploadPage(ttk.Frame):
                     "title": title,
                     "price": price,
                     "stock": stock,
+                    "stock_known": stock_known,
                     "platform": platform,
                     "payload": payload if isinstance(payload, dict) else row,
                     "raw": row,
@@ -4426,7 +4556,11 @@ class UploadPage(ttk.Frame):
                     str(row.get("title") or ""),
                     str(row.get("source_product_id") or ""),
                     f"¥{_row_price_cents(row) / 100:,.2f}",
-                    _row_stock(row),
+                    (
+                        _row_stock(row)
+                        if _row_stock_known(row)
+                        else "未知"
+                    ),
                     str(row.get("platform") or ""),
                     str(row.get("source_file") or ""),
                 ),
@@ -4727,7 +4861,11 @@ class UploadPage(ttk.Frame):
                 "请选择商品", "请先选择至少一个商品。", parent=self
             )
             return
-        zero_stock = [row for row in selected if _row_stock(row) <= 0]
+        zero_stock = [
+            row
+            for row in selected
+            if _row_stock_known(row) and _row_stock(row) <= 0
+        ]
         if zero_stock:
             selected = [
                 row for row in selected if _row_stock(row) > 0
@@ -4760,6 +4898,7 @@ class UploadPage(ttk.Frame):
                 "title": row.get("title", ""),
                 "price": row.get("price", 0),
                 "stock": row.get("stock", 0),
+                "stock_known": _row_stock_known(row),
                 "payload": row.get("payload"),
                 "raw": row.get("raw"),
                 "source_product_id": row.get("source_product_id", ""),
@@ -5954,7 +6093,15 @@ class UploadPage(ttk.Frame):
         prefix = str(template.get("title_prefix") or "")
         suffix = str(template.get("title_suffix") or "")
         payload["title"] = f"{prefix}{title}{suffix}".strip()
-        stock = max(0, int(template.get("stock") or item.get("stock") or 0))
+        template_stock = _stock_int(template.get("stock"))
+        item_stock = _stock_int(item.get("stock"))
+        stock = (
+            template_stock
+            if template_stock is not None
+            else item_stock
+            if item_stock is not None
+            else 0
+        )
         multiplier = float(template.get("price_multiplier") or 1)
         offset = int(template.get("price_offset") or 0)
         fixed_price = int(template.get("fixed_price") or 0)

@@ -227,6 +227,18 @@ class MainWindow(tk.Tk):
                 if auth_context is not None
                 else ""
             ),
+            access_token_provider=(
+                lambda: str(auth_client.current_access_token or "")
+                if auth_client is not None
+                else ""
+            ),
+            access_token_refresher=(
+                lambda failed: auth_client.refresh_current_session(
+                    failed
+                ).access_token
+                if auth_client is not None
+                else ""
+            ),
             tester_key=str(
                 tester_channel.get("diagnostic_upload_key") or ""
             ),

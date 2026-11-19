@@ -10,6 +10,8 @@ from unittest import mock
 
 from weimi_manager.diagnostics import DiagnosticManager, redact_text
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 class DiagnosticTests(unittest.TestCase):
     def test_sensitive_values_are_redacted(self) -> None:
@@ -140,6 +142,109 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertEqual(manager.pending_count(), 0)
             finally:
                 manager.close()
+
+    def test_expired_upload_token_refreshes_once_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            current_tokens = {"access": "expired-token"}
+            refresh_calls: list[str] = []
+
+            def refresh(failed_token: str) -> str:
+                refresh_calls.append(failed_token)
+                current_tokens["access"] = "fresh-token"
+                return current_tokens["access"]
+
+            manager = DiagnosticManager(
+                Path(tmp),
+                "1.8.49",
+                upload_url="https://example.test/diagnostics",
+                access_token_provider=lambda: current_tokens["access"],
+                access_token_refresher=refresh,
+                auto_upload=False,
+            )
+            try:
+                manager.record("event", "upload after refresh")
+                expired = mock.Mock(status_code=401)
+                success = mock.Mock(status_code=200)
+                success.raise_for_status.return_value = None
+                with mock.patch(
+                    "weimi_manager.diagnostics.requests.post",
+                    side_effect=[expired, success],
+                ) as post:
+                    self.assertEqual(manager.flush(), 1)
+                self.assertEqual(refresh_calls, ["expired-token"])
+                self.assertEqual(post.call_count, 2)
+                self.assertEqual(
+                    post.call_args_list[0].kwargs["headers"]["Authorization"],
+                    "Bearer expired-token",
+                )
+                self.assertEqual(
+                    post.call_args_list[1].kwargs["headers"]["Authorization"],
+                    "Bearer fresh-token",
+                )
+                self.assertEqual(manager.pending_count(), 0)
+            finally:
+                manager.close()
+
+    def test_upload_failure_keeps_report_for_later_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = DiagnosticManager(
+                Path(tmp),
+                "1.8.49",
+                upload_url="https://example.test/diagnostics",
+                access_token="token",
+                auto_upload=False,
+            )
+            try:
+                manager.record("event", "must stay queued")
+                denied = mock.Mock(status_code=401)
+                with mock.patch(
+                    "weimi_manager.diagnostics.requests.post",
+                    return_value=denied,
+                ):
+                    self.assertEqual(manager.flush(), 0)
+                self.assertEqual(manager.pending_count(), 1)
+            finally:
+                manager.close()
+
+    def test_diagnostic_upload_uses_current_session_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            current = {"token": "first"}
+            manager = DiagnosticManager(
+                Path(tmp),
+                "1.8.49",
+                upload_url="https://example.test/diagnostics",
+                access_token_provider=lambda: current["token"],
+                auto_upload=False,
+            )
+            try:
+                manager.record("event", "first")
+                first = mock.Mock(status_code=200)
+                first.raise_for_status.return_value = None
+                with mock.patch(
+                    "weimi_manager.diagnostics.requests.post",
+                    return_value=first,
+                ) as post:
+                    current["token"] = "current"
+                    self.assertEqual(manager.flush(), 1)
+                self.assertEqual(
+                    post.call_args.kwargs["headers"]["Authorization"],
+                    "Bearer current",
+                )
+            finally:
+                manager.close()
+
+    def test_diagnostic_reports_service_role_migration_grants_rw(self) -> None:
+        migration = (
+            ROOT
+            / "supabase"
+            / "migrations"
+            / "202611190002_diagnostic_reports_service_role.sql"
+        )
+        self.assertTrue(migration.is_file(), migration)
+        sql = migration.read_text(encoding="utf-8")
+        self.assertIn("grant select, insert, update", sql)
+        self.assertIn("public.diagnostic_reports", sql)
+        self.assertIn("to service_role", sql)
 
     def test_unclean_previous_session_is_reported_on_startup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
