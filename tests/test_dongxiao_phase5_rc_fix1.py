@@ -209,7 +209,7 @@ def test_missing_empty_corrupt_and_incompatible_backups_fail_safely(
     conn = sqlite3.connect(incompatible)
     try:
         conn.execute(
-            "DELETE FROM dongxiao_schema_migrations WHERE version=7"
+            "DELETE FROM dongxiao_schema_migrations WHERE version=8"
         )
         conn.commit()
     finally:

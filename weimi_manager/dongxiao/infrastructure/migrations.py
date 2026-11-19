@@ -23,8 +23,8 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 7
-DONGXIAO_MIGRATION_NAME = "dongxiao_final_release_v7"
+DONGXIAO_MIGRATION_VERSION = 8
+DONGXIAO_MIGRATION_NAME = "dongxiao_real_buyer_flow_v8"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
 )
@@ -45,6 +45,9 @@ DONGXIAO_V6_CHECKSUM = (
 )
 DONGXIAO_V7_CHECKSUM = (
     "6cdff17dc4c3f149b05b5b9de8d53d26ab5ddd3c9a3e0a438c4512ec6f14c785"
+)
+DONGXIAO_V8_CHECKSUM = (
+    "bc537cd23725489e984967fa90fef629688f449eda74f97d26cdaaf7f5d330a3"
 )
 
 
@@ -1297,6 +1300,156 @@ END;
 """
 
 
+def _migration_v8_sql() -> str:
+    return """
+CREATE TABLE IF NOT EXISTS dongxiao_buyer_accounts (
+    buyer_account_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    account_ref_hash TEXT NOT NULL UNIQUE,
+    provider TEXT NOT NULL
+        CHECK (provider IN (
+            'official_wechat', 'official_partner', 'manual_handoff',
+            'mock', 'unknown'
+        )),
+    identity_status TEXT NOT NULL
+        CHECK (identity_status IN (
+            'unverified', 'user_asserted', 'verified_official',
+            'verified_mock', 'expired', 'revoked'
+        )),
+    status TEXT NOT NULL
+        CHECK (status IN (
+            'pending_authorization', 'active', 'expired',
+            'disconnected', 'mock_ready', 'official_unsupported'
+        )),
+    is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1)),
+    authorization_at TEXT,
+    last_verified_at TEXT,
+    status_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (length(trim(buyer_account_id)) > 0),
+    CHECK (length(trim(display_name)) > 0),
+    CHECK (length(trim(account_ref_hash)) > 0)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dongxiao_buyer_current_v8
+    ON dongxiao_buyer_accounts(is_current)
+    WHERE is_current=1;
+
+CREATE TABLE IF NOT EXISTS dongxiao_buyer_flow_runs (
+    run_id TEXT PRIMARY KEY,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    store_name TEXT NOT NULL,
+    buyer_account_id TEXT NOT NULL,
+    mode TEXT NOT NULL
+        CHECK (mode IN ('auto_select', 'manual_select', 'manual_handoff', 'mock')),
+    status TEXT NOT NULL
+        CHECK (status IN (
+            'draft', 'prepared', 'blocked_official_unsupported',
+            'waiting_user_handoff', 'waiting_order_id', 'paused',
+            'cancelled', 'order_verified', 'failed', 'unknown'
+        )),
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    requested_count INTEGER NOT NULL
+        CHECK (requested_count BETWEEN 1 AND 10),
+    item_count INTEGER NOT NULL CHECK (item_count >= 0),
+    merchandise_total_cents INTEGER NOT NULL
+        CHECK (merchandise_total_cents BETWEEN 0 AND 999999999999),
+    expires_at TEXT,
+    handoff_token TEXT NOT NULL DEFAULT '',
+    order_id TEXT NOT NULL DEFAULT '',
+    verification_status TEXT NOT NULL
+        CHECK (verification_status IN (
+            'unverified', 'pending_payment', 'status_mismatch', 'not_found'
+        )),
+    status_reason TEXT NOT NULL DEFAULT '',
+    capability_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (store_app_id, idempotency_key),
+    UNIQUE (run_id, store_app_id),
+    FOREIGN KEY (buyer_account_id)
+        REFERENCES dongxiao_buyer_accounts(buyer_account_id)
+        ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_runs_store_v8
+    ON dongxiao_buyer_flow_runs(store_app_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_runs_account_v8
+    ON dongxiao_buyer_flow_runs(buyer_account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS dongxiao_buyer_flow_items (
+    item_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    sku_id TEXT NOT NULL,
+    specs_json TEXT NOT NULL DEFAULT '{}',
+    unit_price_cents INTEGER NOT NULL
+        CHECK (unit_price_cents BETWEEN 1 AND 999999999999),
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    stock INTEGER NOT NULL CHECK (stock >= 0),
+    status TEXT NOT NULL
+        CHECK (status IN ('selected', 'skipped', 'invalid')),
+    reason TEXT NOT NULL DEFAULT '',
+    UNIQUE (run_id, product_id, sku_id),
+    FOREIGN KEY (run_id)
+        REFERENCES dongxiao_buyer_flow_runs(run_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS dongxiao_buyer_order_links (
+    link_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    buyer_account_id TEXT NOT NULL,
+    platform_order_id TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN (
+            'unverified', 'pending_payment', 'status_mismatch', 'not_found'
+        )),
+    total_amount_cents INTEGER NOT NULL
+        CHECK (total_amount_cents BETWEEN 0 AND 999999999999),
+    item_count INTEGER NOT NULL CHECK (item_count >= 0),
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    verified_at TEXT NOT NULL,
+    UNIQUE (run_id, platform_order_id),
+    FOREIGN KEY (run_id)
+        REFERENCES dongxiao_buyer_flow_runs(run_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (buyer_account_id)
+        REFERENCES dongxiao_buyer_accounts(buyer_account_id)
+        ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_order_links_store_v8
+    ON dongxiao_buyer_order_links(store_app_id, verified_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_dongxiao_buyer_runs_store_v8
+BEFORE INSERT ON dongxiao_buyer_flow_runs
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+      WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'buyer flow store identity mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dongxiao_buyer_order_links_store_v8
+BEFORE INSERT ON dongxiao_buyer_order_links
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+      WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'buyer order link store identity mismatch');
+END;
+"""
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
@@ -1306,6 +1459,7 @@ def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
         (5, "dongxiao_fix1_integrity_v5", _migration_v5_sql),
         (6, "dongxiao_release_candidate_v6", _migration_v6_sql),
         (7, "dongxiao_final_release_v7", _migration_v7_sql),
+        (8, "dongxiao_real_buyer_flow_v8", _migration_v8_sql),
     )
 
 
@@ -1400,6 +1554,10 @@ def migrate_dongxiao_schema(
             raise sqlite3.IntegrityError(
                 "动销中心 v7 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
+        if version == 8 and current_checksum != DONGXIAO_V8_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v8 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
             conn.executescript(
@@ -1478,6 +1636,10 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_cart_mock_state",
         "dongxiao_cart_mock_operations",
         "dongxiao_pending_order_drafts",
+        "dongxiao_buyer_accounts",
+        "dongxiao_buyer_flow_runs",
+        "dongxiao_buyer_flow_items",
+        "dongxiao_buyer_order_links",
     }
     tables = {
         str(row[0])

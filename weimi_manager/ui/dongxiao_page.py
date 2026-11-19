@@ -19,6 +19,10 @@ from ..dongxiao.application.preflight_service import (
     DongxiaoPreflightService,
 )
 from ..dongxiao.application.task_service import DongxiaoTaskService
+from ..dongxiao.buyer_flow.domain import BuyerFlowMode
+from ..dongxiao.buyer_flow.repository import BuyerFlowRepository
+from ..dongxiao.buyer_flow.service import DongxiaoBuyerFlowService
+from ..dongxiao.buyer_flow.session_vault import BuyerSessionVault
 from ..dongxiao.desktop_cart.domain import (
     CartAdapterMode,
     CartBatchStatus,
@@ -94,6 +98,16 @@ AUDIT_ACTION_LABELS = {
     "platform_write_guard_changed": "平台写操作开关变更",
     "store_platform_write_startup_reset": "启动时关闭店铺写操作",
     "store_platform_write_changed": "店铺真实写操作变更",
+    "buyer_account_created": "添加买家账号",
+    "buyer_mock_account_created": "添加 Mock 买家账号",
+    "buyer_current_account_changed": "切换当前买家账号",
+    "buyer_account_checked": "检查买家账号",
+    "buyer_account_deleted": "删除买家账号",
+    "buyer_flow_prepared": "准备买家流程",
+    "buyer_manual_handoff_started": "开始官方客户端交接",
+    "buyer_handoff_user_confirmed": "用户确认完成官方操作",
+    "buyer_order_verified": "核验官方待付款订单",
+    "buyer_mock_flow_executed": "执行 Mock 买家流程",
 }
 AUDIT_ENTITY_LABELS = {
     "task": "任务",
@@ -101,6 +115,9 @@ AUDIT_ENTITY_LABELS = {
     "aftersale": "售后",
     "approval": "审批",
     "store": "店铺",
+    "buyer_account": "买家账号",
+    "buyer_flow_run": "买家流程",
+    "buyer_order": "买家订单",
 }
 
 
@@ -178,6 +195,9 @@ class DongxiaoPage(BasePage):
         self._cart_accounts: list[Any] = []
         self._cart_batches: list[Any] = []
         self._cart_pending_drafts: list[Any] = []
+        self._buyer_accounts: list[Any] = []
+        self._buyer_runs: list[Any] = []
+        self._buyer_run_items: list[Any] = []
         self._cart_preview = None
         self._verified_product_id = ""
         self._verified_sku_id = ""
@@ -200,6 +220,7 @@ class DongxiaoPage(BasePage):
             self.task_scheduler = self.runtime.scheduler
             self.preflight_service = self.runtime.preflight_service
             self.cart_service = self.runtime.cart_service
+            self.buyer_flow_service = self.runtime.buyer_flow_service
         else:
             platform = OfficialDongxiaoPlatformAdapter(self.window.service)
             self.task_service = DongxiaoTaskService(
@@ -229,6 +250,12 @@ class DongxiaoPage(BasePage):
                 self.repository,
                 self.task_service,
                 scheduler=None,
+            )
+            self.buyer_flow_service = DongxiaoBuyerFlowService(
+                BuyerFlowRepository(database_path),
+                self.repository,
+                BuyerSessionVault(database_path.parent),
+                order_service=self.order_service,
             )
         self.official_catalog_service = ProductCatalogService(
             self.repository,
@@ -279,6 +306,12 @@ class DongxiaoPage(BasePage):
         self.cart_interval_var = tk.StringVar(value="2500")
         self.cart_concurrency_var = tk.StringVar(value="1")
         self.cart_batch_name_var = tk.StringVar(value="桌面批量加购")
+        self.buyer_account_status_var = tk.StringVar(value="买家账号尚未读取")
+        self.buyer_flow_status_var = tk.StringVar(value="买家完整流程尚未准备")
+        self.buyer_count_var = tk.StringVar(value="5")
+        self.buyer_selection_mode_var = tk.StringVar(value="自动挑选")
+        self.buyer_manual_ids_var = tk.StringVar()
+        self.buyer_order_id_var = tk.StringVar()
         self.audit_status_var = tk.StringVar(value="审计日志尚未读取")
         self.preflight_status_var = tk.StringVar(value="实盘检查尚未运行")
         self.platform_write_status_var = tk.StringVar(
@@ -462,6 +495,7 @@ class DongxiaoPage(BasePage):
         self.section_views["cart_batch"] = self._build_cart_batch_view()
         self.section_views["pending_orders"] = self._build_pending_orders_view()
         self.section_views["accounts"] = self._build_cart_accounts_view()
+        self.section_views["buyer_flow"] = self._build_buyer_flow_view()
         self.section_views["tasks"] = self._build_task_view()
         self.section_views["orders"] = self._build_order_view()
         self.section_views["aftersales"] = self._build_aftersale_view()
@@ -981,6 +1015,70 @@ class DongxiaoPage(BasePage):
             ),
             style="Subtitle.TLabel",
         ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(
+            view,
+            text="独立买家微信账号",
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).grid(row=5, column=0, sticky="w", pady=(14, 4))
+        buyer_toolbar = ttk.Frame(view, style="Panel.TFrame")
+        buyer_toolbar.grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        button(
+            buyer_toolbar,
+            "添加真实买家账号",
+            self._add_official_buyer_account,
+            "Primary",
+        ).pack(side="left")
+        button(
+            buyer_toolbar,
+            "添加 Mock 测试账号",
+            self._add_mock_buyer_account,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            buyer_toolbar,
+            "打开官方微信",
+            self._open_official_wechat_client,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            buyer_toolbar,
+            "检查身份",
+            self._check_selected_buyer_account,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            buyer_toolbar,
+            "设为当前",
+            self._set_selected_buyer_account_current,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            buyer_toolbar,
+            "删除",
+            self._delete_selected_buyer_account,
+        ).pack(side="left", padx=(6, 0))
+        self.buyer_account_tree = ttk.Treeview(
+            view,
+            columns=("current", "name", "provider", "identity", "status", "auth", "verified"),
+            show="headings",
+            selectmode="browse",
+            height=5,
+        )
+        for key, label, width in (
+            ("current", "当前", 50),
+            ("name", "买家显示名", 130),
+            ("provider", "授权来源", 115),
+            ("identity", "真实身份", 125),
+            ("status", "会话状态", 125),
+            ("auth", "授权时间", 145),
+            ("verified", "最近验证", 145),
+        ):
+            self.buyer_account_tree.heading(key, text=label)
+            self.buyer_account_tree.column(key, width=width, anchor="w")
+        self.buyer_account_tree.grid(row=7, column=0, sticky="nsew")
+        ttk.Label(
+            view,
+            textvariable=self.buyer_account_status_var,
+            style="Subtitle.TLabel",
+            wraplength=850,
+            justify="left",
+        ).grid(row=8, column=0, sticky="w", pady=(6, 0))
         return view
 
     def _load_cart_accounts(self) -> None:
@@ -1157,6 +1255,688 @@ class DongxiaoPage(BasePage):
             ),
             log_title="检查动销执行账号",
             task_scope=f"dongxiao:cart-account-check:{account.account_id}",
+        )
+
+    def _load_buyer_accounts(self) -> None:
+        scope = "dongxiao:buyer-accounts"
+        if self.window.has_running_task(scope):
+            return
+        service = self.buyer_flow_service
+        permission = self._permission_checker
+
+        self.window.run_task(
+            lambda _progress: service.list_accounts(
+                permission_checker=permission
+            ),
+            self._buyer_accounts_loaded,
+            lambda error: self.buyer_account_status_var.set(
+                f"买家账号读取失败：{error}"
+            ),
+            log_title="读取独立买家账号",
+            task_scope=scope,
+        )
+
+    def _buyer_accounts_loaded(self, accounts) -> None:
+        self._buyer_accounts = list(accounts)
+        tree = getattr(self, "buyer_account_tree", None)
+        if tree is not None:
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            provider_labels = {
+                "official_wechat": "官方微信",
+                "official_partner": "官方合作方",
+                "manual_handoff": "人工交接",
+                "mock": "Mock 测试",
+                "unknown": "未知",
+            }
+            identity_labels = {
+                "unverified": "未验证",
+                "user_asserted": "用户自述·未验证",
+                "verified_official": "官方已验证",
+                "verified_mock": "Mock 已验证",
+                "expired": "身份已失效",
+                "revoked": "身份已撤销",
+            }
+            for account in accounts:
+                tree.insert(
+                    "",
+                    "end",
+                    iid=account.buyer_account_id,
+                    values=(
+                        "是" if account.is_current else "",
+                        account.display_name,
+                        provider_labels.get(account.provider.value, account.provider.value),
+                        identity_labels.get(
+                            account.identity_status.value,
+                            account.identity_status.value,
+                        ),
+                        account.status.value,
+                        _date_time(account.authorization_at),
+                        _date_time(account.last_verified_at),
+                    ),
+                )
+        current = next(
+            (account for account in accounts if account.is_current),
+            None,
+        )
+        capability = self.buyer_flow_service.capability()
+        if current is None:
+            self.buyer_account_status_var.set(
+                f"未选择已验证买家账号；{capability.reason}"
+            )
+        else:
+            self.buyer_account_status_var.set(
+                f"当前买家：{current.display_name}；"
+                f"身份：{current.identity_status.value}；"
+                f"{capability.reason}"
+            )
+
+    def _add_official_buyer_account(self) -> None:
+        display_name = simpledialog.askstring(
+            "添加真实买家账号",
+            "请输入用于识别的买家显示名。\n"
+            "不要输入密码、Cookie、Token 或验证码：",
+            parent=self,
+        )
+        if not display_name:
+            return
+
+        def work(_progress):
+            return self.buyer_flow_service.create_official_account(
+                display_name=display_name,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            )
+
+        def done(result) -> None:
+            self._load_buyer_accounts()
+            messagebox.showinfo(
+                "官方买家授权能力",
+                (
+                    f"账号“{result.account.display_name}”已保存为待授权记录。\n\n"
+                    f"{result.instructions or result.capability.reason}\n\n"
+                    "在官方能力未确认前，该账号不会产生真实登录或购买成功。"
+                ),
+                parent=self,
+            )
+
+        self.window.run_task(
+            work,
+            done,
+            lambda error: messagebox.showerror(
+                "添加买家账号失败",
+                error,
+                parent=self,
+            ),
+            log_title="添加官方买家账号",
+            task_scope="dongxiao:buyer-account-add",
+        )
+
+    def _add_mock_buyer_account(self) -> None:
+        display_name = simpledialog.askstring(
+            "添加 Mock 买家账号",
+            "这是本地流程测试账号，不代表真实微信身份。请输入显示名：",
+            parent=self,
+        )
+        if not display_name:
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.create_mock_account(
+                display_name=display_name,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda _account: self._load_buyer_accounts(),
+            lambda error: messagebox.showerror(
+                "添加 Mock 买家失败",
+                error,
+                parent=self,
+            ),
+            log_title="添加 Mock 买家账号",
+            task_scope="dongxiao:buyer-account-add-mock",
+        )
+
+    def _selected_buyer_account(self):
+        tree = getattr(self, "buyer_account_tree", None)
+        if tree is None or not tree.selection():
+            return None
+        selected_id = str(tree.selection()[0])
+        return next(
+            (
+                account
+                for account in self._buyer_accounts
+                if account.buyer_account_id == selected_id
+            ),
+            None,
+        )
+
+    def _check_selected_buyer_account(self) -> None:
+        account = self._selected_buyer_account()
+        if account is None:
+            messagebox.showwarning(
+                "检查买家账号",
+                "请先选择一个买家账号。",
+                parent=self,
+            )
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.check_account(
+                account.buyer_account_id,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda _account: self._load_buyer_accounts(),
+            lambda error: messagebox.showerror(
+                "检查买家账号失败",
+                error,
+                parent=self,
+            ),
+            log_title="检查买家账号",
+            task_scope=f"dongxiao:buyer-check:{account.buyer_account_id}",
+        )
+
+    def _set_selected_buyer_account_current(self) -> None:
+        account = self._selected_buyer_account()
+        if account is None:
+            messagebox.showwarning(
+                "选择当前买家",
+                "请先选择一个买家账号。",
+                parent=self,
+            )
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.set_current_account(
+                account.buyer_account_id,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda _account: self._load_buyer_accounts(),
+            lambda error: messagebox.showerror(
+                "切换买家账号失败",
+                error,
+                parent=self,
+            ),
+            log_title="切换当前买家账号",
+            task_scope=f"dongxiao:buyer-current:{account.buyer_account_id}",
+        )
+
+    def _delete_selected_buyer_account(self) -> None:
+        account = self._selected_buyer_account()
+        if account is None:
+            messagebox.showwarning(
+                "删除买家账号",
+                "请先选择一个买家账号。",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "删除买家账号",
+            f"确认删除买家账号“{account.display_name}”及其加密会话吗？",
+            parent=self,
+        ):
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.delete_account(
+                account.buyer_account_id,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda _result: self._load_buyer_accounts(),
+            lambda error: messagebox.showerror(
+                "删除买家账号失败",
+                error,
+                parent=self,
+            ),
+            log_title="删除买家账号",
+            task_scope=f"dongxiao:buyer-delete:{account.buyer_account_id}",
+        )
+
+    def _open_official_wechat_client(self) -> None:
+        try:
+            self.buyer_flow_service.open_official_wechat_client()
+        except Exception as exc:
+            messagebox.showinfo(
+                "打开官方微信",
+                f"{exc}\n\n请用户本人手动打开官方微信客户端。",
+                parent=self,
+            )
+            return
+        self.buyer_account_status_var.set(
+            "已请求打开官方微信客户端；登录、扫码和验证码均由用户本人完成。"
+        )
+
+    def _build_buyer_flow_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(5, weight=1)
+        ttk.Label(
+            view,
+            text="买家完整流程",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            view,
+            text=(
+                "商家店铺授权与买家微信身份严格分离。"
+                "只有官方可验证的买家身份才允许进入真实加购和订单创建；"
+                "当前不存在的官方能力会明确阻塞，不会用网页私有接口或 Mock 冒充。"
+            ),
+            style="Subtitle.TLabel",
+            wraplength=850,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 8))
+        form = ttk.Frame(view, style="Panel.TFrame")
+        form.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(form, text="选择方式").pack(side="left")
+        ttk.Combobox(
+            form,
+            textvariable=self.buyer_selection_mode_var,
+            values=("自动挑选", "手动选择"),
+            state="readonly",
+            width=12,
+        ).pack(side="left", padx=(5, 12))
+        ttk.Label(form, text="商品数量").pack(side="left")
+        ttk.Combobox(
+            form,
+            textvariable=self.buyer_count_var,
+            values=tuple(str(index) for index in range(5, 11)),
+            state="readonly",
+            width=6,
+        ).pack(side="left", padx=(5, 12))
+        ttk.Label(form, text="手动商品 ID").pack(side="left")
+        ttk.Entry(
+            form,
+            textvariable=self.buyer_manual_ids_var,
+            width=36,
+        ).pack(side="left", padx=(5, 12))
+        ttk.Label(form, text="订单号").pack(side="left")
+        ttk.Entry(
+            form,
+            textvariable=self.buyer_order_id_var,
+            width=24,
+        ).pack(side="left", padx=(5, 0))
+        actions = ttk.Frame(view, style="Panel.TFrame")
+        actions.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        button(
+            actions,
+            "准备并预览",
+            self._prepare_buyer_flow,
+            "Primary",
+        ).pack(side="left")
+        button(
+            actions,
+            "执行 Mock 流程",
+            lambda: self._buyer_flow_action("mock"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            actions,
+            "开始官方交接",
+            lambda: self._buyer_flow_action("handoff"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            actions,
+            "已在官方客户端完成",
+            lambda: self._buyer_flow_action("handoff_done"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            actions,
+            "暂停",
+            lambda: self._buyer_flow_action("pause"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            actions,
+            "继续",
+            lambda: self._buyer_flow_action("resume"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            actions,
+            "取消",
+            lambda: self._buyer_flow_action("cancel"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            actions,
+            "核验官方待付款订单",
+            self._verify_buyer_order,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            view,
+            textvariable=self.buyer_flow_status_var,
+            style="Subtitle.TLabel",
+            wraplength=850,
+            justify="left",
+        ).grid(row=4, column=0, sticky="w", pady=(0, 6))
+        panes = ttk.Panedwindow(view, orient="vertical")
+        panes.grid(row=5, column=0, sticky="nsew")
+        runs_box = ttk.Frame(panes, style="Panel.TFrame")
+        runs_box.columnconfigure(0, weight=1)
+        runs_box.rowconfigure(1, weight=1)
+        ttk.Label(
+            runs_box,
+            text="流程历史与状态",
+            style="Subtitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.buyer_run_tree = ttk.Treeview(
+            runs_box,
+            columns=("created", "store", "items", "mode", "status", "order", "reason"),
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        for key, label, width in (
+            ("created", "创建时间", 145),
+            ("store", "店铺", 145),
+            ("items", "商品数", 65),
+            ("mode", "选择方式", 105),
+            ("status", "状态", 140),
+            ("order", "真实订单号", 190),
+            ("reason", "说明", 420),
+        ):
+            self.buyer_run_tree.heading(key, text=label)
+            self.buyer_run_tree.column(key, width=width, anchor="w")
+        self.buyer_run_tree.grid(row=1, column=0, sticky="nsew")
+        self.buyer_run_tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event: self._render_selected_buyer_run(),
+        )
+        panes.add(runs_box, weight=2)
+        items_box = ttk.Frame(panes, style="Panel.TFrame")
+        items_box.columnconfigure(0, weight=1)
+        items_box.rowconfigure(1, weight=1)
+        ttk.Label(
+            items_box,
+            text="商品、SKU、价格与订单预览",
+            style="Subtitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.buyer_item_tree = ttk.Treeview(
+            items_box,
+            columns=("product", "title", "sku", "specs", "price", "qty", "stock", "subtotal"),
+            show="headings",
+        )
+        for key, label, width in (
+            ("product", "商品 ID", 130),
+            ("title", "商品名称", 210),
+            ("sku", "SKU", 130),
+            ("specs", "规格", 170),
+            ("price", "单价", 80),
+            ("qty", "数量", 60),
+            ("stock", "库存", 65),
+            ("subtotal", "商品总价", 95),
+        ):
+            self.buyer_item_tree.heading(key, text=label)
+            self.buyer_item_tree.column(key, width=width, anchor="w")
+        self.buyer_item_tree.grid(row=1, column=0, sticky="nsew")
+        panes.add(items_box, weight=1)
+        return view
+
+    def _load_buyer_runs(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+        scope = f"dongxiao:buyer-runs:{store.id}"
+        if self.window.has_running_task(scope):
+            return
+        repository = self.buyer_flow_service.repository
+        self.window.run_task(
+            lambda _progress: repository.list_runs(store_id=int(store.id)),
+            self._buyer_runs_loaded,
+            lambda error: self.buyer_flow_status_var.set(
+                f"买家流程读取失败：{error}"
+            ),
+            log_title="读取买家完整流程",
+            task_scope=scope,
+            store_app_id=str(store.app_id),
+        )
+
+    def _buyer_runs_loaded(self, runs) -> None:
+        self._buyer_runs = list(runs)
+        tree = getattr(self, "buyer_run_tree", None)
+        if tree is None:
+            return
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        labels = {
+            "draft": "草稿",
+            "prepared": "已准备",
+            "blocked_official_unsupported": "官方能力不支持",
+            "waiting_user_handoff": "等待官方客户端操作",
+            "waiting_order_id": "等待真实订单号",
+            "paused": "已暂停",
+            "cancelled": "已取消",
+            "order_verified": "订单已核验",
+            "failed": "失败",
+            "unknown": "结果未知",
+        }
+        for run in runs:
+            tree.insert(
+                "",
+                "end",
+                iid=run.run_id,
+                values=(
+                    _date_time(run.created_at),
+                    run.store_name,
+                    run.item_count,
+                    run.mode.value,
+                    labels.get(run.status.value, run.status.value),
+                    run.order_id,
+                    run.status_reason,
+                ),
+            )
+        self.buyer_flow_status_var.set(f"已读取 {len(runs)} 个买家流程")
+
+    def _selected_buyer_run(self):
+        tree = getattr(self, "buyer_run_tree", None)
+        if tree is None or not tree.selection():
+            return None
+        run_id = str(tree.selection()[0])
+        return next((run for run in self._buyer_runs if run.run_id == run_id), None)
+
+    def _prepare_buyer_flow(self) -> None:
+        store = self._current_store()
+        account = self.buyer_flow_service.current_account()
+        if store is None:
+            messagebox.showwarning(
+                "买家完整流程",
+                "请先选择目标商家店铺。",
+                parent=self,
+            )
+            return
+        if account is None:
+            messagebox.showwarning(
+                "买家完整流程",
+                "没有已验证的当前买家账号。真实买家登录能力未确认，"
+                "请查看官方接口审计；可先添加 Mock 账号验证流程。",
+                parent=self,
+            )
+            return
+        try:
+            count = int(self.buyer_count_var.get())
+        except ValueError:
+            count = 5
+        manual_ids = [
+            item
+            for item in self.buyer_manual_ids_var.get().replace(
+                ",",
+                " ",
+            ).replace(
+                "\n",
+                " ",
+            ).split()
+            if item
+        ]
+        mode = (
+            BuyerFlowMode.MANUAL_SELECT
+            if self.buyer_selection_mode_var.get() == "手动选择"
+            else BuyerFlowMode.AUTO_SELECT
+        )
+        quantities = {product_id: 1 for product_id in manual_ids}
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.prepare_run(
+                store,
+                buyer_account_id=account.buyer_account_id,
+                mode=mode,
+                requested_count=count,
+                manual_product_ids=manual_ids,
+                quantities=quantities,
+                idempotency_key=f"buyer-flow-{uuid.uuid4().hex}",
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            self._buyer_flow_prepared,
+            lambda error: messagebox.showerror(
+                "准备买家流程失败",
+                error,
+                parent=self,
+            ),
+            log_title="准备买家完整流程",
+            task_scope=f"dongxiao:buyer-prepare:{store.id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _buyer_flow_prepared(self, payload) -> None:
+        run, _items = payload
+        self._load_buyer_runs()
+        self.buyer_order_id_var.set(run.order_id)
+        self.buyer_flow_status_var.set(
+            f"流程已保存：{run.status.value}；{run.status_reason}"
+        )
+
+    def _render_selected_buyer_run(self) -> None:
+        run = self._selected_buyer_run()
+        if run is None:
+            return
+        items = self.buyer_flow_service.repository.list_items(run.run_id)
+        self._buyer_run_items = list(items)
+        tree = getattr(self, "buyer_item_tree", None)
+        if tree is None:
+            return
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        for item in items:
+            tree.insert(
+                "",
+                "end",
+                iid=item.item_id,
+                values=(
+                    item.product_id,
+                    item.title,
+                    item.sku_id,
+                    "；".join(f"{key}:{value}" for key, value in item.specs),
+                    _money(item.unit_price_cents),
+                    item.quantity,
+                    item.stock,
+                    _money(item.subtotal_cents),
+                ),
+            )
+        self.buyer_order_id_var.set(run.order_id)
+        preview = self.buyer_flow_service.preview(
+            run.run_id,
+            buyer_display_name=run.buyer_account_id,
+        )
+        self.buyer_flow_status_var.set(
+            f"{run.status.value}；商品总额 {_money(preview.merchandise_total_cents)}；"
+            f"运费/最终应付：{preview.notes[0] if preview.notes else '官方结算页确认'}；"
+            f"{run.status_reason}"
+        )
+
+    def _buyer_flow_action(self, action: str) -> None:
+        run = self._selected_buyer_run()
+        if run is None:
+            messagebox.showwarning(
+                "买家完整流程",
+                "请先选择一个买家流程。",
+                parent=self,
+            )
+            return
+
+        def work(_progress):
+            if action == "mock":
+                return self.buyer_flow_service.execute_mock_flow(
+                    run.run_id,
+                    permission_checker=self._permission_checker,
+                    actor_id=self._actor_id(),
+                )
+            if action == "handoff":
+                return self.buyer_flow_service.start_manual_handoff(
+                    run.run_id,
+                    permission_checker=self._permission_checker,
+                    actor_id=self._actor_id(),
+                )
+            if action == "handoff_done":
+                return self.buyer_flow_service.mark_handoff_complete(
+                    run.run_id,
+                    permission_checker=self._permission_checker,
+                    actor_id=self._actor_id(),
+                )
+            return self.buyer_flow_service.set_run_status(
+                run.run_id,
+                action,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            )
+
+        self.window.run_task(
+            work,
+            lambda saved: (
+                self._load_buyer_runs(),
+                self.buyer_flow_status_var.set(
+                    f"流程状态已更新：{saved.status.value}"
+                ),
+            ),
+            lambda error: messagebox.showerror(
+                "买家流程操作失败",
+                error,
+                parent=self,
+            ),
+            log_title=f"买家流程操作：{action}",
+            task_scope=f"dongxiao:buyer-action:{action}:{run.run_id}",
+            store_app_id=run.store_app_id,
+        )
+
+    def _verify_buyer_order(self) -> None:
+        store = self._current_store()
+        run = self._selected_buyer_run()
+        order_id = self.buyer_order_id_var.get().strip()
+        if store is None or run is None or not order_id:
+            messagebox.showwarning(
+                "核验待付款订单",
+                "请选择流程并输入官方客户端生成的真实订单号。",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "核验官方订单",
+            (
+                "将通过当前店铺的官方商家订单接口读取该订单。\n"
+                "只验证订单是否存在及是否待付款，不会付款或修改订单。\n\n"
+                f"订单号：{order_id}\n是否继续？"
+            ),
+            parent=self,
+        ):
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.verify_merchant_order(
+                run.run_id,
+                order_id=order_id,
+                store=store,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda link: (
+                self._load_buyer_runs(),
+                self._load_orders(),
+                self.buyer_flow_status_var.set(
+                    f"官方订单核验：{link.status.value}；"
+                    "买家手机端仍需用户本人确认。"
+                ),
+            ),
+            lambda error: messagebox.showerror(
+                "官方订单核验失败",
+                error,
+                parent=self,
+            ),
+            log_title="核验真实买家待付款订单",
+            task_scope=f"dongxiao:buyer-order-verify:{run.run_id}",
+            store_app_id=str(store.app_id),
         )
 
     def _build_cart_batch_view(self) -> ttk.Frame:
@@ -2783,6 +3563,10 @@ class DongxiaoPage(BasePage):
             self._load_tasks()
         elif section.key == "accounts":
             self._load_cart_accounts()
+            self._load_buyer_accounts()
+        elif section.key == "buyer_flow":
+            self._load_buyer_accounts()
+            self._load_buyer_runs()
         elif section.key == "cart_batch":
             self._load_cart_accounts()
             self._load_cart_batches()
@@ -2818,6 +3602,7 @@ class DongxiaoPage(BasePage):
                 "cart_batch",
                 "pending_orders",
                 "accounts",
+                "buyer_flow",
             }
             and scope
             and not self.window.has_running_task(scope)
@@ -2828,6 +3613,10 @@ class DongxiaoPage(BasePage):
                 self._load_pending_orders()
             elif self._active_section == "accounts":
                 self._load_cart_accounts()
+                self._load_buyer_accounts()
+            elif self._active_section == "buyer_flow":
+                self._load_buyer_accounts()
+                self._load_buyer_runs()
             else:
                 self._load_tasks()
         self.after(2000, self._task_activity_tick)
@@ -2872,7 +3661,18 @@ class DongxiaoPage(BasePage):
         labels = [f"{store.name} · {store.app_id}" for store in stores]
         self.store_combo.configure(values=labels)
         if labels and self.store_var.get() not in labels:
-            self.store_var.set(labels[0])
+            target_store = next(
+                (
+                    store
+                    for store in stores
+                    if str(store.name).strip()
+                    == self.buyer_flow_service.TARGET_STORE_NAME
+                ),
+                stores[0],
+            )
+            self.store_var.set(
+                f"{target_store.name} · {target_store.app_id}"
+            )
         if not labels:
             self.store_var.set("")
         self.store_count_var.set(f"{len(labels)} 家店铺")
@@ -2908,6 +3708,7 @@ class DongxiaoPage(BasePage):
         self._load_products()
         self._load_pools()
         self._load_cart_accounts()
+        self._load_buyer_accounts()
         self._load_cart_batches()
         self._load_overview_stats()
 

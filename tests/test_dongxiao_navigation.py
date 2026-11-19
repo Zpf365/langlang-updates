@@ -44,6 +44,7 @@ def test_formal_sales_related_route_opens_dongxiao_center(
             "批量加购",
             "待付款订单",
             "多账号任务",
+            "买家完整流程",
             "任务中心",
             "订单与售后",
             "售后工单",
@@ -106,6 +107,10 @@ def test_formal_sales_related_route_opens_dongxiao_center(
         assert "product" in page.cart_preview_tree["columns"]
         assert page.pending_order_tree.winfo_exists()
         assert "status" in page.pending_order_tree["columns"]
+        assert page.buyer_account_tree.winfo_exists()
+        assert "identity" in page.buyer_account_tree["columns"]
+        assert page.buyer_run_tree.winfo_exists()
+        assert "order" in page.buyer_run_tree["columns"]
         page.section_buttons["orders"].invoke()
         window.update_idletasks()
         assert page.section_title_var.get() == "订单与售后"

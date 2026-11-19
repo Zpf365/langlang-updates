@@ -6,6 +6,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from ..buyer_flow.repository import BuyerFlowRepository
+from ..buyer_flow.service import DongxiaoBuyerFlowService
+from ..buyer_flow.session_vault import BuyerSessionVault
 from ..desktop_cart.executor import DesktopCartExecutor
 from ..desktop_cart.repository import DesktopCartRepository
 from ..desktop_cart.service import DesktopCartService
@@ -46,6 +49,10 @@ class DongxiaoRuntime:
         self.database_path = Path(database_path)
         self.repository = DongxiaoRepository(self.database_path)
         self.cart_repository = DesktopCartRepository(self.database_path)
+        self.buyer_flow_repository = BuyerFlowRepository(self.database_path)
+        self.buyer_session_vault = BuyerSessionVault(
+            self.database_path.parent
+        )
         self.session_id = _PROCESS_SESSION_ID
         self.clock = clock or (lambda: datetime.now(UTC))
         self._verification_lock = threading.RLock()
@@ -112,6 +119,12 @@ class DongxiaoRuntime:
             self.repository,
             self.task_service,
             scheduler=self.scheduler,
+        )
+        self.buyer_flow_service = DongxiaoBuyerFlowService(
+            self.buyer_flow_repository,
+            self.repository,
+            self.buyer_session_vault,
+            order_service=self.order_service,
         )
         self.preflight_service = DongxiaoPreflightService(
             self.repository,

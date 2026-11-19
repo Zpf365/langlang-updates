@@ -29,7 +29,12 @@ DONGXIAO_SECTIONS = (
     DongxiaoSection(
         "accounts",
         "多账号任务",
-        "执行账号、店铺绑定、分配与逐账号进度",
+        "商家执行账号与独立买家微信账号管理",
+    ),
+    DongxiaoSection(
+        "buyer_flow",
+        "买家完整流程",
+        "买家授权、商品预选、官方客户端交接和待付款订单核验",
     ),
     DongxiaoSection("tasks", "任务中心", "持久任务、进度与异常处理"),
     DongxiaoSection("orders", "订单与售后", "平台真实订单查询与核验"),
