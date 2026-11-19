@@ -4,10 +4,12 @@ import argparse
 import gc
 import json
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
 import tkinter as tk
+import traceback
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -195,6 +197,15 @@ def main() -> int:
     unknown_not_replayed = 0
     recovery_times: list[float] = []
     tk_gap_samples: list[float] = []
+    tk_gap_events: list[dict[str, object]] = []
+    tk_max_gap_context: dict[str, object] = {}
+    current_activity: dict[str, object] = {
+        "phase": "startup",
+        "cycle": 0,
+        "database_operation": "",
+        "thread": threading.current_thread().name,
+        "since": datetime.now(UTC).isoformat(timespec="milliseconds"),
+    }
 
     try:
         root = tk.Tk()
@@ -210,9 +221,47 @@ def main() -> int:
     last_tick = 0.0
 
     def ui_tick() -> None:
-        nonlocal last_tick
+        nonlocal last_tick, tk_max_gap_context
         now = time.perf_counter()
-        tk_gap_samples.append((now - last_tick) * 1000)
+        gap_ms = (now - last_tick) * 1000
+        tk_gap_samples.append(gap_ms)
+        if gap_ms >= 50:
+            main_frame = sys._current_frames().get(
+                threading.main_thread().ident
+            )
+            stack = (
+                "".join(traceback.format_stack(main_frame, limit=24))
+                if main_frame is not None
+                else "主线程调用栈不可用"
+            )
+            event = {
+                "timestamp_utc": datetime.now(UTC).isoformat(
+                    timespec="milliseconds"
+                ),
+                "gap_ms": round(gap_ms, 2),
+                "cycle": int(current_activity.get("cycle") or 0),
+                "phase": str(current_activity.get("phase") or ""),
+                "database_operation": str(
+                    current_activity.get("database_operation") or ""
+                ),
+                "thread": threading.current_thread().name,
+                "operation_since_utc": str(
+                    current_activity.get("since") or ""
+                ),
+                "tk_root_type": (
+                    f"{type(root).__module__}.{type(root).__name__}"
+                    if root is not None
+                    else "none"
+                ),
+                "is_formal_main_window": False,
+                "uses_formal_page_run_task": False,
+                "main_thread_stack": stack[-8000:],
+            }
+            tk_gap_events.append(event)
+            if len(tk_gap_events) > 200:
+                del tk_gap_events[:50]
+            if gap_ms > float(tk_max_gap_context.get("gap_ms") or 0):
+                tk_max_gap_context = event
         last_tick = now
         if root is not None:
             root.after(10, ui_tick)
@@ -285,6 +334,15 @@ def main() -> int:
         try:
             while time.monotonic() < deadline:
                 cycle += 1
+                current_activity.update({
+                    "phase": "cycle_start",
+                    "cycle": cycle,
+                    "database_operation": "",
+                    "thread": threading.current_thread().name,
+                    "since": datetime.now(UTC).isoformat(
+                        timespec="milliseconds"
+                    ),
+                })
                 iteration_started = time.monotonic()
                 if root is not None and page_frames:
                     page_frames[cycle % len(page_frames)].tkraise()
@@ -400,6 +458,16 @@ def main() -> int:
                     name="rc-fix1-soak-data",
                     daemon=True,
                 )
+                current_activity.update({
+                    "phase": "operational_worker_wait",
+                    "database_operation": (
+                        "task/catalog/order/aftersale upserts in worker thread"
+                    ),
+                    "thread": threading.current_thread().name,
+                    "since": datetime.now(UTC).isoformat(
+                        timespec="milliseconds"
+                    ),
+                })
                 operational_thread.start()
                 while operational_thread.is_alive():
                     pump_ui(0.02)
@@ -412,6 +480,10 @@ def main() -> int:
                 pending_tasks = list(current_tasks)
                 wait_deadline = time.monotonic() + 30
                 while pending_tasks and time.monotonic() < wait_deadline:
+                    current_activity["phase"] = "task_completion_wait"
+                    current_activity["database_operation"] = (
+                        "poll dongxiao_tasks and dongxiao_task_execution_items"
+                    )
                     remaining_tasks = []
                     for store, task_id in pending_tasks:
                         saved = repository.get_task(
@@ -470,6 +542,13 @@ def main() -> int:
 
                 now_monotonic = time.monotonic()
                 if now_monotonic >= next_network_at:
+                    current_activity.update({
+                        "phase": "network_interruption_probe",
+                        "database_operation": "read order history before/after failure",
+                        "since": datetime.now(UTC).isoformat(
+                            timespec="milliseconds"
+                        ),
+                    })
                     for store in stores:
                         before = len(
                             repository.list_order_records(
@@ -510,6 +589,16 @@ def main() -> int:
                     next_network_at = now_monotonic + 30
 
                 if now_monotonic >= next_database_at:
+                    current_activity.update({
+                        "phase": "database_exception_probe",
+                        "database_operation": (
+                            "standalone SQLite migration, trigger injection, "
+                            "and rollback probe"
+                        ),
+                        "since": datetime.now(UTC).isoformat(
+                            timespec="milliseconds"
+                        ),
+                    })
                     try:
                         if not _exception_probe(
                             root_path / f"exception-{cycle}.db"
@@ -522,6 +611,16 @@ def main() -> int:
                     next_database_at = now_monotonic + 120
 
                 if now_monotonic >= next_restart_at:
+                    current_activity.update({
+                        "phase": "restart_recovery_probe",
+                        "database_operation": (
+                            "recover RUNNING task lease and verify UNKNOWN "
+                            "is not runnable"
+                        ),
+                        "since": datetime.now(UTC).isoformat(
+                            timespec="milliseconds"
+                        ),
+                    })
                     restart_started = time.perf_counter()
                     task_id, item_id = _insert_restart_probe(
                         repository,
@@ -610,6 +709,8 @@ def main() -> int:
         "native_threads_end": process.num_threads(),
         "tk_measured": bool(tk_gap_samples),
         "tk_max_gap_ms": round(max(tk_gap_samples, default=0.0), 2),
+            "tk_max_gap_context": tk_max_gap_context,
+            "tk_gap_events_over_50ms": tk_gap_events,
         "database_bytes": database_size,
     }
     text = json.dumps(result, ensure_ascii=False, indent=2)

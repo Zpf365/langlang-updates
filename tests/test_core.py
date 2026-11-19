@@ -1124,6 +1124,7 @@ class CoreTests(unittest.TestCase):
 
         client = FakeClient()
         service = SyncService(self.db)
+        service.platform_write_authorizer = lambda _app_id, _action: None
         service.client_for = lambda _store: client
         source_urls = [
             "https://img.alicdn.com/example-1.jpg",
@@ -1206,7 +1207,9 @@ class CoreTests(unittest.TestCase):
                 raise RuntimeError("audit pending")
 
         client = FakeClient()
-        result = SyncService(self.db).product_write(
+        service = SyncService(self.db)
+        service.platform_write_authorizer = lambda _app_id, _action: None
+        result = service.product_write(
             store,
             "add",
             {
@@ -1902,7 +1905,11 @@ class CoreTests(unittest.TestCase):
             "weimi_manager.service.ShopPrivateClient",
             FakePrivateClient,
         ):
-            applied = SyncService(self.db).apply_platform_activity(
+            service = SyncService(self.db)
+            service.platform_write_authorizer = (
+                lambda _app_id, _action: None
+            )
+            applied = service.apply_platform_activity(
                 store,
                 1323,
             )
@@ -2019,7 +2026,11 @@ class CoreTests(unittest.TestCase):
             "weimi_manager.service.ShopPrivateClient",
             FakePrivateClient,
         ):
-            result = SyncService(self.db).activity_submit_items(
+            service = SyncService(self.db)
+            service.platform_write_authorizer = (
+                lambda _app_id, _action: None
+            )
+            result = service.activity_submit_items(
                 store,
                 1323,
                 items,
@@ -2156,6 +2167,7 @@ class CoreTests(unittest.TestCase):
             transport=transport,
             sleeper=lambda _: None,
             min_request_interval=0,
+            write_authorizer=lambda _app_id, _action: None,
         )
         client.set_product_listing("P1", listed=True)
         client.set_product_listing("P1", listed=False)
@@ -2170,6 +2182,8 @@ class CoreTests(unittest.TestCase):
     def test_client_builds_official_league_and_price_requests(self) -> None:
         calls = []
         client = object.__new__(WechatShopClient)
+        client.app_id = "wx-test"
+        client.write_authorizer = lambda _app_id, _action: None
 
         def post(path, payload):
             calls.append((path, dict(payload)))
@@ -2195,6 +2209,9 @@ class CoreTests(unittest.TestCase):
             return {"errcode": 0, "errmsg": "ok"}
 
         client._post_api = post
+        client._post_write_api = (
+            lambda path, payload, *, action: post(path, payload)
+        )
         client.batch_add_league_items(
             [{"product_id": "100", "ratio": 20}],
         )
@@ -2262,6 +2279,7 @@ class CoreTests(unittest.TestCase):
                 return {"errcode": 0}
 
         service = SyncService(self.db)
+        service.platform_write_authorizer = lambda _app_id, _action: None
         service.client_for = lambda _store: FakeClient()
         errors = service.create_limited_discount_tasks(
             store,

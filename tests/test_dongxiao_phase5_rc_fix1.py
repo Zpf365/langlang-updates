@@ -33,6 +33,8 @@ from weimi_manager.dongxiao.domain.enums import (
 )
 from weimi_manager.dongxiao.domain.models import AftersaleCase, Approval
 from weimi_manager.dongxiao.domain.operations import (
+    PreflightCheck,
+    PreflightReport,
     PreflightState,
     TaskExecutionError,
 )
@@ -40,6 +42,7 @@ from weimi_manager.dongxiao.infrastructure.executors import (
     AftersaleDecisionExecutor,
 )
 from weimi_manager.dongxiao.infrastructure.repository import DongxiaoRepository
+from weimi_manager.service import SyncService
 from weimi_manager.wechat_api import (
     WechatApiError,
     WechatNetworkError,
@@ -206,7 +209,7 @@ def test_missing_empty_corrupt_and_incompatible_backups_fail_safely(
     conn = sqlite3.connect(incompatible)
     try:
         conn.execute(
-            "DELETE FROM dongxiao_schema_migrations WHERE version=6"
+            "DELETE FROM dongxiao_schema_migrations WHERE version=7"
         )
         conn.commit()
     finally:
@@ -572,6 +575,10 @@ def test_enable_requires_current_store_verification_and_expires_after_ten_minute
         permission_checker=lambda _permission: True,
     )
     assert runtime.platform_write_gate(store.app_id) is True
+    assert (
+        preflight._write_guard_check(store.app_id).state
+        is PreflightState.PASSED
+    )
     other_store_id = db.add_store(
         "Phase5 Fix1 其他店铺",
         "wx-phase5-fix1-other",
@@ -586,7 +593,8 @@ def test_enable_requires_current_store_verification_and_expires_after_ten_minute
     runtime.set_platform_writes_enabled(
         False,
         actor_id="owner",
-        permission_checker=lambda _permission: True,
+        permission_checker=lambda _permission: False,
+        emergency=True,
     )
     report = preflight.run_platform_readonly(
         store,
@@ -606,6 +614,229 @@ def test_enable_requires_current_store_verification_and_expires_after_ten_minute
     runtime.clock = lambda: now
     assert runtime.platform_write_gate(store.app_id) is False
     runtime.stop()
+
+
+def _passing_report(store, now: datetime) -> PreflightReport:
+    codes = (
+        ("store_authorization", "店铺授权"),
+        ("product_api", "商品接口"),
+        ("order_api", "订单接口"),
+        ("aftersale_read_api", "售后读取"),
+        ("database_integrity", "数据库"),
+    )
+    return PreflightReport(
+        generated_at=now,
+        store_app_id=store.app_id,
+        checks=tuple(
+            PreflightCheck(
+                code=code,
+                label=label,
+                state=PreflightState.PASSED,
+                message="通过",
+            )
+            for code, label in codes
+        ),
+    )
+
+
+def test_store_write_switches_are_independent_and_emergency_close_clears_all(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 11, 19, 2, 0, tzinfo=UTC)
+    db, first_store, _backup = _environment(tmp_path)
+    second_id = db.add_store(
+        "第二真实写店铺",
+        "wx-phase5-fix1-second",
+        "z" * 32,
+    )
+    second_store = db.get_store(second_id)
+    assert second_store is not None
+    runtime, _preflight_service = _preflight(
+        db,
+        _SyncService(),
+        clock=lambda: now,
+    )
+    runtime.remember_platform_readonly_report(
+        _passing_report(first_store, now)
+    )
+    runtime.set_platform_writes_enabled(
+        True,
+        store=first_store,
+        actor_id="owner",
+        permission_checker=lambda _permission: True,
+    )
+    runtime.remember_platform_readonly_report(
+        _passing_report(second_store, now)
+    )
+    runtime.set_platform_writes_enabled(
+        True,
+        store=second_store,
+        actor_id="owner",
+        permission_checker=lambda _permission: True,
+    )
+
+    assert runtime.store_platform_writes_enabled(first_store.app_id) is True
+    assert runtime.store_platform_writes_enabled(second_store.app_id) is True
+    runtime.set_platform_writes_enabled(
+        False,
+        store=first_store,
+        actor_id="owner",
+        permission_checker=lambda _permission: True,
+    )
+    assert runtime.store_platform_writes_enabled(first_store.app_id) is False
+    assert runtime.store_platform_writes_enabled(second_store.app_id) is True
+    runtime.set_platform_writes_enabled(
+        False,
+        actor_id="owner",
+        permission_checker=lambda _permission: True,
+    )
+    assert runtime.store_platform_writes_enabled(first_store.app_id) is False
+    assert runtime.store_platform_writes_enabled(second_store.app_id) is False
+    runtime.stop()
+
+
+def test_new_process_resets_all_per_store_write_switches(
+    tmp_path: Path,
+) -> None:
+    db, store, _backup = _environment(tmp_path)
+    repository = DongxiaoRepository(db.path)
+    repository.set_store_platform_writes_enabled(
+        store.app_id,
+        True,
+        session_id="previous",
+        actor_id="previous",
+    )
+    repository.set_platform_writes_enabled(True, actor_id="previous")
+    code = (
+        "from weimi_manager.dongxiao.application.runtime import "
+        "DongxiaoRuntime;"
+        f"DongxiaoRuntime(r'{db.path}', object())"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path.cwd())
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path.cwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert repository.store_platform_writes_enabled(store.app_id) is False
+    assert repository.platform_writes_enabled() is False
+
+
+def test_official_client_and_sync_service_block_writes_before_network(
+    tmp_path: Path,
+) -> None:
+    db, store, _backup = _environment(tmp_path)
+    calls: list[tuple[str, str]] = []
+
+    def deny(app_id: str, action: str) -> None:
+        calls.append((app_id, action))
+        raise PermissionError("真实平台写操作已关闭")
+
+    transport = _Transport()
+    client = WechatShopClient(
+        store.app_id,
+        "s" * 32,
+        transport=transport,
+        min_request_interval=0,
+        write_authorizer=deny,
+    )
+    with pytest.raises(PermissionError):
+        client.set_product_listing("product-1", True)
+    assert transport.calls == []
+    assert calls[-1] == (store.app_id, "product_listing")
+
+    service = SyncService(db)
+    service.platform_write_authorizer = deny
+    with pytest.raises(PermissionError):
+        service.update_order_notes(store, "order-1", "test", 0)
+    assert calls[-1] == (store.app_id, "order_notes_update")
+
+
+def test_sync_service_fails_closed_without_runtime_authorizer(
+    tmp_path: Path,
+) -> None:
+    db, store, _backup = _environment(tmp_path)
+    service = SyncService(db)
+
+    with pytest.raises(PermissionError, match="缺少当前会话安全门"):
+        service.update_order_notes(store, "order-1", "test", 0)
+    store.web_status = "已登录"
+    with pytest.raises(PermissionError, match="缺少当前会话安全门"):
+        service.apply_platform_activity(store, 1)
+
+
+def test_official_client_fails_closed_without_write_authorizer() -> None:
+    transport = _Transport()
+    client = WechatShopClient(
+        "wx-no-authorizer",
+        "s" * 32,
+        transport=transport,
+        min_request_interval=0,
+    )
+
+    with pytest.raises(PermissionError, match="未连接当前会话写操作安全门"):
+        client.set_product_listing("product-1", True)
+    assert transport.calls == []
+
+
+def test_write_api_never_retries_ambiguous_rate_limit_or_network_failure(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+
+    class AmbiguousTransport:
+        def __init__(self) -> None:
+            self.write_calls = 0
+
+        def post_json(self, url: str, payload: dict) -> dict:
+            del payload
+            if "/stable_token" in url:
+                return {
+                    "errcode": 0,
+                    "access_token": "TOKEN",
+                    "expires_in": 7200,
+                }
+            self.write_calls += 1
+            return {"errcode": 45011, "errmsg": "freq limit"}
+
+    transport = AmbiguousTransport()
+    client = WechatShopClient(
+        "wx-write-safety",
+        "s" * 32,
+        transport=transport,
+        min_request_interval=0,
+        write_authorizer=lambda _app_id, _action: None,
+    )
+    with pytest.raises(WechatApiError) as exc_info:
+        client.set_product_listing("product-1", True)
+    assert exc_info.value.code == 45011
+    assert transport.write_calls == 1
+
+    class NetworkTransport(AmbiguousTransport):
+        def post_json(self, url: str, payload: dict) -> dict:
+            if "/stable_token" in url:
+                return super().post_json(url, payload)
+            self.write_calls += 1
+            raise WechatNetworkError("connection dropped")
+
+    network_transport = NetworkTransport()
+    network_client = WechatShopClient(
+        "wx-write-network",
+        "s" * 32,
+        transport=network_transport,
+        min_request_interval=0,
+        write_authorizer=lambda _app_id, _action: None,
+    )
+    with pytest.raises(WechatNetworkError):
+        network_client.set_product_listing("product-1", True)
+    assert network_transport.write_calls == 1
 
 
 def test_idle_scheduler_passes_but_pending_work_without_thread_fails(

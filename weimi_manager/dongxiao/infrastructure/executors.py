@@ -145,16 +145,28 @@ class CompositeTaskExecutor:
         order_service: DongxiaoOrderService,
         aftersale_service: DongxiaoAftersaleService,
         aftersale_decision_executor: "AftersaleDecisionExecutor | None" = None,
+        desktop_cart_executor=None,
     ) -> None:
         self.repository = repository
         self.local_sku = LocalSkuValidationExecutor(repository)
         self.order_service = order_service
         self.aftersale_service = aftersale_service
         self.aftersale_decision_executor = aftersale_decision_executor
+        self.desktop_cart_executor = desktop_cart_executor
 
     def execute(self, item: TaskExecutionItem) -> dict[str, object]:
         store = self._store(item)
         try:
+            if (
+                item.subject_type == "product"
+                and item.payload.get("desktop_cart")
+            ):
+                if self.desktop_cart_executor is None:
+                    raise TaskExecutionError(
+                        "cart_executor_unavailable",
+                        "桌面加购执行器未配置",
+                    )
+                return self.desktop_cart_executor.execute(item)
             if item.subject_type == "product":
                 return self.local_sku.execute(item)
             if item.subject_type == "order":
@@ -225,6 +237,16 @@ class CompositeTaskExecutor:
 
     def verify(self, item: TaskExecutionItem) -> dict[str, object]:
         store = self._store(item)
+        if (
+            item.subject_type == "product"
+            and item.payload.get("desktop_cart")
+        ):
+            if self.desktop_cart_executor is None:
+                raise TaskExecutionError(
+                    "cart_executor_unavailable",
+                    "桌面加购执行器未配置",
+                )
+            return self.desktop_cart_executor.verify(item)
         if item.subject_type == "order":
             record = self.order_service.sync_order(
                 store,

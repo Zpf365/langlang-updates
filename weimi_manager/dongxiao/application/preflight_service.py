@@ -46,6 +46,7 @@ class DongxiaoPreflightService:
     def run_local(
         self,
         *,
+        store=None,
         actor_id: str,
         permission_checker,
     ) -> PreflightReport:
@@ -68,7 +69,9 @@ class DongxiaoPreflightService:
                 state=PreflightState.PASSED,
                 message="当前账号具备动销实盘前检查权限",
             ),
-            self._write_guard_check(),
+            self._write_guard_check(
+                str(getattr(store, "app_id", "") or "")
+            ),
             PreflightCheck(
                 code="store_authorization",
                 label="店铺授权",
@@ -106,6 +109,7 @@ class DongxiaoPreflightService:
         return PreflightReport(
             generated_at=self.clock(),
             checks=tuple(checks),
+            store_app_id=str(getattr(store, "app_id", "") or ""),
         )
 
     def run_platform_readonly(
@@ -129,8 +133,9 @@ class DongxiaoPreflightService:
             None,
         )
         if callable(invalidate):
-            invalidate()
+            invalidate(str(getattr(store, "app_id", "") or ""))
         local = self.run_local(
+            store=store,
             actor_id="platform-readonly",
             permission_checker=permission_checker,
         )
@@ -346,7 +351,7 @@ class DongxiaoPreflightService:
                 "迁移版本",
                 self._safe_error("无法读取迁移版本", exc),
             )
-        passed = summary["latest"] == 6
+        passed = summary["latest"] == DONGXIAO_MIGRATION_VERSION
         return PreflightCheck(
             code="migration_version",
             label="迁移版本",
@@ -356,9 +361,12 @@ class DongxiaoPreflightService:
                 else PreflightState.FAILED
             ),
             message=(
-                "已应用 v6 release candidate 迁移"
+                f"已应用 v{DONGXIAO_MIGRATION_VERSION} 动销迁移"
                 if passed
-                else f"当前迁移版本为 v{summary['latest']}，预期 v6"
+                else (
+                    f"当前迁移版本为 v{summary['latest']}，"
+                    f"预期 v{DONGXIAO_MIGRATION_VERSION}"
+                )
             ),
             detail=str(summary["latest_name"]),
         )
@@ -587,9 +595,13 @@ class DongxiaoPreflightService:
             ),
         )
 
-    def _write_guard_check(self) -> PreflightCheck:
+    def _write_guard_check(self, store_app_id: str = "") -> PreflightCheck:
         try:
-            enabled = self.repository.platform_writes_enabled()
+            enabled = (
+                self.runtime.store_platform_writes_enabled(store_app_id)
+                if self.runtime is not None and store_app_id
+                else self.repository.platform_writes_enabled()
+            )
         except Exception as exc:
             return self._failed(
                 "platform_write_guard",
@@ -598,16 +610,22 @@ class DongxiaoPreflightService:
             )
         return PreflightCheck(
             code="platform_write_guard",
-            label="平台写操作总开关",
-            state=(
-                PreflightState.FAILED
-                if enabled
-                else PreflightState.PASSED
+            label=(
+                "当前店铺真实平台写操作"
+                if store_app_id
+                else "真实平台写操作紧急总闸"
             ),
+            state=PreflightState.PASSED,
             message=(
-                "总开关当前开启；实盘前默认状态必须关闭"
+                "当前店铺真实平台写操作已开启，"
+                "执行层仍会逐项校验权限、验收有效期和审批"
                 if enabled
-                else "总开关已关闭，所有新的平台写操作均被阻止"
+                else (
+                    "当前店铺真实平台写操作已关闭，"
+                    "只读检查与数据管理不受影响"
+                    if store_app_id
+                    else "紧急总闸已关闭，所有店铺平台写操作均被禁止"
+                )
             ),
         )
 

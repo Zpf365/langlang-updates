@@ -16,6 +16,7 @@ from weimi_manager.dongxiao.infrastructure.migrations import (
     DONGXIAO_V4_CHECKSUM,
     DONGXIAO_V5_CHECKSUM,
     DONGXIAO_V6_CHECKSUM,
+    DONGXIAO_V7_CHECKSUM,
     migrate_dongxiao_schema,
 )
 from weimi_manager.sales_related.migrations import (
@@ -46,6 +47,15 @@ REQUIRED_TABLES = {
     "dongxiao_aftersale_status_history",
     "dongxiao_api_calls",
     "dongxiao_runtime_settings",
+    "dongxiao_store_write_settings",
+    "dongxiao_cart_accounts",
+    "dongxiao_cart_batches",
+    "dongxiao_cart_assignments",
+    "dongxiao_cart_results",
+    "dongxiao_cart_verifications",
+    "dongxiao_cart_mock_state",
+    "dongxiao_cart_mock_operations",
+    "dongxiao_pending_order_drafts",
 }
 
 
@@ -82,10 +92,10 @@ def test_dongxiao_migration_creates_isolated_schema(
         }
         assert changed is True
         assert REQUIRED_TABLES.issubset(tables)
-        assert backups == ["pre-dongxiao-v6"]
+        assert backups == ["pre-dongxiao-v7"]
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
         product_columns = {
             str(row[1])
             for row in conn.execute(
@@ -171,7 +181,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
             lambda label: backups.append(label) or backup,
         )
 
-        assert backups == ["pre-dongxiao-v6"]
+        assert backups == ["pre-dongxiao-v7"]
         assert conn.execute(
             "SELECT COUNT(*) FROM sales_audit_logs"
         ).fetchone()[0] == 1
@@ -183,7 +193,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
         ).fetchone()[0] == old_checksum
         assert conn.execute(
             "SELECT COUNT(*) FROM dongxiao_schema_migrations"
-        ).fetchone()[0] == 6
+        ).fetchone()[0] == 7
     finally:
         conn.close()
 
@@ -277,6 +287,12 @@ def test_v6_checksum_is_frozen_for_release_candidate_migration() -> None:
     assert hashlib.sha256(
         migration_module._migration_v6_sql().encode("utf-8")
     ).hexdigest() == DONGXIAO_V6_CHECKSUM
+
+
+def test_v7_checksum_is_frozen_for_final_release_migration() -> None:
+    assert hashlib.sha256(
+        migration_module._migration_v7_sql().encode("utf-8")
+    ).hexdigest() == DONGXIAO_V7_CHECKSUM
 
 
 def test_failed_v3_migration_rolls_back_only_v3_and_keeps_v2_complete(
@@ -599,7 +615,9 @@ def test_v5_upgrades_v4_history_and_deduplicates_pending_approvals(
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        ).fetchall() == [
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,)
+        ]
     finally:
         conn.close()
 
@@ -829,7 +847,9 @@ def test_v6_upgrades_v5_history_and_defaults_platform_writes_off(
         ).fetchone() == ("0",)
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        ).fetchall() == [
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,)
+        ]
         assert not migrate_dongxiao_schema(
             conn,
             path,
@@ -907,6 +927,138 @@ def test_failed_v6_migration_rolls_back_only_v6_and_keeps_v5_complete(
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
         ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]
+    finally:
+        conn.close()
+
+
+def test_v7_upgrades_v6_with_per_store_write_settings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "upgrade-v7.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE stores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id TEXT NOT NULL UNIQUE
+            );
+            INSERT INTO stores(app_id) VALUES('wx-store-v7');
+            """
+        )
+        conn.commit()
+        migrations = list(migration_module._migrations())
+        monkeypatch.setattr(
+            migration_module,
+            "_migrations",
+            lambda: migrations[:6],
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "_verify_required_tables",
+            lambda _conn: None,
+        )
+        migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".v6.backup"),
+        )
+        monkeypatch.undo()
+
+        assert migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".v7.backup"),
+        )
+        assert conn.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='dongxiao_store_write_settings'
+            """
+        ).fetchone() == ("dongxiao_store_write_settings",)
+        assert conn.execute(
+            "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
+        ).fetchall() == [
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,)
+        ]
+        assert not migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".repeat.backup"),
+        )
+    finally:
+        conn.close()
+
+
+def test_failed_v7_migration_rolls_back_only_v7_and_keeps_v6_complete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "rollback-v7.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE stores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id TEXT NOT NULL UNIQUE
+            );
+            INSERT INTO stores(app_id) VALUES('wx-store-v7');
+            """
+        )
+        conn.commit()
+        migrations = list(migration_module._migrations())
+        monkeypatch.setattr(
+            migration_module,
+            "_migrations",
+            lambda: migrations[:6],
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "_verify_required_tables",
+            lambda _conn: None,
+        )
+        migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".v6.backup"),
+        )
+        monkeypatch.undo()
+        failing_v7 = """
+            CREATE TABLE dongxiao_failure_probe_v7 (id INTEGER);
+            INSERT INTO table_that_does_not_exist(id) VALUES(1);
+        """
+        monkeypatch.setattr(
+            migration_module,
+            "_migration_v7_sql",
+            lambda: failing_v7,
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "DONGXIAO_V7_CHECKSUM",
+            hashlib.sha256(failing_v7.encode("utf-8")).hexdigest(),
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            migrate_dongxiao_schema(
+                conn,
+                path,
+                lambda _label: path.with_suffix(".v7.backup"),
+            )
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "dongxiao_failure_probe_v7" not in tables
+        assert "dongxiao_store_write_settings" not in tables
+        assert conn.execute(
+            "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
+        ).fetchall() == [
+            (1,), (2,), (3,), (4,), (5,), (6,)
+        ]
     finally:
         conn.close()
 

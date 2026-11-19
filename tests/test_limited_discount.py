@@ -17,6 +17,19 @@ from weimi_manager.ui.activity_center import ActivityCenterPage
 from weimi_manager.ui.theme import apply_theme
 
 
+@pytest.fixture(autouse=True)
+def _allow_fake_private_writes(monkeypatch):
+    original_init = SyncService.__init__
+
+    def init(service, *args, **kwargs):
+        original_init(service, *args, **kwargs)
+        service.platform_write_authorizer = (
+            lambda _app_id, _action: None
+        )
+
+    monkeypatch.setattr(SyncService, "__init__", init)
+
+
 def test_activity_center_nine_discount_flows_to_bulk_import_template() -> None:
     class ActivityClient:
         def __init__(self, *_args, **_kwargs):

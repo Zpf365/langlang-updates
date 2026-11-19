@@ -588,7 +588,7 @@ class TaskExecutionItem:
             _required_text(self.store_app_id, "店铺 AppID"),
         )
         subject_type = str(self.subject_type or "").strip()
-        if subject_type not in {"product", "order", "aftersale"}:
+        if subject_type not in {"product", "order", "aftersale", "cart"}:
             raise ValueError("任务执行对象类型不受支持")
         object.__setattr__(self, "subject_type", subject_type)
         object.__setattr__(

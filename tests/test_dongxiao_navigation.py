@@ -36,15 +36,19 @@ def test_formal_sales_related_route_opens_dongxiao_center(
             button.cget("text")
             for button in page.section_buttons.values()
         ] == [
-            "总览",
-            "店铺连接",
-            "商品池",
+            "总览与任务",
+            "店铺与授权",
+            "商品池管理",
             "商品筛选",
             "SKU 规则",
+            "批量加购",
+            "待付款订单",
+            "多账号任务",
             "任务中心",
-            "真实订单",
+            "订单与售后",
             "售后工单",
-            "日志审计",
+            "日志与诊断",
+            "真实操作管理",
             "实盘前检查",
         ]
 
@@ -89,9 +93,22 @@ def test_formal_sales_related_route_opens_dongxiao_center(
         } == set(page.order_tree["columns"])
         assert "case_id" in page.aftersale_tree["columns"]
         assert "action" in page.audit_tree["columns"]
+        assert page.cart_account_tree.winfo_exists()
+        assert set(page.cart_account_tree["columns"]) == {
+            "name",
+            "mode",
+            "status",
+            "store",
+            "checked",
+            "error",
+        }
+        assert page.cart_preview_tree.winfo_exists()
+        assert "product" in page.cart_preview_tree["columns"]
+        assert page.pending_order_tree.winfo_exists()
+        assert "status" in page.pending_order_tree["columns"]
         page.section_buttons["orders"].invoke()
         window.update_idletasks()
-        assert page.section_title_var.get() == "真实订单"
+        assert page.section_title_var.get() == "订单与售后"
 
         store_id = window.base_db.add_store(
             "动销界面测试店铺",

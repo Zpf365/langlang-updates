@@ -23,8 +23,8 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 6
-DONGXIAO_MIGRATION_NAME = "dongxiao_release_candidate_v6"
+DONGXIAO_MIGRATION_VERSION = 7
+DONGXIAO_MIGRATION_NAME = "dongxiao_final_release_v7"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
 )
@@ -42,6 +42,9 @@ DONGXIAO_V5_CHECKSUM = (
 )
 DONGXIAO_V6_CHECKSUM = (
     "26c3bfc3bc3e19fde485fc8972b09e7b630daad303780d2d0ee63ca408d18673"
+)
+DONGXIAO_V7_CHECKSUM = (
+    "6cdff17dc4c3f149b05b5b9de8d53d26ab5ddd3c9a3e0a438c4512ec6f14c785"
 )
 
 
@@ -1020,6 +1023,280 @@ INSERT OR IGNORE INTO dongxiao_runtime_settings(
 """
 
 
+def _migration_v7_sql() -> str:
+    return """
+CREATE TABLE IF NOT EXISTS dongxiao_store_write_settings (
+    store_app_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    session_id TEXT NOT NULL DEFAULT '',
+    enabled_at TEXT,
+    enabled_by TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_store_write_settings_state_v7
+    ON dongxiao_store_write_settings(enabled, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS dongxiao_cart_accounts (
+    account_id TEXT PRIMARY KEY,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    adapter_mode TEXT NOT NULL
+        CHECK (adapter_mode IN ('mock', 'official', 'manual', 'unknown')),
+    status TEXT NOT NULL CHECK (status IN (
+        'pending_authorization', 'connected', 'expired',
+        'disconnected', 'mock_ready'
+    )),
+    authorization_ref TEXT NOT NULL DEFAULT '',
+    last_connected_at TEXT,
+    last_checked_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (length(trim(account_id)) > 0),
+    CHECK (length(trim(store_app_id)) > 0),
+    CHECK (length(trim(display_name)) > 0),
+    UNIQUE (store_app_id, display_name)
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_cart_accounts_store_v7
+    ON dongxiao_cart_accounts(store_app_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS dongxiao_cart_batches (
+    batch_id TEXT PRIMARY KEY,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    pool_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'draft', 'awaiting_confirmation', 'queued', 'running',
+        'paused', 'completed', 'partially_failed', 'failed',
+        'cancelled', 'unknown'
+    )),
+    total_products INTEGER NOT NULL CHECK (total_products > 0),
+    products_per_batch INTEGER NOT NULL CHECK (products_per_batch > 0),
+    quantity_per_product INTEGER NOT NULL CHECK (quantity_per_product > 0),
+    sku_mode TEXT NOT NULL
+        CHECK (sku_mode IN ('first_available', 'lowest_price', 'specified')),
+    specified_sku_id TEXT NOT NULL DEFAULT '',
+    out_of_stock_policy TEXT NOT NULL
+        CHECK (out_of_stock_policy IN ('skip', 'fail')),
+    speed_mode TEXT NOT NULL
+        CHECK (speed_mode IN ('conservative', 'adaptive', 'fast', 'custom')),
+    interval_ms INTEGER NOT NULL CHECK (interval_ms BETWEEN 250 AND 600000),
+    concurrency INTEGER NOT NULL CHECK (concurrency BETWEEN 1 AND 4),
+    adapter_mode TEXT NOT NULL
+        CHECK (adapter_mode IN ('mock', 'official', 'manual', 'unknown')),
+    created_by TEXT NOT NULL DEFAULT '',
+    confirmed_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (store_app_id, idempotency_key),
+    UNIQUE (batch_id, store_app_id),
+    FOREIGN KEY (pool_id, store_app_id)
+        REFERENCES dongxiao_product_pools(pool_id, store_app_id)
+        ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_cart_batches_store_v7
+    ON dongxiao_cart_batches(store_app_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS dongxiao_cart_assignments (
+    assignment_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    sequence_no INTEGER NOT NULL CHECK (sequence_no > 0),
+    task_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN (
+        'pending', 'running', 'completed', 'failed', 'cancelled', 'unknown'
+    )),
+    total_items INTEGER NOT NULL DEFAULT 0 CHECK (total_items >= 0),
+    succeeded_items INTEGER NOT NULL DEFAULT 0 CHECK (succeeded_items >= 0),
+    failed_items INTEGER NOT NULL DEFAULT 0 CHECK (failed_items >= 0),
+    skipped_items INTEGER NOT NULL DEFAULT 0 CHECK (skipped_items >= 0),
+    unknown_items INTEGER NOT NULL DEFAULT 0 CHECK (unknown_items >= 0),
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (batch_id, account_id),
+    UNIQUE (batch_id, sequence_no),
+    FOREIGN KEY (batch_id)
+        REFERENCES dongxiao_cart_batches(batch_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (account_id)
+        REFERENCES dongxiao_cart_accounts(account_id)
+        ON DELETE RESTRICT,
+    CHECK (
+        succeeded_items + failed_items + skipped_items + unknown_items
+        <= total_items
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_cart_assignments_task_v7
+    ON dongxiao_cart_assignments(task_id);
+
+CREATE TABLE IF NOT EXISTS dongxiao_cart_results (
+    result_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    store_name TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    product_title TEXT NOT NULL,
+    sku_id TEXT NOT NULL,
+    specs_json TEXT NOT NULL DEFAULT '{}',
+    unit_price_cents INTEGER NOT NULL
+        CHECK (unit_price_cents BETWEEN 1 AND 999999999999),
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    batch_no INTEGER NOT NULL CHECK (batch_no > 0),
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'succeeded', 'failed', 'skipped', 'unknown')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    failure_code TEXT NOT NULL DEFAULT '',
+    failure_reason TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    verification_source TEXT NOT NULL
+        CHECK (verification_source IN ('mock', 'official', 'manual', 'unknown')),
+    verification_token TEXT NOT NULL DEFAULT '',
+    UNIQUE (batch_id, account_id, product_id, sku_id),
+    FOREIGN KEY (batch_id, account_id)
+        REFERENCES dongxiao_cart_assignments(batch_id, account_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_cart_results_store_v7
+    ON dongxiao_cart_results(store_app_id, status, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_cart_results_batch_v7
+    ON dongxiao_cart_results(batch_id, account_id, batch_no, started_at);
+
+CREATE TABLE IF NOT EXISTS dongxiao_cart_verifications (
+    verification_id TEXT PRIMARY KEY,
+    result_id TEXT NOT NULL,
+    store_app_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    sku_id TEXT NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity >= 0),
+    unit_price_cents INTEGER NOT NULL CHECK (unit_price_cents >= 0),
+    source TEXT NOT NULL
+        CHECK (source IN ('mock', 'official', 'manual', 'unknown')),
+    server_state_token TEXT NOT NULL,
+    raw_fingerprint TEXT NOT NULL DEFAULT '',
+    verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+    reason TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    FOREIGN KEY (result_id)
+        REFERENCES dongxiao_cart_results(result_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_cart_verifications_result_v7
+    ON dongxiao_cart_verifications(result_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS dongxiao_cart_mock_state (
+    store_app_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    sku_id TEXT NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity >= 0),
+    unit_price_cents INTEGER NOT NULL CHECK (unit_price_cents > 0),
+    server_state_token TEXT NOT NULL,
+    raw_fingerprint TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (store_app_id, account_id, product_id, sku_id)
+);
+
+CREATE TABLE IF NOT EXISTS dongxiao_cart_mock_operations (
+    operation_key TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    store_app_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    sku_id TEXT NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    completed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dongxiao_pending_order_drafts (
+    draft_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+    store_app_id TEXT NOT NULL,
+    store_name TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'draft', 'awaiting_approval', 'approved', 'cancelled',
+        'verified', 'official_create_unsupported'
+    )),
+    item_count INTEGER NOT NULL CHECK (item_count >= 0),
+    total_amount_cents INTEGER NOT NULL
+        CHECK (total_amount_cents BETWEEN 0 AND 999999999999),
+    approval_id TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL DEFAULT '',
+    decided_at TEXT,
+    official_order_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (batch_id, account_id),
+    FOREIGN KEY (batch_id, account_id)
+        REFERENCES dongxiao_cart_assignments(batch_id, account_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_pending_order_drafts_store_v7
+    ON dongxiao_pending_order_drafts(store_app_id, status, created_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_dongxiao_cart_accounts_store_v7
+BEFORE INSERT ON dongxiao_cart_accounts
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+      WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'cart account store identity mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dongxiao_cart_batches_store_v7
+BEFORE INSERT ON dongxiao_cart_batches
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+      WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'cart batch store identity mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dongxiao_cart_results_store_v7
+BEFORE INSERT ON dongxiao_cart_results
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+      WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'cart result store identity mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dongxiao_pending_order_drafts_store_v7
+BEFORE INSERT ON dongxiao_pending_order_drafts
+WHEN NEW.store_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM stores
+      WHERE id=NEW.store_id AND app_id=NEW.store_app_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'pending order draft store identity mismatch');
+END;
+"""
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
@@ -1028,6 +1305,7 @@ def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
         (4, "dongxiao_operations_v4", _migration_v4_sql),
         (5, "dongxiao_fix1_integrity_v5", _migration_v5_sql),
         (6, "dongxiao_release_candidate_v6", _migration_v6_sql),
+        (7, "dongxiao_final_release_v7", _migration_v7_sql),
     )
 
 
@@ -1118,6 +1396,10 @@ def migrate_dongxiao_schema(
             raise sqlite3.IntegrityError(
                 "动销中心 v6 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
+        if version == 7 and current_checksum != DONGXIAO_V7_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v7 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
             conn.executescript(
@@ -1187,6 +1469,15 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_aftersale_status_history",
         "dongxiao_api_calls",
         "dongxiao_runtime_settings",
+        "dongxiao_store_write_settings",
+        "dongxiao_cart_accounts",
+        "dongxiao_cart_batches",
+        "dongxiao_cart_assignments",
+        "dongxiao_cart_results",
+        "dongxiao_cart_verifications",
+        "dongxiao_cart_mock_state",
+        "dongxiao_cart_mock_operations",
+        "dongxiao_pending_order_drafts",
     }
     tables = {
         str(row[0])

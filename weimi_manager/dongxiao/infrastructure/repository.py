@@ -327,13 +327,17 @@ class DongxiaoRepository:
         conditions = ["store_id=?"]
         args: list[Any] = [int(store_id)]
         if filters.keyword:
-            escaped = (
-                filters.keyword.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
-            conditions.append("title LIKE ? ESCAPE '\\'")
-            args.append(f"%{escaped}%")
+            if filters.title_exact:
+                conditions.append("title = ? COLLATE NOCASE")
+                args.append(filters.keyword)
+            else:
+                escaped = (
+                    filters.keyword.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                conditions.append("title LIKE ? ESCAPE '\\'")
+                args.append(f"%{escaped}%")
         if filters.states:
             placeholders = ",".join("?" for _ in filters.states)
             conditions.append(f"state IN ({placeholders})")
@@ -2722,6 +2726,22 @@ class DongxiaoRepository:
         now = to_utc_iso(datetime.now(UTC))
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            enabled_stores = conn.execute(
+                """
+                SELECT store_app_id
+                FROM dongxiao_store_write_settings
+                WHERE enabled=1
+                """
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE dongxiao_store_write_settings
+                SET enabled=0, session_id='', enabled_at=NULL,
+                    enabled_by=?, updated_at=?
+                WHERE enabled=1
+                """,
+                (f"session:{normalized_session}", now),
+            )
             previous = conn.execute(
                 """
                 SELECT setting_value
@@ -2755,6 +2775,7 @@ class DongxiaoRepository:
                 result=AuditResult.INFO,
                 detail={
                     "enabled": False,
+                    "reset_store_count": len(enabled_stores),
                     "previous_enabled": (
                         previous is not None
                         and str(previous["setting_value"]) == "1"
@@ -2762,6 +2783,30 @@ class DongxiaoRepository:
                     "message": "新进程启动，平台写操作强制关闭",
                 },
             )
+            for row in enabled_stores:
+                store_row = conn.execute(
+                    "SELECT id FROM stores WHERE app_id=?",
+                    (str(row["store_app_id"]),),
+                ).fetchone()
+                self._insert_audit(
+                    conn,
+                    store_id=(
+                        int(store_row["id"])
+                        if store_row is not None
+                        else None
+                    ),
+                    store_app_id=str(row["store_app_id"]),
+                    actor_id=f"session:{normalized_session}",
+                    action="store_platform_write_startup_reset",
+                    entity_type="store",
+                    entity_id=str(row["store_app_id"]),
+                    request_id=normalized_session,
+                    result=AuditResult.INFO,
+                    detail={
+                        "enabled": False,
+                        "message": "新进程启动，店铺真实写操作关闭",
+                    },
+                )
         return False
 
     def set_platform_writes_enabled(
@@ -2820,6 +2865,146 @@ class DongxiaoRepository:
                 },
             )
         return enabled
+
+    def store_platform_writes_enabled(self, store_app_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT enabled
+                FROM dongxiao_store_write_settings
+                WHERE store_app_id=?
+                """,
+                (str(store_app_id),),
+            ).fetchone()
+        return row is not None and int(row["enabled"]) == 1
+
+    def any_store_platform_writes_enabled(self) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM dongxiao_store_write_settings
+                WHERE enabled=1
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
+
+    def set_store_platform_writes_enabled(
+        self,
+        store_app_id: str,
+        enabled: bool,
+        *,
+        session_id: str,
+        actor_id: str,
+    ) -> bool:
+        if not isinstance(enabled, bool):
+            raise TypeError("店铺平台写操作开关必须是布尔值")
+        normalized_store = str(store_app_id).strip()
+        if not normalized_store:
+            raise ValueError("店铺 AppID 不能为空")
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            store_row = conn.execute(
+                "SELECT id FROM stores WHERE app_id=?",
+                (normalized_store,),
+            ).fetchone()
+            if store_row is None:
+                raise EntityNotFound("店铺不存在")
+            conn.execute(
+                """
+                INSERT INTO dongxiao_store_write_settings(
+                    store_app_id, enabled, session_id, enabled_at,
+                    enabled_by, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_app_id) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    session_id=excluded.session_id,
+                    enabled_at=excluded.enabled_at,
+                    enabled_by=excluded.enabled_by,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    normalized_store,
+                    1 if enabled else 0,
+                    str(session_id) if enabled else "",
+                    now if enabled else None,
+                    str(actor_id) if enabled else str(actor_id),
+                    now,
+                ),
+            )
+            self._insert_audit(
+                conn,
+                store_id=int(store_row["id"]),
+                store_app_id=normalized_store,
+                actor_id=str(actor_id),
+                action="store_platform_write_changed",
+                entity_type="store",
+                entity_id=normalized_store,
+                request_id=str(session_id),
+                result=AuditResult.INFO,
+                detail={
+                    "enabled": enabled,
+                    "message": (
+                        "当前店铺真实平台写操作已开启"
+                        if enabled
+                        else "当前店铺真实平台写操作已关闭"
+                    ),
+                },
+            )
+        return enabled
+
+    def disable_all_store_platform_writes(
+        self,
+        *,
+        actor_id: str,
+        session_id: str,
+    ) -> int:
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT store_app_id
+                FROM dongxiao_store_write_settings
+                WHERE enabled=1
+                """
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE dongxiao_store_write_settings
+                SET enabled=0, session_id='', enabled_at=NULL,
+                    enabled_by=?, updated_at=?
+                WHERE enabled=1
+                """,
+                (str(actor_id), now),
+            )
+            for row in rows:
+                store_row = conn.execute(
+                    "SELECT id FROM stores WHERE app_id=?",
+                    (str(row["store_app_id"]),),
+                ).fetchone()
+                self._insert_audit(
+                    conn,
+                    store_id=(
+                        int(store_row["id"])
+                        if store_row is not None
+                        else None
+                    ),
+                    store_app_id=str(row["store_app_id"]),
+                    actor_id=str(actor_id),
+                    action="store_platform_write_changed",
+                    entity_type="store",
+                    entity_id=str(row["store_app_id"]),
+                    request_id=str(session_id),
+                    result=AuditResult.INFO,
+                    detail={
+                        "enabled": False,
+                        "message": "紧急关闭全部店铺真实平台写操作",
+                    },
+                )
+        return len(rows)
 
     def schema_migration_summary(self) -> dict[str, Any]:
         with self.connect() as conn:

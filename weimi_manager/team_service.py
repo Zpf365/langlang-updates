@@ -18,6 +18,11 @@ TEAM_PERMISSIONS: tuple[tuple[str, str], ...] = (
     ("after_sales", "售后处理"),
     ("procurement", "采购中心"),
     ("activities", "活动与优惠券"),
+    ("dongxiao_cart_account_manage", "动销执行账号管理"),
+    ("dongxiao_cart_task_preview", "批量加购预检"),
+    ("dongxiao_cart_task_create", "创建批量加购任务"),
+    ("dongxiao_cart_execute", "执行批量加购任务"),
+    ("dongxiao_cart_order_approve", "审批待付款草案"),
     ("team_manage", "管理子账号"),
 )
 DEFAULT_SUBACCOUNT_PERMISSIONS = {

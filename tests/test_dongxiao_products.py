@@ -167,6 +167,25 @@ def test_product_filter_uses_trusted_fields_and_database_pagination(
     assert combined.total == 1
     assert combined.page_count == 1
 
+    exact_title = repo.query_products(
+        store.id,
+        ProductFilter(
+            keyword="有销量黑色外套",
+            title_exact=True,
+            page_size=20,
+        ),
+    )
+    assert [item.product_id for item in exact_title.items] == ["100002"]
+    exact_missing = repo.query_products(
+        store.id,
+        ProductFilter(
+            keyword="黑色",
+            title_exact=True,
+            page_size=20,
+        ),
+    )
+    assert exact_missing.items == ()
+
     only_untrusted = repo.query_products(
         other.id,
         ProductFilter(zero_sales=True),

@@ -32,11 +32,25 @@ class ProductFreshnessTests(unittest.TestCase):
             client = SimpleNamespace(
                 delete_product=lambda _id: {"errcode": 1, "errmsg": "rejected"}
             )
+            service = SyncService(db)
+            service.platform_write_authorizer = (
+                lambda _app_id, _action: None
+            )
             with self.assertRaises(RuntimeError):
-                SyncService(db).product_write(store, "delete", product_id="one", client=client)
+                service.product_write(
+                    store,
+                    "delete",
+                    product_id="one",
+                    client=client,
+                )
             self.assertIsNotNone(db.get_product(store_id, "one"))
             client.delete_product = lambda _id: {"errcode": 0}
-            SyncService(db).product_write(store, "delete", product_id="one", client=client)
+            service.product_write(
+                store,
+                "delete",
+                product_id="one",
+                client=client,
+            )
             self.assertIsNone(db.get_product(store_id, "one"))
 
     def test_snapshot_failure_rolls_back_without_clearing_previous_products(self):
@@ -46,7 +60,9 @@ class ProductFreshnessTests(unittest.TestCase):
             old = ShopPrivateClient._parse_product({"spuId": "old", "title": "Old", "status": 5})
             old.store_id = store_id
             db.upsert_product(old)
-            invalid = ShopPrivateClient._parse_product({"spuId": "new", "title": "New", "status": 5})
+            invalid = ShopPrivateClient._parse_product(
+                {"spuId": "new", "title": "New", "status": 5}
+            )
             invalid.store_id = store_id
             invalid.title = None
             with self.assertRaises(sqlite3.IntegrityError):
@@ -169,7 +185,13 @@ class ProductFreshnessTests(unittest.TestCase):
 
     def test_merchant_statuses_appear_in_their_tabs(self):
         page = object.__new__(ProductsPage)
-        for tab, status in (("sales", 5), ("audit", 2), ("failed", 3), ("draft", 0), ("strategy", 7)):
+        for tab, status in (
+            ("sales", 5),
+            ("audit", 2),
+            ("failed", 3),
+            ("draft", 0),
+            ("strategy", 7),
+        ):
             with self.subTest(tab=tab):
                 product = ShopPrivateClient._parse_product(
                     {"spuId": "fixture", "title": "Fixture", "status": status}
@@ -207,6 +229,9 @@ class ProductFreshnessTests(unittest.TestCase):
             product.store_id = store_id
             db.upsert_product(product)
             service = SyncService(db)
+            service.platform_write_authorizer = (
+                lambda _app_id, _action: None
+            )
             with patch("weimi_manager.service.ShopPrivateClient") as factory:
                 private = factory.return_value
                 private.batch_product_action.return_value = {"success": True}

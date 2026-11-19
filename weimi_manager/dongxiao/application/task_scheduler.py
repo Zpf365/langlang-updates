@@ -262,7 +262,17 @@ class DongxiaoTaskScheduler:
                 and not self._platform_write_allowed(task.store_app_id)
             ):
                 continue
-            if active_by_store.get(task.store_id, 0) >= self.max_tasks_per_store:
+            store_limit = self.max_tasks_per_store
+            if task.task_type == "desktop_cart_add":
+                try:
+                    requested_limit = int(task.metadata.get("concurrency") or 1)
+                except (TypeError, ValueError):
+                    requested_limit = 1
+                store_limit = max(
+                    self.max_tasks_per_store,
+                    min(self.max_concurrent_tasks, max(1, requested_limit)),
+                )
+            if active_by_store.get(task.store_id, 0) >= store_limit:
                 continue
             future = self._executor.submit(self._execute_task, task)
             entry = _ActiveTask(

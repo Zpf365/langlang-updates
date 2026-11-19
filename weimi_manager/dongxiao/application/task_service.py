@@ -21,6 +21,7 @@ PRODUCT_SKU_VALIDATION = "product_sku_validation"
 ORDER_VERIFICATION = "order_verification"
 AFTERSALE_VERIFICATION = "aftersale_verification"
 AFTERSALE_DECISION = "aftersale_decision"
+DESKTOP_CART_ADD = "desktop_cart_add"
 
 
 class PlatformWriteDisabled(RuntimeError):
@@ -312,6 +313,118 @@ class DongxiaoTaskService:
             max_attempts=max_attempts,
             execution_mode="platform_write",
             payload=payload,
+        )
+
+    def create_desktop_cart_task(
+        self,
+        store,
+        *,
+        batch_id: str,
+        account_id: str,
+        items: list[dict[str, object]],
+        idempotency_key: str,
+        actor_id: str,
+        execution_mode: str,
+        speed_mode: str,
+        interval_ms: int,
+        concurrency: int,
+        adapter_mode: str,
+        requested_at: datetime | None = None,
+        max_attempts: int = 1,
+    ) -> tuple[Task, bool]:
+        if execution_mode == "platform_write":
+            self._assert_platform_write_allowed(store)
+        if not items:
+            raise ValueError("批量加购任务至少需要一个商品")
+        now = requested_at or datetime.now(UTC)
+        normalized_items: list[dict[str, object]] = []
+        for item in items:
+            product_id = str(item.get("product_id") or "").strip()
+            sku_id = str(item.get("sku_id") or "").strip()
+            if not product_id:
+                raise ValueError("批量加购任务商品 ID 不能为空")
+            normalized_items.append(
+                {
+                    **dict(item),
+                    "batch_id": str(batch_id),
+                    "account_id": str(account_id),
+                    "desktop_cart": True,
+                    "adapter_mode": str(adapter_mode),
+                    "speed_mode": str(speed_mode),
+                    "interval_ms": int(interval_ms),
+                    "concurrency": int(concurrency),
+                    "product_id": product_id,
+                    "sku_id": sku_id,
+                }
+            )
+        signatures = [
+            (
+                "cart",
+                f"{item['product_id']}:{item.get('sku_id') or ''}",
+                str(item["product_id"]),
+                str(item.get("sku_id") or ""),
+            )
+            for item in normalized_items
+        ]
+        digest = hashlib.sha256(
+            json.dumps(
+                signatures,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        metadata = {
+            "subject_type": "cart",
+            "batch_id": str(batch_id),
+            "account_id": str(account_id),
+            "adapter_mode": str(adapter_mode),
+            "speed_mode": str(speed_mode),
+            "interval_ms": int(interval_ms),
+            "concurrency": int(concurrency),
+            "item_digest": digest,
+            "actor_id": str(actor_id),
+        }
+        task = Task(
+            task_id=uuid.uuid4().hex,
+            store_id=int(store.id),
+            store_app_id=str(store.app_id),
+            task_type=DESKTOP_CART_ADD,
+            idempotency_key=str(idempotency_key).strip(),
+            status=TaskStatus.PENDING,
+            total_items=len(normalized_items),
+            succeeded_items=0,
+            failed_items=0,
+            created_at=now,
+            updated_at=now,
+            metadata=metadata,
+            max_attempts=int(max_attempts),
+            execution_mode=execution_mode,
+        )
+        execution_items = [
+            TaskExecutionItem(
+                item_id=uuid.uuid4().hex,
+                task_id=task.task_id,
+                store_id=int(store.id),
+                store_app_id=str(store.app_id),
+                subject_type="product",
+                subject_id=(
+                    f"{item['product_id']}:{item.get('sku_id') or ''}"
+                ),
+                product_id=str(item["product_id"]),
+                sku_id=str(item.get("sku_id") or ""),
+                status=TaskItemStatus.PENDING,
+                attempt_count=0,
+                max_attempts=task.max_attempts,
+                created_at=now,
+                updated_at=now,
+                payload=dict(item),
+            )
+            for item in normalized_items
+        ]
+        return self.repository.create_task_with_execution_items(
+            task,
+            execution_items,
         )
 
     def pause(self, store, task_id: str, *, actor_id: str = "") -> Task:

@@ -249,6 +249,7 @@ class WechatShopClient:
         sleeper: Callable[[float], None] = time.sleep,
         min_request_interval: float | None = None,
         call_observer: Callable[[dict[str, Any]], None] | None = None,
+        write_authorizer: Callable[[str, str], None] | None = None,
     ):
         self.app_id = app_id.strip()
         self._secret = secret.strip()
@@ -267,12 +268,103 @@ class WechatShopClient:
             else max(0.0, min_request_interval)
         )
         self.call_observer = call_observer
+        self.write_authorizer = write_authorizer
 
     def set_call_observer(
         self,
         observer: Callable[[dict[str, Any]], None] | None,
     ) -> None:
         self.call_observer = observer
+
+    def _post_write_api(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        action: str,
+    ) -> dict[str, Any]:
+        if not callable(self.write_authorizer):
+            raise PermissionError(
+                "官方客户端未连接当前会话写操作安全门，"
+                f"已拒绝执行：{str(action)}"
+            )
+        self.write_authorizer(self.app_id, str(action))
+        token = self.get_access_token()
+        request_id = uuid.uuid4().hex
+        started_at = datetime.now(UTC)
+        started_perf = time.perf_counter()
+        self._wait_for_rate_limit()
+        try:
+            result = self.transport.post_json(
+                f"{API_ROOT}{path}?access_token={token}",
+                payload,
+            )
+        except Exception as exc:
+            self._notify_api_call(
+                path=path,
+                method="POST",
+                attempt_no=1,
+                request_id=request_id,
+                started_at=started_at,
+                started_perf=started_perf,
+                error=exc,
+            )
+            raise
+        self._notify_api_call(
+            path=path,
+            method="POST",
+            attempt_no=1,
+            request_id=request_id,
+            started_at=started_at,
+            started_perf=started_perf,
+            result=result,
+        )
+        try:
+            self._raise_for_error(result)
+            return result
+        except WechatApiError as exc:
+            exc.request_id = request_id
+            if exc.code not in TOKEN_INVALID_CODES:
+                raise
+        # An invalid-token response is a definitive business-request
+        # rejection. It is safe to refresh once and resend.
+        self._invalidate_access_token()
+        token = self.get_access_token()
+        retry_request_id = uuid.uuid4().hex
+        retry_started_at = datetime.now(UTC)
+        retry_started_perf = time.perf_counter()
+        self._wait_for_rate_limit()
+        try:
+            retry_result = self.transport.post_json(
+                f"{API_ROOT}{path}?access_token={token}",
+                payload,
+            )
+        except Exception as exc:
+            self._notify_api_call(
+                path=path,
+                method="POST",
+                attempt_no=2,
+                request_id=retry_request_id,
+                started_at=retry_started_at,
+                started_perf=retry_started_perf,
+                error=exc,
+            )
+            raise
+        self._notify_api_call(
+            path=path,
+            method="POST",
+            attempt_no=2,
+            request_id=retry_request_id,
+            started_at=retry_started_at,
+            started_perf=retry_started_perf,
+            result=retry_result,
+        )
+        try:
+            self._raise_for_error(retry_result)
+        except WechatApiError as exc:
+            exc.request_id = retry_request_id
+            raise
+        return retry_result
 
     def _notify_api_call(
         self,
@@ -698,50 +790,99 @@ class WechatShopClient:
         notes: str,
         color: int = 0,
     ) -> dict[str, Any]:
-        return self._post_api(
+        return self._post_write_api(
             ORDER_NOTES_PATH,
             {
                 "order_id": str(order_id),
                 "merchant_notes": notes,
                 "merchant_notes_tag_color": int(color),
             },
+            action="order_notes_update",
         )
 
     def update_order_price(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(ORDER_PRICE_PATH, payload)
+        return self._post_write_api(
+            ORDER_PRICE_PATH,
+            payload,
+            action="order_price_update",
+        )
 
     def update_order_address(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(ORDER_ADDRESS_PATH, payload)
+        return self._post_write_api(
+            ORDER_ADDRESS_PATH,
+            payload,
+            action="order_address_update",
+        )
 
     def update_order_delivery_info(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(ORDER_DELIVERY_INFO_PATH, payload)
+        return self._post_write_api(
+            ORDER_DELIVERY_INFO_PATH,
+            payload,
+            action="order_delivery_update",
+        )
 
     def accept_after_sale(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(AFTER_SALE_ACCEPT_PATH, payload)
+        return self._post_write_api(
+            AFTER_SALE_ACCEPT_PATH,
+            payload,
+            action="aftersale_accept",
+        )
 
     def reject_after_sale(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(AFTER_SALE_REJECT_PATH, payload)
+        return self._post_write_api(
+            AFTER_SALE_REJECT_PATH,
+            payload,
+            action="aftersale_reject",
+        )
 
     def negotiate_after_sale(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(AFTER_SALE_NEGOTIATE_PATH, payload)
+        return self._post_write_api(
+            AFTER_SALE_NEGOTIATE_PATH,
+            payload,
+            action="aftersale_negotiate",
+        )
 
     def reship_after_sale(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(AFTER_SALE_RESHIP_PATH, payload)
+        return self._post_write_api(
+            AFTER_SALE_RESHIP_PATH,
+            payload,
+            action="aftersale_reship",
+        )
 
     def update_after_sale_reship(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(AFTER_SALE_UPDATE_RESHIP_PATH, payload)
+        return self._post_write_api(
+            AFTER_SALE_UPDATE_RESHIP_PATH,
+            payload,
+            action="aftersale_reship_update",
+        )
 
     def accept_after_sale_exchange(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(AFTER_SALE_ACCEPT_EXCHANGE_PATH, payload)
+        return self._post_write_api(
+            AFTER_SALE_ACCEPT_EXCHANGE_PATH,
+            payload,
+            action="aftersale_exchange_accept",
+        )
 
     def reject_after_sale_exchange(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(AFTER_SALE_REJECT_EXCHANGE_PATH, payload)
+        return self._post_write_api(
+            AFTER_SALE_REJECT_EXCHANGE_PATH,
+            payload,
+            action="aftersale_exchange_reject",
+        )
 
     def add_product(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(PRODUCT_ADD_PATH, payload)
+        return self._post_write_api(
+            PRODUCT_ADD_PATH,
+            payload,
+            action="product_add",
+        )
 
     def update_product(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(PRODUCT_UPDATE_PATH, payload)
+        return self._post_write_api(
+            PRODUCT_UPDATE_PATH,
+            payload,
+            action="product_update",
+        )
 
     def fetch_product_payload(
         self,
@@ -838,7 +979,7 @@ class WechatShopClient:
             )
         if not clean:
             raise WechatApiError("没有可新增的联盟商品")
-        return self._post_api(
+        return self._post_write_api(
             LEAGUE_ITEM_BATCH_ADD_PATH,
             {
                 "type": int(plan_type),
@@ -847,6 +988,7 @@ class WechatShopClient:
                 "end_time": int(end_time),
                 "is_forerver": bool(forever),
             },
+            action="league_items_add",
         )
 
     def fetch_league_items(
@@ -881,7 +1023,7 @@ class WechatShopClient:
         *,
         plan_type: int = 100,
     ) -> dict[str, Any]:
-        return self._post_api(
+        return self._post_write_api(
             LEAGUE_ITEM_UPDATE_PATH,
             {
                 "type": int(plan_type),
@@ -890,13 +1032,18 @@ class WechatShopClient:
                 "operate_type": 1,
                 "ratio": max(0, min(90, float(ratio))),
             },
+            action="league_item_update",
         )
 
     def create_limited_discount_task(
         self,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        return self._post_api(LIMITED_DISCOUNT_ADD_PATH, payload)
+        return self._post_write_api(
+            LIMITED_DISCOUNT_ADD_PATH,
+            payload,
+            action="limited_discount_create",
+        )
 
     def fetch_limited_discount_tasks(
         self,
@@ -915,18 +1062,24 @@ class WechatShopClient:
         return self._post_api(LIMITED_DISCOUNT_LIST_PATH, body)
 
     def stop_limited_discount_task(self, task_id: str) -> dict[str, Any]:
-        return self._post_api(
+        return self._post_write_api(
             LIMITED_DISCOUNT_STOP_PATH,
             {"task_id": str(task_id)},
+            action="limited_discount_stop",
         )
 
     def delete_product(self, product_id: str) -> dict[str, Any]:
-        return self._post_api(PRODUCT_DELETE_PATH, {"product_id": str(product_id)})
+        return self._post_write_api(
+            PRODUCT_DELETE_PATH,
+            {"product_id": str(product_id)},
+            action="product_delete",
+        )
 
     def cancel_product_audit(self, product_id: str) -> dict[str, Any]:
-        return self._post_api(
+        return self._post_write_api(
             PRODUCT_CANCEL_AUDIT_PATH,
             {"product_id": str(product_id)},
+            action="product_audit_cancel",
         )
 
     def fetch_product_taglink(self, product_id: str) -> dict[str, Any]:
@@ -1059,6 +1212,8 @@ class WechatShopClient:
         return result if isinstance(result, dict) else {}
 
     def upload_product_image(self, path: str | Path) -> str:
+        if callable(self.write_authorizer):
+            self.write_authorizer(self.app_id, "product_image_upload")
         from PIL import Image
 
         image_path = Path(path)
@@ -1185,13 +1340,25 @@ class WechatShopClient:
         return result.get("coupon") or {}
 
     def create_coupon(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(COUPON_CREATE_PATH, payload)
+        return self._post_write_api(
+            COUPON_CREATE_PATH,
+            payload,
+            action="coupon_create",
+        )
 
     def update_coupon(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(COUPON_UPDATE_PATH, payload)
+        return self._post_write_api(
+            COUPON_UPDATE_PATH,
+            payload,
+            action="coupon_update",
+        )
 
     def update_coupon_status(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(COUPON_STATUS_PATH, payload)
+        return self._post_write_api(
+            COUPON_STATUS_PATH,
+            payload,
+            action="coupon_status_update",
+        )
 
     def fetch_storefront_product_ids(self) -> list[str]:
         ids: list[str] = []
@@ -1208,21 +1375,24 @@ class WechatShopClient:
         return list(dict.fromkeys(ids))
 
     def reorder_storefront_product(self, product_id: str, index_num: int) -> None:
-        self._post_api(
+        self._post_write_api(
             STOREFRONT_REORDER_PATH,
             {"product_id": str(product_id), "index_num": int(index_num)},
+            action="storefront_reorder",
         )
 
     def hide_storefront_product(self, product_id: str, hidden: bool) -> None:
-        self._post_api(
+        self._post_write_api(
             STOREFRONT_HIDE_PATH,
             {"product_id": str(product_id), "is_set_hide": 1 if hidden else 0},
+            action="storefront_hide",
         )
 
     def top_storefront_product(self, product_id: str, pinned: bool) -> None:
-        self._post_api(
+        self._post_write_api(
             STOREFRONT_TOP_PATH,
             {"product_id": str(product_id), "is_set_top": 1 if pinned else 0},
+            action="storefront_pin",
         )
 
     def fetch_fund_balance(self) -> dict[str, Any]:
@@ -1243,7 +1413,11 @@ class WechatShopClient:
 
     def set_product_listing(self, product_id: str, listed: bool) -> dict[str, Any]:
         path = PRODUCT_LISTING_PATH if listed else PRODUCT_DELISTING_PATH
-        return self._post_api(path, {"product_id": str(product_id)})
+        return self._post_write_api(
+            path,
+            {"product_id": str(product_id)},
+            action="product_listing" if listed else "product_delisting",
+        )
 
     def update_product_stock(
         self,
@@ -1254,7 +1428,7 @@ class WechatShopClient:
     ) -> dict[str, Any]:
         if diff_type not in {1, 2, 3}:
             raise ValueError("库存修改类型必须是 1、2 或 3")
-        return self._post_api(
+        return self._post_write_api(
             PRODUCT_STOCK_PATH,
             {
                 "product_id": str(product_id),
@@ -1262,6 +1436,7 @@ class WechatShopClient:
                 "diff_type": diff_type,
                 "num": int(amount),
             },
+            action="product_stock_update",
         )
 
     def fetch_delivery_companies(self, ewaybill_only: bool = False) -> list[dict[str, Any]]:
@@ -1326,10 +1501,18 @@ class WechatShopClient:
         return templates
 
     def precreate_ewaybill(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(EWAYBILL_PRECREATE_PATH, payload)
+        return self._post_write_api(
+            EWAYBILL_PRECREATE_PATH,
+            payload,
+            action="ewaybill_precreate",
+        )
 
     def create_ewaybill(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post_api(EWAYBILL_CREATE_PATH, payload)
+        return self._post_write_api(
+            EWAYBILL_CREATE_PATH,
+            payload,
+            action="ewaybill_create",
+        )
 
     def fetch_ewaybill(self, ewaybill_order_id: str) -> dict[str, Any]:
         result = self._post_api(
@@ -1345,7 +1528,7 @@ class WechatShopClient:
         waybill_id: str,
         reprint: bool = False,
     ) -> dict[str, Any]:
-        return self._post_api(
+        return self._post_write_api(
             EWAYBILL_PRINT_PATH,
             {
                 "ewaybill_order_id": str(ewaybill_order_id),
@@ -1353,6 +1536,7 @@ class WechatShopClient:
                 "waybill_id": str(waybill_id),
                 "re_print": 1 if reprint else 0,
             },
+            action="ewaybill_print_confirm",
         )
 
     def send_order_delivery(
@@ -1360,12 +1544,13 @@ class WechatShopClient:
         order_id: str,
         delivery_list: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        return self._post_api(
+        return self._post_write_api(
             ORDER_DELIVERY_PATH,
             {
                 "order_id": str(order_id),
                 "delivery_list": delivery_list,
             },
+            action="order_delivery_send",
         )
 
     def _post_api(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:

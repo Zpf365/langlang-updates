@@ -21,6 +21,7 @@ class ProductSortField(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ProductFilter:
     keyword: str = ""
+    title_exact: bool = False
     states: tuple[ProductState, ...] = ()
     product_ids: tuple[str, ...] = ()
     min_price_cents: int | None = None
@@ -37,6 +38,7 @@ class ProductFilter:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "keyword", str(self.keyword or "").strip())
+        object.__setattr__(self, "title_exact", bool(self.title_exact))
         object.__setattr__(
             self,
             "states",

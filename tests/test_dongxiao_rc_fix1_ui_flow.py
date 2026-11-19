@@ -46,7 +46,7 @@ def test_source_tk_flow_switches_all_dongxiao_pages_and_restarts(
             ).fetchall()
         finally:
             conn.close()
-        assert [int(row[0]) for row in rows] == [1, 2, 3, 4, 5, 6]
+        assert [int(row[0]) for row in rows] == [1, 2, 3, 4, 5, 6, 7]
     finally:
         if runtime is not None:
             runtime.stop()

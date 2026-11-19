@@ -6,6 +6,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from ..desktop_cart.executor import DesktopCartExecutor
+from ..desktop_cart.repository import DesktopCartRepository
+from ..desktop_cart.service import DesktopCartService
 from ..domain.operations import (
     ApiCallRecord,
     PlatformReadonlyVerification,
@@ -42,12 +45,14 @@ class DongxiaoRuntime:
     ) -> None:
         self.database_path = Path(database_path)
         self.repository = DongxiaoRepository(self.database_path)
+        self.cart_repository = DesktopCartRepository(self.database_path)
         self.session_id = _PROCESS_SESSION_ID
         self.clock = clock or (lambda: datetime.now(UTC))
         self._verification_lock = threading.RLock()
-        self._platform_readonly_verification: (
-            PlatformReadonlyVerification | None
-        ) = None
+        self._platform_readonly_verifications: dict[
+            str,
+            PlatformReadonlyVerification,
+        ] = {}
         database_key = str(self.database_path.resolve()).casefold()
         with _SESSION_RESET_LOCK:
             if database_key not in _SESSION_RESET_DATABASES:
@@ -57,6 +62,12 @@ class DongxiaoRuntime:
                 _SESSION_RESET_DATABASES.add(database_key)
         try:
             sync_service.call_observer = self.record_api_call
+        except (AttributeError, TypeError):
+            pass
+        try:
+            sync_service.platform_write_authorizer = (
+                self.authorize_platform_write
+            )
         except (AttributeError, TypeError):
             pass
         self.platform = OfficialDongxiaoPlatformAdapter(sync_service)
@@ -79,11 +90,15 @@ class DongxiaoRuntime:
             self.aftersale_service,
             platform_write_gate=self.platform_write_gate,
         )
+        self.cart_executor = DesktopCartExecutor(
+            self.cart_repository,
+        )
         self.executor = CompositeTaskExecutor(
             self.repository,
             order_service=self.order_service,
             aftersale_service=self.aftersale_service,
             aftersale_decision_executor=self.decision_executor,
+            desktop_cart_executor=self.cart_executor,
         )
         self.scheduler = DongxiaoTaskScheduler(
             self.repository,
@@ -91,6 +106,12 @@ class DongxiaoRuntime:
             max_concurrent_tasks=max_concurrent_tasks,
             max_tasks_per_store=max_tasks_per_store,
             platform_write_gate=self.platform_write_gate,
+        )
+        self.cart_service = DesktopCartService(
+            self.cart_repository,
+            self.repository,
+            self.task_service,
+            scheduler=self.scheduler,
         )
         self.preflight_service = DongxiaoPreflightService(
             self.repository,
@@ -102,15 +123,31 @@ class DongxiaoRuntime:
         )
         self.started = False
 
-    def platform_writes_enabled(self) -> bool:
-        return self.repository.platform_writes_enabled()
+    def platform_writes_enabled(self, store_app_id: str = "") -> bool:
+        global_enabled = self.repository.platform_writes_enabled()
+        if not store_app_id:
+            return global_enabled
+        return bool(
+            global_enabled
+            and self.repository.store_platform_writes_enabled(
+                str(store_app_id)
+            )
+        )
+
+    def store_platform_writes_enabled(self, store_app_id: str) -> bool:
+        return self.platform_writes_enabled(str(store_app_id))
 
     def platform_write_gate(self, store_app_id: str) -> bool:
         normalized_store = str(store_app_id).strip()
-        if not normalized_store or not self.platform_writes_enabled():
+        if (
+            not normalized_store
+            or not self.platform_writes_enabled(normalized_store)
+        ):
             return False
         with self._verification_lock:
-            verification = self._platform_readonly_verification
+            verification = self._platform_readonly_verifications.get(
+                normalized_store
+            )
         return bool(
             verification is not None
             and verification.is_valid(
@@ -119,6 +156,17 @@ class DongxiaoRuntime:
                 now=self.clock(),
             )
         )
+
+    def authorize_platform_write(
+        self,
+        store_app_id: str,
+        action: str,
+    ) -> None:
+        if not self.platform_write_gate(str(store_app_id)):
+            raise PermissionError(
+                "当前店铺真实平台写操作未开启或只读验收已失效；"
+                f"已阻止操作：{str(action)}"
+            )
 
     def remember_platform_readonly_report(
         self,
@@ -144,7 +192,9 @@ class DongxiaoRuntime:
             )
         )
         if not platform_ready:
-            self.invalidate_platform_readonly_verification()
+            self.invalidate_platform_readonly_verification(
+                store_app_id
+            )
             return None
         digest_input = "\0".join(
             (
@@ -169,19 +219,33 @@ class DongxiaoRuntime:
             ).hexdigest(),
         )
         with self._verification_lock:
-            self._platform_readonly_verification = verification
+            self._platform_readonly_verifications[store_app_id] = (
+                verification
+            )
         return verification
 
-    def invalidate_platform_readonly_verification(self) -> None:
+    def invalidate_platform_readonly_verification(
+        self,
+        store_app_id: str = "",
+    ) -> None:
         with self._verification_lock:
-            self._platform_readonly_verification = None
+            normalized_store = str(store_app_id).strip()
+            if normalized_store:
+                self._platform_readonly_verifications.pop(
+                    normalized_store,
+                    None,
+                )
+            else:
+                self._platform_readonly_verifications.clear()
 
     def platform_readonly_verification(
         self,
         store_app_id: str,
     ) -> PlatformReadonlyVerification | None:
         with self._verification_lock:
-            verification = self._platform_readonly_verification
+            verification = self._platform_readonly_verifications.get(
+                str(store_app_id)
+            )
         if verification is None:
             return None
         if not verification.is_valid(
@@ -199,12 +263,16 @@ class DongxiaoRuntime:
         store=None,
         actor_id: str,
         permission_checker,
+        emergency: bool = False,
     ) -> bool:
-        require_permission(
-            permission_checker,
-            "dongxiao_platform_write_switch",
-        )
+        if not emergency:
+            require_permission(
+                permission_checker,
+                "dongxiao_platform_write_switch",
+            )
         if enabled:
+            if emergency:
+                raise ValueError("紧急安全操作只能关闭平台写操作")
             if store is None:
                 raise ValueError("开启平台写操作前必须选择已验证店铺")
             verification = self.platform_readonly_verification(
@@ -215,12 +283,44 @@ class DongxiaoRuntime:
                     "当前店铺没有有效的真实只读验收结果，"
                     "请重新完成官方 Token、商品、订单和售后只读检查"
                 )
+            self.repository.set_store_platform_writes_enabled(
+                str(store.app_id),
+                True,
+                session_id=self.session_id,
+                actor_id=actor_id,
+            )
         else:
-            self.invalidate_platform_readonly_verification()
-        return self.repository.set_platform_writes_enabled(
-            enabled,
+            if store is not None:
+                self.repository.set_store_platform_writes_enabled(
+                    str(store.app_id),
+                    False,
+                    session_id=self.session_id,
+                    actor_id=actor_id,
+                )
+                if not self.repository.any_store_platform_writes_enabled():
+                    self.repository.set_platform_writes_enabled(
+                        False,
+                        actor_id=actor_id,
+                    )
+                self.invalidate_platform_readonly_verification(
+                    str(store.app_id)
+                )
+            else:
+                self.repository.disable_all_store_platform_writes(
+                    actor_id=actor_id,
+                    session_id=self.session_id,
+                )
+                self.repository.set_platform_writes_enabled(
+                    False,
+                    actor_id=actor_id,
+                )
+                self.invalidate_platform_readonly_verification()
+            return False
+        enabled_globally = self.repository.set_platform_writes_enabled(
+            True,
             actor_id=actor_id,
         )
+        return bool(enabled_globally)
 
     def scheduler_health(self) -> dict[str, object]:
         scheduler = self.scheduler

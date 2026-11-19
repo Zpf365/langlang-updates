@@ -91,6 +91,9 @@ class SyncService:
     def __init__(self, db: Database, sleep: Callable[[float], None] | None = None):
         self.db = db
         self.sleep = sleep
+        self.platform_write_authorizer: (
+            Callable[[str, str], None] | None
+        ) = None
         self._product_payload_defaults_cache: dict[int, dict[str, Any]] = {}
         self._category_rule_cache: dict[tuple[int, str, str], dict[str, Any]] = {}
 
@@ -106,7 +109,21 @@ class SyncService:
         observer = getattr(self, "call_observer", None)
         if callable(observer):
             kwargs["call_observer"] = observer
+        authorizer = getattr(self, "platform_write_authorizer", None)
+        if callable(authorizer):
+            kwargs["write_authorizer"] = authorizer
         return WechatShopClient(store.app_id, secret, **kwargs)
+
+    def _require_platform_write(self, store: Store, action: str) -> None:
+        if str(store.app_id) == "demo-store":
+            return
+        authorizer = getattr(self, "platform_write_authorizer", None)
+        if not callable(authorizer):
+            raise PermissionError(
+                "真实平台写操作缺少当前会话安全门，已拒绝执行："
+                f"{str(action)}"
+            )
+        authorizer(str(store.app_id), str(action))
 
     def validate_store(self, store: Store) -> None:
         client = self.client_for(store)
@@ -178,6 +195,7 @@ class SyncService:
         notes: str,
         color: int = 0,
     ) -> None:
+        self._require_platform_write(store, "order_notes_update")
         client = self.client_for(store)
         if not isinstance(client, MockShopClient):
             client.update_order_notes(order_id, notes, color)
@@ -191,6 +209,7 @@ class SyncService:
         change_express: bool,
         express_fee: int,
     ) -> None:
+        self._require_platform_write(store, "order_price_update")
         client = self.client_for(store)
         if not isinstance(client, MockShopClient):
             client.update_order_price(
@@ -210,6 +229,7 @@ class SyncService:
         order_id: str,
         address: dict[str, str],
     ) -> None:
+        self._require_platform_write(store, "order_address_update")
         client = self.client_for(store)
         if isinstance(client, MockShopClient):
             return
@@ -228,6 +248,7 @@ class SyncService:
         delivery_id: str,
         product_infos: list[dict[str, Any]],
     ) -> None:
+        self._require_platform_write(store, "order_delivery_update")
         client = self.client_for(store)
         if isinstance(client, MockShopClient):
             return
@@ -260,6 +281,7 @@ class SyncService:
         packages: list[dict[str, str]],
         product_infos: list[dict[str, Any]],
     ) -> None:
+        self._require_platform_write(store, "order_delivery_update")
         if not packages:
             raise ValueError("至少需要一个店铺包裹")
         client = self.client_for(store)
@@ -296,6 +318,7 @@ class SyncService:
         action: str,
         payload: dict[str, Any] | None = None,
     ) -> SyncResult:
+        self._require_platform_write(store, f"aftersale_{action}")
         client = self.client_for(store)
         payload = dict(payload or {})
         payload["after_sale_order_id"] = after_sale_id
@@ -335,6 +358,7 @@ class SyncService:
         store: Store,
         paths: list[str],
     ) -> list[str]:
+        self._require_platform_write(store, "aftersale_media_upload")
         client = self.client_for(store)
         if isinstance(client, MockShopClient):
             return [f"demo://after-sale-proof/{Path(path).name}" for path in paths]
@@ -959,6 +983,7 @@ class SyncService:
         client: WechatShopClient | MockShopClient | None = None,
         listing_mode: str = "",
     ) -> dict[str, Any]:
+        self._require_platform_write(store, "product_write")
         if (
             client is None
             and action == "delete"
@@ -1041,6 +1066,7 @@ class SyncService:
         store: Store,
         paths: list[str],
     ) -> list[str]:
+        self._require_platform_write(store, "product_image_upload")
         client = self.client_for(store)
         if isinstance(client, MockShopClient):
             return [f"https://example.invalid/demo-{index}.png" for index, _ in enumerate(paths, 1)]
@@ -1921,6 +1947,7 @@ class SyncService:
         product_ids: list[str],
         way: str,
     ) -> dict[str, Any]:
+        self._require_platform_write(store, "product_web_batch_action")
         private = ShopPrivateClient(self.db, store)
         return private.batch_product_action(product_ids, way)
 
@@ -1930,6 +1957,7 @@ class SyncService:
         product_ids: list[str],
         ratio_percent: float,
     ) -> dict[str, Any]:
+        self._require_platform_write(store, "league_items_add")
         client = self.client_for(store)
         method = getattr(client, "batch_add_league_items", None)
         if not callable(method):
@@ -1965,6 +1993,7 @@ class SyncService:
         product_ids: list[str],
         ratio_percent: float,
     ) -> list[str]:
+        self._require_platform_write(store, "league_item_update")
         client = self.client_for(store)
         fetch_detail = getattr(client, "fetch_league_item", None)
         update_item = getattr(client, "update_league_item", None)
@@ -1995,6 +2024,7 @@ class SyncService:
         product_ids: list[str],
         multiplier: float,
     ) -> list[str]:
+        self._require_platform_write(store, "product_price_update")
         client = self.client_for(store)
         method = getattr(client, "update_product_prices", None)
         if not callable(method):
@@ -2020,6 +2050,7 @@ class SyncService:
         min_discount_cents: int = 100,
         create_all: bool = False,
     ) -> dict[str, Any]:
+        self._require_platform_write(store, "activity_create")
         try:
             discount = float(discount)
         except (TypeError, ValueError) as exc:
@@ -2331,6 +2362,7 @@ class SyncService:
         *,
         stop_if_active: bool = True,
     ) -> dict[str, Any]:
+        self._require_platform_write(store, "activity_delete")
         private = ShopPrivateClient(self.db, store)
         if stop_if_active:
             task = private.snapup_activity(activity_id)
@@ -2352,6 +2384,7 @@ class SyncService:
         end_time: int | None = None,
         min_discount_cents: int = 100,
     ) -> list[str]:
+        self._require_platform_write(store, "limited_discount_create")
         client = self.client_for(store)
         fetch_product = getattr(client, "fetch_product_payload", None)
         create_task = getattr(client, "create_limited_discount_task", None)
@@ -2435,6 +2468,7 @@ class SyncService:
         self,
         store: Store,
     ) -> list[str]:
+        self._require_platform_write(store, "limited_discount_stop")
         client = self.client_for(store)
         fetch_tasks = getattr(client, "fetch_limited_discount_tasks", None)
         stop_task = getattr(client, "stop_limited_discount_task", None)
@@ -2466,6 +2500,7 @@ class SyncService:
         workers: int = 4,
         cancel_event: threading.Event | None = None,
     ) -> SyncResult:
+        self._require_platform_write(store, "product_listing")
         action = "listing" if listed else "delisting"
         private = None
         if (
@@ -2570,6 +2605,7 @@ class SyncService:
         diff_type: int,
         amount: int,
     ) -> Product | None:
+        self._require_platform_write(store, "product_stock_update")
         if diff_type not in {1, 2, 3}:
             raise ValueError("库存修改类型必须是 1、2 或 3")
         if amount < 0 or (diff_type != 3 and amount == 0):
@@ -2744,6 +2780,7 @@ class SyncService:
             raise
 
     def create_shipment(self, store: Store, order_id: str) -> dict:
+        self._require_platform_write(store, "ewaybill_create")
         order = self.db.get_order(store.id, order_id)
         if order is None:
             raise ValueError("订单不存在")
@@ -2888,6 +2925,7 @@ class SyncService:
         return self.db.get_shipment(store.id, order_id) or {}
 
     def complete_shipment(self, store: Store, order_id: str) -> dict:
+        self._require_platform_write(store, "order_delivery_send")
         shipment = self.db.get_shipment(store.id, order_id)
         if shipment is None or not shipment["waybill_id"]:
             raise ValueError("请先生成电子面单")
@@ -3118,6 +3156,7 @@ class SyncService:
         client = self.client_for(store)
         if isinstance(client, MockShopClient):
             return {"errcode": 0, "demo": True}
+        self._require_platform_write(store, f"coupon_{action}")
         if action == "create":
             result = client.create_coupon(payload)
         elif action == "update":
@@ -3179,6 +3218,7 @@ class SyncService:
         client = self.client_for(store)
         if isinstance(client, MockShopClient):
             return
+        self._require_platform_write(store, f"storefront_{action}")
         if action == "reorder":
             client.reorder_storefront_product(product_id, value)
         elif action == "hide":
@@ -3367,6 +3407,7 @@ class SyncService:
     ) -> dict[str, Any]:
         if store.web_status != "已登录":
             raise ValueError(f"网页{store.web_status}，不能申报平台活动")
+        self._require_platform_write(store, "platform_activity_apply")
         try:
             result = ShopPrivateClient(
                 self.db,
@@ -3589,6 +3630,7 @@ class SyncService:
     ) -> dict[str, Any]:
         if not items:
             raise ValueError("没有可提交的SKU")
+        self._require_platform_write(store, "platform_activity_items_submit")
         client = ShopPrivateClient(self.db, store)
         normalized = []
         for item in items:
@@ -3693,6 +3735,7 @@ class SyncService:
         store: Store,
         activity_id: int = 1323,
     ) -> dict[str, Any]:
+        self._require_platform_write(store, "platform_activity_items_remove")
         client = ShopPrivateClient(self.db, store)
         rows: list[dict[str, Any]] = []
         for page in range(1, 101):
@@ -3744,6 +3787,7 @@ class SyncService:
     ) -> dict[str, Any]:
         if not drafts:
             raise ValueError("双十一草稿为空")
+        self._require_platform_write(store, "platform_activity_double11_submit")
         items = []
         missing = []
         for draft in drafts:

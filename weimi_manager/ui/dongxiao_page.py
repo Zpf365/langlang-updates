@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tkinter as tk
+import uuid
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -18,6 +19,17 @@ from ..dongxiao.application.preflight_service import (
     DongxiaoPreflightService,
 )
 from ..dongxiao.application.task_service import DongxiaoTaskService
+from ..dongxiao.desktop_cart.domain import (
+    CartAdapterMode,
+    CartBatchStatus,
+    CartResultStatus,
+    CartSkuMode,
+    CartSpeedMode,
+    OutOfStockPolicy,
+    PendingOrderStatus,
+)
+from ..dongxiao.desktop_cart.repository import DesktopCartRepository
+from ..dongxiao.desktop_cart.service import DesktopCartService
 from ..dongxiao.domain.catalog import (
     CatalogFreshness,
     classify_catalog_freshness,
@@ -80,6 +92,8 @@ AUDIT_ACTION_LABELS = {
     "aftersale_synced": "同步真实售后",
     "platform_write_startup_reset": "启动时关闭平台写操作",
     "platform_write_guard_changed": "平台写操作开关变更",
+    "store_platform_write_startup_reset": "启动时关闭店铺写操作",
+    "store_platform_write_changed": "店铺真实写操作变更",
 }
 AUDIT_ENTITY_LABELS = {
     "task": "任务",
@@ -99,6 +113,19 @@ def _money(cents: int | None) -> str:
 
 def _date_time(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M") if value else "—"
+
+
+def _store_name_for_id(stores, store_id: int | None) -> str:
+    if store_id is None:
+        return "店铺已删除（历史记录）"
+    return next(
+        (
+            str(getattr(store, "name", store_id))
+            for store in stores
+            if int(getattr(store, "id", 0)) == int(store_id)
+        ),
+        f"店铺 #{store_id}",
+    )
 
 
 def _day_start(value: date) -> datetime:
@@ -148,6 +175,10 @@ class DongxiaoPage(BasePage):
         self._products: list[Any] = []
         self._pools: list[Any] = []
         self._pool_items: list[dict[str, Any]] = []
+        self._cart_accounts: list[Any] = []
+        self._cart_batches: list[Any] = []
+        self._cart_pending_drafts: list[Any] = []
+        self._cart_preview = None
         self._verified_product_id = ""
         self._verified_sku_id = ""
         self._page = 1
@@ -168,6 +199,7 @@ class DongxiaoPage(BasePage):
             self.aftersale_service = self.runtime.aftersale_service
             self.task_scheduler = self.runtime.scheduler
             self.preflight_service = self.runtime.preflight_service
+            self.cart_service = self.runtime.cart_service
         else:
             platform = OfficialDongxiaoPlatformAdapter(self.window.service)
             self.task_service = DongxiaoTaskService(
@@ -190,6 +222,13 @@ class DongxiaoPage(BasePage):
                 sync_service=self.window.service,
                 database_path=database_path,
                 backup_dir=database_path.parent / "backups",
+            )
+            cart_repository = DesktopCartRepository(database_path)
+            self.cart_service = DesktopCartService(
+                cart_repository,
+                self.repository,
+                self.task_service,
+                scheduler=None,
             )
         self.official_catalog_service = ProductCatalogService(
             self.repository,
@@ -227,10 +266,23 @@ class DongxiaoPage(BasePage):
         self.task_stats_var = tk.StringVar(value="任务统计待读取")
         self.order_status_var = tk.StringVar(value="真实订单尚未同步")
         self.aftersale_status_var = tk.StringVar(value="售后工单尚未同步")
+        self.cart_status_var = tk.StringVar(value="批量加购尚未配置")
+        self.cart_preview_var = tk.StringVar(value="请先选择商品池和执行账号")
+        self.pending_order_status_var = tk.StringVar(value="待付款草案尚未读取")
+        self.cart_account_mode_var = tk.StringVar(value="模拟验证")
+        self.cart_products_per_batch_var = tk.StringVar(value="10")
+        self.cart_quantity_var = tk.StringVar(value="1")
+        self.cart_sku_mode_var = tk.StringVar(value="首个可售 SKU")
+        self.cart_specified_sku_var = tk.StringVar()
+        self.cart_stock_policy_var = tk.StringVar(value="缺货跳过")
+        self.cart_speed_var = tk.StringVar(value="保守")
+        self.cart_interval_var = tk.StringVar(value="2500")
+        self.cart_concurrency_var = tk.StringVar(value="1")
+        self.cart_batch_name_var = tk.StringVar(value="桌面批量加购")
         self.audit_status_var = tk.StringVar(value="审计日志尚未读取")
         self.preflight_status_var = tk.StringVar(value="实盘检查尚未运行")
         self.platform_write_status_var = tk.StringVar(
-            value="平台写操作：检查中"
+            value="真实平台写操作：检查中"
         )
         self.overview_stats_vars = {
             "stores": tk.StringVar(value="—"),
@@ -240,6 +292,9 @@ class DongxiaoPage(BasePage):
         }
 
         self.filter_keyword_var = tk.StringVar()
+        self.filter_title_exact_var = tk.BooleanVar(value=False)
+        self.filter_new_7d_var = tk.BooleanVar(value=False)
+        self.filter_low_sales_var = tk.BooleanVar(value=False)
         self.filter_state_var = tk.StringVar(value="全部状态")
         self.filter_min_price_var = tk.StringVar()
         self.filter_max_price_var = tk.StringVar()
@@ -379,7 +434,7 @@ class DongxiaoPage(BasePage):
             navigation,
             text=(
                 "买卖双方真实数据严格隔离。\n"
-                "平台写操作默认关闭。"
+                "真实平台写操作默认关闭。"
             ),
             bg=PANEL,
             fg=MUTED,
@@ -404,10 +459,14 @@ class DongxiaoPage(BasePage):
         self.section_views["products"] = self._build_product_view()
         self.section_views["pools"] = self._build_pool_view()
         self.section_views["sku_rules"] = self._build_sku_view()
+        self.section_views["cart_batch"] = self._build_cart_batch_view()
+        self.section_views["pending_orders"] = self._build_pending_orders_view()
+        self.section_views["accounts"] = self._build_cart_accounts_view()
         self.section_views["tasks"] = self._build_task_view()
         self.section_views["orders"] = self._build_order_view()
         self.section_views["aftersales"] = self._build_aftersale_view()
         self.section_views["audit"] = self._build_audit_view()
+        self.section_views["real_ops"] = self._build_real_ops_view()
         self.section_views["preflight"] = self._build_preflight_view()
         for view in self.section_views.values():
             view.grid(row=0, column=0, sticky="nsew")
@@ -557,6 +616,36 @@ class DongxiaoPage(BasePage):
         self._entry_field(filters, 1, 4, "上架起", self.filter_listed_from_var)
         self._entry_field(filters, 1, 6, "上架止", self.filter_listed_to_var)
         self._entry_field(filters, 2, 0, "商品 ID", self.filter_product_ids_var)
+        tk.Checkbutton(
+            filters,
+            text="标题精准匹配",
+            variable=self.filter_title_exact_var,
+            bg=PANEL,
+            fg=TEXT,
+            activebackground=PANEL,
+            selectcolor=PANEL,
+            anchor="w",
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
+        tk.Checkbutton(
+            filters,
+            text="近 7 天新品（需官方可信时间）",
+            variable=self.filter_new_7d_var,
+            bg=PANEL,
+            fg=TEXT,
+            activebackground=PANEL,
+            selectcolor=PANEL,
+            anchor="w",
+        ).grid(row=3, column=2, columnspan=3, sticky="w")
+        tk.Checkbutton(
+            filters,
+            text="低销量（0–10，需官方可信数据）",
+            variable=self.filter_low_sales_var,
+            bg=PANEL,
+            fg=TEXT,
+            activebackground=PANEL,
+            selectcolor=PANEL,
+            anchor="w",
+        ).grid(row=3, column=5, columnspan=3, sticky="w")
         tk.Checkbutton(
             filters,
             text="仅零销量（需官方可信数据）",
@@ -816,6 +905,1240 @@ class DongxiaoPage(BasePage):
             justify="left",
         ).grid(row=3, column=0, sticky="w", pady=(18, 0))
         return view
+
+    def _build_cart_accounts_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(3, weight=1)
+        ttk.Label(
+            view,
+            text="多账号任务",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            view,
+            text=(
+                "执行账号只绑定当前澜琅店铺，不创建第二套账号系统，"
+                "也不在普通数据库中保存密码或 Token。"
+                "Mock 账号只用于隔离流程验证；真实买家购物车接口待官方授权能力。"
+            ),
+            style="Subtitle.TLabel",
+            wraplength=820,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 12))
+        toolbar = ttk.Frame(view, style="Panel.TFrame")
+        toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(toolbar, text="新账号类型").pack(side="left")
+        ttk.Combobox(
+            toolbar,
+            textvariable=self.cart_account_mode_var,
+            values=("模拟验证", "真实账号（待授权）"),
+            state="readonly",
+            width=18,
+        ).pack(side="left", padx=(5, 10))
+        button(
+            toolbar,
+            "添加执行账号",
+            self._add_cart_account,
+            "Primary",
+        ).pack(side="left")
+        button(
+            toolbar,
+            "检查连接",
+            self._check_selected_cart_account,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            toolbar,
+            "刷新",
+            self._load_cart_accounts,
+        ).pack(side="left", padx=(6, 0))
+        self.cart_account_tree = ttk.Treeview(
+            view,
+            columns=("name", "mode", "status", "store", "checked", "error"),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label, width in (
+            ("name", "账号显示名", 140),
+            ("mode", "来源", 100),
+            ("status", "连接状态", 120),
+            ("store", "绑定店铺", 190),
+            ("checked", "最近检查", 145),
+            ("error", "失败原因", 260),
+        ):
+            self.cart_account_tree.heading(key, text=label)
+            self.cart_account_tree.column(key, width=width, anchor="w")
+        self.cart_account_tree.grid(row=3, column=0, sticky="nsew")
+        self.cart_account_tree.bind(
+            "<Double-1>",
+            lambda _event: self._check_selected_cart_account(),
+        )
+        ttk.Label(
+            view,
+            text=(
+                "真实账号只有在官方买家购物车授权、购物车服务端读取能力"
+                "得到确认后才可进入执行；当前不会用网页私有接口代替。"
+            ),
+            style="Subtitle.TLabel",
+        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        return view
+
+    def _load_cart_accounts(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+        scope = f"dongxiao:cart-accounts:{store.id}"
+        if self.window.has_running_task(scope):
+            return
+
+        def work(_progress):
+            return self.cart_service.list_accounts(
+                store,
+                permission_checker=self._permission_checker,
+            )
+
+        self.window.run_task(
+            work,
+            self._cart_accounts_loaded,
+            lambda error: self.window.set_status(
+                f"执行账号读取失败：{error}",
+                busy=False,
+            ),
+            log_title="读取多账号任务执行账号",
+            task_scope=scope,
+            store_app_id=str(store.app_id),
+        )
+
+    def _cart_accounts_loaded(self, accounts) -> None:
+        self._cart_accounts = list(accounts)
+        listbox = getattr(self, "cart_account_listbox", None)
+        if listbox is not None:
+            listbox.delete(0, "end")
+            for account in accounts:
+                listbox.insert(
+                    "end",
+                    f"{account.display_name} · {account.adapter_mode.value} · "
+                    f"{account.status.value}",
+                )
+        tree = getattr(self, "cart_account_tree", None)
+        if tree is not None:
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            mode_labels = {
+                CartAdapterMode.MOCK: "Mock 模拟",
+                CartAdapterMode.OFFICIAL: "真实账号待授权",
+                CartAdapterMode.MANUAL: "人工",
+                CartAdapterMode.UNKNOWN: "未知",
+            }
+            status_labels = {
+                "mock_ready": "模拟环境可用",
+                "pending_authorization": "等待平台授权",
+                "connected": "已连接",
+                "expired": "授权已失效",
+                "disconnected": "未连接",
+            }
+            for account in accounts:
+                tree.insert(
+                    "",
+                    "end",
+                    iid=account.account_id,
+                    values=(
+                        account.display_name,
+                        mode_labels.get(account.adapter_mode, account.adapter_mode.value),
+                        status_labels.get(account.status.value, account.status.value),
+                        f"{_store_name_for_id(self._stores, account.store_id)}",
+                        _date_time(account.last_checked_at),
+                        account.last_error,
+                    ),
+                )
+        self.cart_status_var.set(f"已读取 {len(accounts)} 个执行账号")
+
+    def _add_cart_account(self) -> None:
+        store = self._current_store()
+        if store is None:
+            messagebox.showwarning("执行账号", "请先选择店铺。", parent=self)
+            return
+        display_name = simpledialog.askstring(
+            "添加执行账号",
+            "请输入账号显示名（不要输入密码、Cookie 或 Token）：",
+            parent=self,
+        )
+        if not display_name:
+            return
+        mode = (
+            CartAdapterMode.MOCK
+            if self.cart_account_mode_var.get() == "模拟验证"
+            else CartAdapterMode.OFFICIAL
+        )
+        if mode is CartAdapterMode.OFFICIAL:
+            if not messagebox.askyesno(
+                "真实账号授权待确认",
+                (
+                    "当前可确认的官方接口没有买家购物车能力。\n"
+                    "该账号将保存为“等待平台授权”，不会执行真实加购。\n\n"
+                    "是否继续创建这个本地授权档案？"
+                ),
+                parent=self,
+            ):
+                return
+
+        def work(_progress):
+            return self.cart_service.create_account(
+                store,
+                display_name=display_name,
+                adapter_mode=mode,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            )
+
+        self.window.run_task(
+            work,
+            lambda _account: (
+                self._load_cart_accounts(),
+                self.window.set_status("执行账号已保存", busy=False),
+            ),
+            lambda error: messagebox.showerror(
+                "添加执行账号失败",
+                error,
+                parent=self,
+            ),
+            log_title="添加动销执行账号",
+            task_scope=f"dongxiao:cart-account-add:{store.id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _selected_cart_account(self):
+        tree = getattr(self, "cart_account_tree", None)
+        if tree is None:
+            return None
+        selection = tree.selection()
+        if not selection:
+            return None
+        selected_id = str(selection[0])
+        return next(
+            (
+                account
+                for account in self._cart_accounts
+                if account.account_id == selected_id
+            ),
+            None,
+        )
+
+    def _check_selected_cart_account(self) -> None:
+        account = self._selected_cart_account()
+        if account is None:
+            messagebox.showwarning(
+                "检查执行账号",
+                "请先选择一个执行账号。",
+                parent=self,
+            )
+            return
+
+        def work(_progress):
+            return self.cart_service.check_account(
+                account,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            )
+
+        self.window.run_task(
+            work,
+            lambda saved: (
+                self._load_cart_accounts(),
+                self.window.set_status(
+                    f"账号检查完成：{saved.status.value}",
+                    busy=False,
+                ),
+            ),
+            lambda error: messagebox.showerror(
+                "检查执行账号失败",
+                error,
+                parent=self,
+            ),
+            log_title="检查动销执行账号",
+            task_scope=f"dongxiao:cart-account-check:{account.account_id}",
+        )
+
+    def _build_cart_batch_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(5, weight=1)
+        ttk.Label(
+            view,
+            text="批量加购",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            view,
+            text=(
+                "预检会重新核验商品状态、SKU、库存、起购/限购和价格。"
+                "执行成功只以购物车服务端快照为依据。"
+                "Mock 结果只在隔离数据库中有效，真实接口未开放时保持禁止。"
+            ),
+            style="Subtitle.TLabel",
+            wraplength=850,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 10))
+        form = ttk.Frame(view, style="Panel.TFrame")
+        form.grid(row=2, column=0, sticky="ew")
+        ttk.Label(form, text="批次名称").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            form,
+            textvariable=self.cart_batch_name_var,
+            width=22,
+        ).grid(row=0, column=1, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="商品池").grid(row=0, column=2, sticky="w")
+        self.cart_pool_combo = ttk.Combobox(
+            form,
+            textvariable=self.pool_choice_var,
+            state="readonly",
+            width=28,
+        )
+        self.cart_pool_combo.grid(
+            row=0,
+            column=3,
+            sticky="w",
+            padx=(5, 14),
+            pady=3,
+        )
+        ttk.Label(form, text="每批商品数").grid(row=0, column=4, sticky="w")
+        ttk.Entry(
+            form,
+            textvariable=self.cart_products_per_batch_var,
+            width=8,
+        ).grid(row=0, column=5, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="每个商品数量").grid(row=1, column=0, sticky="w")
+        ttk.Entry(
+            form,
+            textvariable=self.cart_quantity_var,
+            width=8,
+        ).grid(row=1, column=1, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="SKU 选择").grid(row=1, column=2, sticky="w")
+        ttk.Combobox(
+            form,
+            textvariable=self.cart_sku_mode_var,
+            values=("首个可售 SKU", "最低价 SKU", "指定 SKU"),
+            state="readonly",
+            width=18,
+        ).grid(row=1, column=3, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="指定 SKU").grid(row=1, column=4, sticky="w")
+        ttk.Entry(
+            form,
+            textvariable=self.cart_specified_sku_var,
+            width=18,
+        ).grid(row=1, column=5, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="缺货处理").grid(row=2, column=0, sticky="w")
+        ttk.Combobox(
+            form,
+            textvariable=self.cart_stock_policy_var,
+            values=("缺货跳过", "缺货失败"),
+            state="readonly",
+            width=12,
+        ).grid(row=2, column=1, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="速度").grid(row=2, column=2, sticky="w")
+        ttk.Combobox(
+            form,
+            textvariable=self.cart_speed_var,
+            values=("保守", "自适应", "较快", "固定配置"),
+            state="readonly",
+            width=12,
+        ).grid(row=2, column=3, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="间隔 ms").grid(row=2, column=4, sticky="w")
+        ttk.Entry(
+            form,
+            textvariable=self.cart_interval_var,
+            width=9,
+        ).grid(row=2, column=5, sticky="w", padx=(5, 14), pady=3)
+        ttk.Label(form, text="并发").grid(row=2, column=6, sticky="w")
+        ttk.Entry(
+            form,
+            textvariable=self.cart_concurrency_var,
+            width=6,
+        ).grid(row=2, column=7, sticky="w", padx=(5, 0), pady=3)
+        account_box = ttk.LabelFrame(
+            view,
+            text="分配执行账号（可多选）",
+            padding=8,
+        )
+        account_box.grid(row=3, column=0, sticky="ew", pady=(8, 5))
+        self.cart_account_listbox = tk.Listbox(
+            account_box,
+            selectmode="extended",
+            height=4,
+            exportselection=False,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.cart_account_listbox.pack(fill="x")
+        tools = ttk.Frame(view, style="Panel.TFrame")
+        tools.grid(row=4, column=0, sticky="ew", pady=(4, 7))
+        button(
+            tools,
+            "执行前预览",
+            self._preview_cart_batch,
+            "Primary",
+        ).pack(side="left")
+        button(
+            tools,
+            "创建批次",
+            self._create_cart_batch,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            tools,
+            "确认并执行",
+            self._confirm_cart_batch,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            tools,
+            "暂停",
+            lambda: self._cart_batch_action("pause"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            tools,
+            "恢复",
+            lambda: self._cart_batch_action("resume"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            tools,
+            "取消",
+            lambda: self._cart_batch_action("cancel"),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            tools,
+            "生成待付款草案",
+            self._create_pending_order_drafts,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            view,
+            textvariable=self.cart_preview_var,
+            style="Subtitle.TLabel",
+        ).grid(row=5, column=0, sticky="nw")
+        bottom = ttk.Frame(view, style="Panel.TFrame")
+        bottom.grid(row=6, column=0, sticky="nsew", pady=(8, 0))
+        bottom.columnconfigure(0, weight=1)
+        bottom.columnconfigure(1, weight=1)
+        bottom.columnconfigure(2, weight=1)
+        bottom.rowconfigure(0, weight=1)
+        self.cart_preview_tree = ttk.Treeview(
+            bottom,
+            columns=("product", "title", "sku", "price", "qty", "status", "reason"),
+            show="headings",
+        )
+        for key, label, width in (
+            ("product", "商品 ID", 125),
+            ("title", "标题", 150),
+            ("sku", "SKU", 110),
+            ("price", "单价", 75),
+            ("qty", "数量", 55),
+            ("status", "预检", 70),
+            ("reason", "原因", 200),
+        ):
+            self.cart_preview_tree.heading(key, text=label)
+            self.cart_preview_tree.column(key, width=width, anchor="w")
+        self.cart_preview_tree.grid(row=0, column=0, sticky="nsew")
+        self.cart_batch_tree = ttk.Treeview(
+            bottom,
+            columns=("name", "status", "products", "accounts", "speed", "created"),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label, width in (
+            ("name", "批次", 155),
+            ("status", "状态", 90),
+            ("products", "商品", 60),
+            ("accounts", "账号", 55),
+            ("speed", "速度", 80),
+            ("created", "创建时间", 145),
+        ):
+            self.cart_batch_tree.heading(key, text=label)
+            self.cart_batch_tree.column(key, width=width, anchor="w")
+        self.cart_batch_tree.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self.cart_batch_tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event: self._show_cart_assignments(),
+        )
+        self.cart_assignment_tree = ttk.Treeview(
+            bottom,
+            columns=("account", "status", "progress", "success", "failed", "unknown"),
+            show="headings",
+        )
+        for key, label, width in (
+            ("account", "执行账号", 135),
+            ("status", "状态", 80),
+            ("progress", "进度", 70),
+            ("success", "成功", 55),
+            ("failed", "失败", 55),
+            ("unknown", "待核验", 65),
+        ):
+            self.cart_assignment_tree.heading(key, text=label)
+            self.cart_assignment_tree.column(key, width=width, anchor="w")
+        self.cart_assignment_tree.grid(
+            row=0,
+            column=2,
+            sticky="nsew",
+            padx=(8, 0),
+        )
+        return view
+
+    def _build_pending_orders_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(2, weight=1)
+        ttk.Label(
+            view,
+            text="待付款订单",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        toolbar = ttk.Frame(view, style="Panel.TFrame")
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        button(toolbar, "刷新", self._load_pending_orders).pack(side="left")
+        button(
+            toolbar,
+            "批准草案",
+            lambda: self._decide_pending_order(True),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            toolbar,
+            "取消草案",
+            lambda: self._decide_pending_order(False),
+        ).pack(side="left", padx=(6, 0))
+        button(
+            toolbar,
+            "尝试创建官方订单",
+            self._request_official_order_creation,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            view,
+            textvariable=self.pending_order_status_var,
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="e", padx=(250, 0))
+        panes = ttk.Panedwindow(view, orient="vertical")
+        panes.grid(row=2, column=0, sticky="nsew")
+        draft_box = ttk.Frame(panes, style="Panel.TFrame")
+        draft_box.columnconfigure(0, weight=1)
+        draft_box.rowconfigure(1, weight=1)
+        ttk.Label(
+            draft_box,
+            text="本地待付款草案（人工审批，不代表平台真实订单）",
+            style="Subtitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.pending_order_tree = ttk.Treeview(
+            draft_box,
+            columns=("store", "account", "status", "items", "amount", "reason", "created"),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label, width in (
+            ("store", "店铺", 150),
+            ("account", "执行账号", 145),
+            ("status", "状态", 105),
+            ("items", "商品数", 65),
+            ("amount", "预计金额", 95),
+            ("reason", "来源/原因", 270),
+            ("created", "创建时间", 150),
+        ):
+            self.pending_order_tree.heading(key, text=label)
+            self.pending_order_tree.column(key, width=width, anchor="w")
+        self.pending_order_tree.grid(row=1, column=0, sticky="nsew")
+        panes.add(draft_box, weight=2)
+        result_box = ttk.Frame(panes, style="Panel.TFrame")
+        result_box.columnconfigure(0, weight=1)
+        result_box.rowconfigure(1, weight=1)
+        ttk.Label(
+            result_box,
+            text="购物车核验明细",
+            style="Subtitle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.cart_result_tree = ttk.Treeview(
+            result_box,
+            columns=("product", "title", "sku", "qty", "price", "status", "source", "request"),
+            show="headings",
+        )
+        for key, label, width in (
+            ("product", "商品 ID", 135),
+            ("title", "商品", 180),
+            ("sku", "SKU", 120),
+            ("qty", "数量", 60),
+            ("price", "单价", 80),
+            ("status", "结果", 90),
+            ("source", "核验来源", 120),
+            ("request", "请求编号", 220),
+        ):
+            self.cart_result_tree.heading(key, text=label)
+            self.cart_result_tree.column(key, width=width, anchor="w")
+        self.cart_result_tree.grid(row=1, column=0, sticky="nsew")
+        panes.add(result_box, weight=1)
+        return view
+
+    def _load_cart_batches(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+        scope = f"dongxiao:cart-batches:{store.id}"
+        if self.window.has_running_task(scope):
+            return
+        repository = self.cart_service.repository
+
+        def work(_progress):
+            batches = repository.list_batches(store_id=int(store.id))
+            for batch in list(batches):
+                if batch.status in {
+                    CartBatchStatus.QUEUED,
+                    CartBatchStatus.RUNNING,
+                    CartBatchStatus.PAUSED,
+                    CartBatchStatus.UNKNOWN,
+                }:
+                    try:
+                        self.cart_service.sync_progress(batch.batch_id)
+                    except Exception:
+                        continue
+            return repository.list_batches(store_id=int(store.id))
+
+        self.window.run_task(
+            work,
+            self._cart_batches_loaded,
+            lambda error: self.window.set_status(
+                f"批量加购批次读取失败：{error}",
+                busy=False,
+            ),
+            log_title="读取批量加购批次",
+            task_scope=scope,
+            store_app_id=str(store.app_id),
+        )
+
+    def _cart_batches_loaded(self, batches) -> None:
+        self._cart_batches = list(batches)
+        tree = getattr(self, "cart_batch_tree", None)
+        if tree is not None:
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            labels = {
+                CartBatchStatus.DRAFT: "草稿",
+                CartBatchStatus.AWAITING_CONFIRMATION: "待确认",
+                CartBatchStatus.QUEUED: "已排队",
+                CartBatchStatus.RUNNING: "执行中",
+                CartBatchStatus.PAUSED: "已暂停",
+                CartBatchStatus.COMPLETED: "已完成",
+                CartBatchStatus.PARTIALLY_FAILED: "部分失败",
+                CartBatchStatus.FAILED: "全部失败",
+                CartBatchStatus.CANCELLED: "已取消",
+                CartBatchStatus.UNKNOWN: "待人工核验",
+            }
+            for batch in batches:
+                tree.insert(
+                    "",
+                    "end",
+                    iid=batch.batch_id,
+                    values=(
+                        batch.name,
+                        labels.get(batch.status, batch.status.value),
+                        batch.total_products,
+                        len(
+                            self.cart_service.repository.list_assignments(
+                                batch.batch_id
+                            )
+                        ),
+                        f"{batch.speed_mode.value} / {batch.interval_ms}ms",
+                        _date_time(batch.created_at),
+                    ),
+                )
+        self.cart_status_var.set(f"已读取 {len(batches)} 个批量加购批次")
+
+    def _selected_cart_batch(self):
+        tree = getattr(self, "cart_batch_tree", None)
+        if tree is None:
+            return None
+        selection = tree.selection()
+        if not selection:
+            return None
+        batch_id = str(selection[0])
+        return next(
+            (batch for batch in self._cart_batches if batch.batch_id == batch_id),
+            None,
+        )
+
+    def _show_cart_assignments(self) -> None:
+        batch = self._selected_cart_batch()
+        tree = getattr(self, "cart_assignment_tree", None)
+        if tree is None:
+            return
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        if batch is None:
+            return
+        labels = {
+            "pending": "等待",
+            "running": "执行中",
+            "completed": "已完成",
+            "failed": "失败",
+            "cancelled": "已取消",
+            "unknown": "待核验",
+        }
+        for assignment in self.cart_service.repository.list_assignments(
+            batch.batch_id
+        ):
+            total = int(assignment["total_items"] or 0)
+            succeeded = int(assignment["succeeded_items"] or 0)
+            failed = int(assignment["failed_items"] or 0)
+            skipped = int(assignment["skipped_items"] or 0)
+            unknown = int(assignment["unknown_items"] or 0)
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    str(assignment["display_name"]),
+                    labels.get(str(assignment["status"]), str(assignment["status"])),
+                    f"{succeeded + failed + skipped + unknown}/{total}",
+                    succeeded,
+                    failed,
+                    unknown,
+                ),
+            )
+
+    def _selected_cart_account_ids(self) -> list[str]:
+        listbox = getattr(self, "cart_account_listbox", None)
+        if listbox is None:
+            return []
+        return [
+            self._cart_accounts[int(index)].account_id
+            for index in listbox.curselection()
+            if 0 <= int(index) < len(self._cart_accounts)
+        ]
+
+    def _cart_sku_mode(self) -> CartSkuMode:
+        return {
+            "首个可售 SKU": CartSkuMode.FIRST_AVAILABLE,
+            "最低价 SKU": CartSkuMode.LOWEST_PRICE,
+            "指定 SKU": CartSkuMode.SPECIFIED,
+        }[self.cart_sku_mode_var.get()]
+
+    def _cart_stock_policy(self) -> OutOfStockPolicy:
+        return (
+            OutOfStockPolicy.SKIP
+            if self.cart_stock_policy_var.get() == "缺货跳过"
+            else OutOfStockPolicy.FAIL
+        )
+
+    def _cart_speed_mode(self) -> CartSpeedMode:
+        return {
+            "保守": CartSpeedMode.CONSERVATIVE,
+            "自适应": CartSpeedMode.ADAPTIVE,
+            "较快": CartSpeedMode.FAST,
+            "固定配置": CartSpeedMode.CUSTOM,
+        }[self.cart_speed_var.get()]
+
+    def _preview_cart_batch(self) -> None:
+        store = self._current_store()
+        pool = self._current_pool()
+        account_ids = self._selected_cart_account_ids()
+        if store is None or pool is None:
+            messagebox.showwarning(
+                "批量加购预览",
+                "请先选择店铺和商品池。",
+                parent=self,
+            )
+            return
+        if not account_ids:
+            messagebox.showwarning(
+                "批量加购预览",
+                "请至少选择一个执行账号。",
+                parent=self,
+            )
+            return
+        accounts = [
+            account
+            for account in self._cart_accounts
+            if account.account_id in set(account_ids)
+        ]
+        modes = {account.adapter_mode for account in accounts}
+        if len(modes) != 1:
+            messagebox.showwarning(
+                "批量加购预览",
+                "同一批次只能使用同一种授权来源的账号。",
+                parent=self,
+            )
+            return
+        adapter_mode = next(iter(modes))
+        try:
+            products_per_batch = int(self.cart_products_per_batch_var.get())
+            quantity = int(self.cart_quantity_var.get())
+            int(self.cart_interval_var.get())
+            int(self.cart_concurrency_var.get())
+        except ValueError:
+            messagebox.showwarning(
+                "批量加购预览",
+                "每批数量、商品数量、间隔和并发必须为整数。",
+                parent=self,
+            )
+            return
+
+        def work(_progress):
+            return self.cart_service.preview_batch(
+                store,
+                pool_id=pool.pool_id,
+                quantity_per_product=quantity,
+                sku_mode=self._cart_sku_mode(),
+                specified_sku_id=self.cart_specified_sku_var.get(),
+                out_of_stock_policy=self._cart_stock_policy(),
+                products_per_batch=products_per_batch,
+                account_ids=account_ids,
+                adapter_mode=adapter_mode,
+                permission_checker=self._permission_checker,
+            )
+
+        self.window.run_task(
+            work,
+            self._cart_preview_loaded,
+            lambda error: messagebox.showerror(
+                "批量加购预览失败",
+                error,
+                parent=self,
+            ),
+            log_title="预览桌面批量加购",
+            task_scope=f"dongxiao:cart-preview:{store.id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _cart_preview_loaded(self, preview) -> None:
+        self._cart_preview = preview
+        tree = getattr(self, "cart_preview_tree", None)
+        if tree is not None:
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            status_labels = {
+                "ready": "可执行",
+                "skipped": "将跳过",
+                "failed": "预检失败",
+            }
+            for item in preview.items:
+                tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        item.product_id,
+                        item.title,
+                        item.sku_id,
+                        _money(item.unit_price_cents),
+                        item.quantity,
+                        status_labels.get(item.status, item.status),
+                        item.reason,
+                    ),
+                )
+        capability = preview.capability
+        self.cart_preview_var.set(
+            f"可执行 {preview.ready_count}，跳过 {preview.skipped_count}，"
+            f"失败 {preview.failed_count}，预计金额 {_money(preview.total_amount_cents)}；"
+            f"接口状态：{capability.state.value}；{capability.reason}"
+        )
+        if capability.can_add_to_cart and capability.can_verify_cart:
+            message = (
+                f"预检完成：可执行 {preview.ready_count} 个商品。\n"
+                f"跳过 {preview.skipped_count}，失败 {preview.failed_count}。\n"
+                f"数据来源：{preview.adapter_mode.value}。\n\n"
+                "确认创建这个批次吗？创建后仍需再次确认执行。"
+            )
+            if tree is not None and messagebox.askyesno(
+                "批量加购预览",
+                message,
+                parent=self,
+            ):
+                self._create_cart_batch()
+            return
+        messagebox.showinfo(
+            "官方购物车能力未开放",
+            capability.reason,
+            parent=self,
+        )
+
+    def _create_cart_batch(self) -> None:
+        store = self._current_store()
+        preview = self._cart_preview
+        account_ids = self._selected_cart_account_ids()
+        if store is None or preview is None or not account_ids:
+            messagebox.showwarning(
+                "创建加购批次",
+                "请先完成预览并选择执行账号。",
+                parent=self,
+            )
+            return
+        if not preview.capability.can_add_to_cart:
+            messagebox.showwarning(
+                "创建加购批次",
+                preview.capability.reason,
+                parent=self,
+            )
+            return
+        try:
+            products_per_batch = int(self.cart_products_per_batch_var.get())
+            quantity = int(self.cart_quantity_var.get())
+            interval_ms = int(self.cart_interval_var.get())
+            concurrency = int(self.cart_concurrency_var.get())
+        except ValueError:
+            messagebox.showwarning(
+                "创建加购批次",
+                "数字输入格式不正确。",
+                parent=self,
+            )
+            return
+
+        def work(_progress):
+            return self.cart_service.create_batch(
+                store,
+                name=self.cart_batch_name_var.get(),
+                idempotency_key=f"desktop-cart-{uuid.uuid4().hex}",
+                preview=preview,
+                quantity_per_product=quantity,
+                products_per_batch=products_per_batch,
+                sku_mode=self._cart_sku_mode(),
+                specified_sku_id=self.cart_specified_sku_var.get(),
+                out_of_stock_policy=self._cart_stock_policy(),
+                speed_mode=self._cart_speed_mode(),
+                interval_ms=interval_ms,
+                concurrency=concurrency,
+                account_ids=account_ids,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            )
+
+        self.window.run_task(
+            work,
+            self._cart_batch_created,
+            lambda error: messagebox.showerror(
+                "创建加购批次失败",
+                error,
+                parent=self,
+            ),
+            log_title="创建桌面批量加购批次",
+            task_scope=f"dongxiao:cart-batch-create:{store.id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _cart_batch_created(self, result) -> None:
+        batch, created = result
+        self.cart_preview_var.set(
+            f"批次 {batch.name} 已{'创建' if created else '读取'}，"
+            "请检查商品和账号后点击“确认并执行”。"
+        )
+        self._load_cart_batches()
+        self.window.set_status("批量加购批次已保存", busy=False)
+
+    def _confirm_cart_batch(self) -> None:
+        store = self._current_store()
+        batch = self._selected_cart_batch()
+        if store is None or batch is None:
+            messagebox.showwarning(
+                "确认加购批次",
+                "请先在右侧批次列表选择一个批次。",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "确认执行批量加购",
+            (
+                f"批次：{batch.name}\n"
+                f"商品数量：{batch.total_products}\n"
+                f"数据来源：{batch.adapter_mode.value}\n\n"
+                "执行后，只有购物车服务端状态核验成功才记为成功。\n"
+                "Mock 模式不会访问真实平台。\n\n是否继续？"
+            ),
+            parent=self,
+        ):
+            return
+
+        def work(_progress):
+            return self.cart_service.confirm_batch(
+                store,
+                batch.batch_id,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            )
+
+        self.window.run_task(
+            work,
+            lambda result: self._cart_batch_command_done(
+                "批次已确认并加入后台任务"
+            ),
+            lambda error: messagebox.showerror(
+                "确认加购批次失败",
+                error,
+                parent=self,
+            ),
+            log_title="确认并执行桌面批量加购",
+            task_scope=f"dongxiao:cart-batch-confirm:{batch.batch_id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _cart_batch_action(self, action: str) -> None:
+        store = self._current_store()
+        batch = self._selected_cart_batch()
+        if store is None or batch is None:
+            messagebox.showwarning(
+                "批量加购",
+                "请先选择一个批次。",
+                parent=self,
+            )
+            return
+        if action == "cancel" and not messagebox.askyesno(
+            "取消加购批次",
+            "取消只停止尚未完成的明细，不删除历史记录。是否继续？",
+            parent=self,
+        ):
+            return
+        method = {
+            "pause": self.cart_service.pause_batch,
+            "resume": self.cart_service.resume_batch,
+            "cancel": self.cart_service.cancel_batch,
+        }[action]
+
+        def work(_progress):
+            return method(
+                store,
+                batch.batch_id,
+                actor_id=self._actor_id(),
+            )
+
+        self.window.run_task(
+            work,
+            lambda _result: self._cart_batch_command_done(
+                {
+                    "pause": "批次已暂停",
+                    "resume": "批次已恢复",
+                    "cancel": "批次已取消",
+                }[action]
+            ),
+            lambda error: messagebox.showerror(
+                "批量加购操作失败",
+                error,
+                parent=self,
+            ),
+            log_title=f"批量加购操作：{action}",
+            task_scope=f"dongxiao:cart-batch-{action}:{batch.batch_id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _cart_batch_command_done(self, message: str) -> None:
+        self.cart_status_var.set(message)
+        self._load_cart_batches()
+        self.window.set_status(message, busy=False)
+
+    def _create_pending_order_drafts(self) -> None:
+        store = self._current_store()
+        batch = self._selected_cart_batch()
+        if store is None or batch is None:
+            messagebox.showwarning(
+                "待付款草案",
+                "请先选择一个已完成的加购批次。",
+                parent=self,
+            )
+            return
+        self.window.run_task(
+            lambda _progress: self.cart_service.create_pending_drafts(
+                store,
+                batch.batch_id,
+                actor_id=self._actor_id(),
+            ),
+            lambda drafts: (
+                self.pending_order_status_var.set(
+                    f"已生成 {len(drafts)} 个待付款草案"
+                ),
+                self._load_pending_orders(),
+            ),
+            lambda error: messagebox.showerror(
+                "生成待付款草案失败",
+                error,
+                parent=self,
+            ),
+            log_title="生成待付款订单草案",
+            task_scope=f"dongxiao:pending-draft:{batch.batch_id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _load_pending_orders(self) -> None:
+        store = self._current_store()
+        if store is None:
+            return
+        scope = f"dongxiao:pending-orders:{store.id}"
+        if self.window.has_running_task(scope):
+            return
+        repository = self.cart_service.repository
+
+        def work(_progress):
+            return (
+                repository.list_pending_drafts(store_id=int(store.id)),
+                repository.list_results(store_id=int(store.id), limit=5000),
+            )
+
+        self.window.run_task(
+            work,
+            self._pending_orders_loaded,
+            lambda error: self.window.set_status(
+                f"待付款草案读取失败：{error}",
+                busy=False,
+            ),
+            log_title="读取待付款订单草案",
+            task_scope=scope,
+            store_app_id=str(store.app_id),
+        )
+
+    def _pending_orders_loaded(self, payload) -> None:
+        drafts, results = payload
+        self._cart_pending_drafts = list(drafts)
+        labels = {
+            PendingOrderStatus.DRAFT: "草稿",
+            PendingOrderStatus.AWAITING_APPROVAL: "待审批",
+            PendingOrderStatus.APPROVED: "已批准（未创建订单）",
+            PendingOrderStatus.CANCELLED: "已取消",
+            PendingOrderStatus.VERIFIED: "真实订单已核验",
+            PendingOrderStatus.OFFICIAL_CREATE_UNSUPPORTED: "官方创建不支持",
+        }
+        tree = getattr(self, "pending_order_tree", None)
+        if tree is not None:
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            for draft in drafts:
+                tree.insert(
+                    "",
+                    "end",
+                    iid=draft.draft_id,
+                    values=(
+                        draft.store_name,
+                        draft.account_id,
+                        labels.get(draft.status, draft.status.value),
+                        draft.item_count,
+                        _money(draft.total_amount_cents),
+                        draft.reason,
+                        _date_time(draft.created_at),
+                    ),
+                )
+        result_tree = getattr(self, "cart_result_tree", None)
+        if result_tree is not None:
+            for item_id in result_tree.get_children():
+                result_tree.delete(item_id)
+            status_labels = {
+                CartResultStatus.SUCCEEDED: "成功",
+                CartResultStatus.FAILED: "失败",
+                CartResultStatus.SKIPPED: "跳过",
+                CartResultStatus.UNKNOWN: "待核验",
+                CartResultStatus.PENDING: "等待",
+            }
+            for result in results:
+                result_tree.insert(
+                    "",
+                    "end",
+                    iid=result.result_id,
+                    values=(
+                        result.product_id,
+                        result.product_title,
+                        result.sku_id,
+                        result.quantity,
+                        _money(result.unit_price_cents),
+                        status_labels.get(result.status, result.status.value),
+                        result.verification_source.value,
+                        result.request_id,
+                    ),
+                )
+        self.pending_order_status_var.set(
+            "待审批 "
+            + str(
+                sum(
+                    item.status is PendingOrderStatus.AWAITING_APPROVAL
+                    for item in drafts
+                )
+            )
+            + "，购物车成功明细 "
+            + str(
+                sum(
+                    item.status is CartResultStatus.SUCCEEDED
+                    for item in results
+                )
+            )
+        )
+
+    def _selected_pending_order_draft(self):
+        tree = getattr(self, "pending_order_tree", None)
+        if tree is None:
+            return None
+        selection = tree.selection()
+        if not selection:
+            return None
+        draft_id = str(selection[0])
+        return next(
+            (
+                draft
+                for draft in self._cart_pending_drafts
+                if draft.draft_id == draft_id
+            ),
+            None,
+        )
+
+    def _decide_pending_order(self, approve: bool) -> None:
+        store = self._current_store()
+        draft = self._selected_pending_order_draft()
+        if store is None or draft is None:
+            messagebox.showwarning(
+                "待付款草案",
+                "请先选择一个待付款草案。",
+                parent=self,
+            )
+            return
+        action = "批准" if approve else "取消"
+        if not messagebox.askyesno(
+            f"{action}待付款草案",
+            (
+                f"店铺：{draft.store_name}\n"
+                f"商品数：{draft.item_count}\n"
+                f"预计金额：{_money(draft.total_amount_cents)}\n\n"
+                "这是本地草案审批，不会创建平台真实订单，也不会付款。\n"
+                f"确认{action}吗？"
+            ),
+            parent=self,
+        ):
+            return
+
+        def work(_progress):
+            return self.cart_service.decide_pending_draft(
+                store,
+                draft.draft_id,
+                approve=approve,
+                actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
+                reason=f"用户人工{action}本地待付款草案",
+            )
+
+        self.window.run_task(
+            work,
+            lambda _saved: (
+                self.pending_order_status_var.set(f"草案已{action}"),
+                self._load_pending_orders(),
+            ),
+            lambda error: messagebox.showerror(
+                "待付款草案审批失败",
+                error,
+                parent=self,
+            ),
+            log_title=f"{action}待付款草案",
+            task_scope=f"dongxiao:pending-decision:{draft.draft_id}",
+            store_app_id=str(store.app_id),
+        )
+
+    def _request_official_order_creation(self) -> None:
+        draft = self._selected_pending_order_draft()
+        if draft is None:
+            messagebox.showwarning(
+                "创建官方订单",
+                "请先选择一个待付款草案。",
+                parent=self,
+            )
+            return
+        messagebox.showinfo(
+            "官方订单创建未开放",
+            (
+                "当前可确认的微信小店商家开放接口不支持由商家端创建"
+                "买家待付款订单。\n\n"
+                "本次不会向平台发送任何请求，也不会自动付款。\n"
+                "请继续使用微信官方下单和支付流程。"
+            ),
+            parent=self,
+        )
 
     def _build_task_view(self) -> ttk.Frame:
         view = ttk.Frame(self.section_host, style="Panel.TFrame")
@@ -1098,6 +2421,155 @@ class DongxiaoPage(BasePage):
         self.aftersale_tree.grid(row=4, column=0, sticky="nsew")
         return view
 
+    def _build_real_ops_view(self) -> ttk.Frame:
+        view = ttk.Frame(self.section_host, style="Panel.TFrame")
+        view.columnconfigure(0, weight=1)
+        view.rowconfigure(4, weight=1)
+        ttk.Label(
+            view,
+            text="真实操作管理",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            view,
+            textvariable=self.active_store_var,
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+        ttk.Label(
+            view,
+            textvariable=self.platform_write_status_var,
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 8))
+
+        actions = ttk.Frame(view, style="Panel.TFrame")
+        actions.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self.real_ops_enable_button = button(
+            actions,
+            "开启当前店铺真实写操作",
+            self._enable_platform_writes,
+            "Primary",
+        )
+        self.real_ops_enable_button.pack(side="left", padx=(0, 6))
+        button(
+            actions,
+            "关闭当前店铺真实写操作",
+            self._disable_current_store_writes,
+        ).pack(side="left", padx=(0, 6))
+        button(
+            actions,
+            "紧急关闭全部",
+            self._disable_platform_writes_now,
+        ).pack(side="left", padx=(0, 12))
+        button(
+            actions,
+            "进入商品管理",
+            lambda: self._open_business_page("products"),
+        ).pack(side="left", padx=(0, 6))
+        button(
+            actions,
+            "进入上传商品",
+            lambda: self._open_business_page("upload"),
+        ).pack(side="left", padx=(0, 6))
+        button(
+            actions,
+            "进入订单管理",
+            lambda: self._open_business_page("order_management"),
+        ).pack(side="left", padx=(0, 6))
+        button(
+            actions,
+            "进入售后管理",
+            lambda: self._open_business_page("operations"),
+        ).pack(side="left")
+
+        table = ttk.Treeview(
+            view,
+            columns=("feature", "source", "entry", "note"),
+            show="headings",
+            height=11,
+        )
+        for key, label, width in (
+            ("feature", "真实业务能力", 190),
+            ("source", "接口依据", 170),
+            ("entry", "执行入口", 150),
+            ("note", "当前说明", 540),
+        ):
+            table.heading(key, text=label)
+            table.column(key, width=width, anchor="w")
+        rows = (
+            (
+                "桌面批量加购（业务编排）",
+                "澜琅本地服务 + 购物车服务端核验协议",
+                "批量加购 / 多账号任务",
+                "商品池、SKU、库存、限购、价格、幂等、暂停恢复、"
+                "逐账号进度与购物车回查已接入统一任务引擎",
+            ),
+            (
+                "真实买家加购与购物车读取",
+                "未确认可授权的官方买家接口",
+                "批量加购",
+                "未发现可确认的微信小店官方开放接口；"
+                "真实账号保持等待授权，禁止以私有网页接口冒充成功",
+            ),
+            (
+                "买家待付款订单创建",
+                "未确认可授权的官方买家下单接口",
+                "待付款订单",
+                "支持本地草案、人工审批和真实订单核验；"
+                "不会由商家端绕过微信官方下单与支付流程",
+            ),
+            (
+                "商品新增与编辑",
+                "微信小店官方商品 API",
+                "商品管理 / 上传商品",
+                "由现有业务页面执行；受当前店铺写开关和人工确认保护",
+            ),
+            (
+                "价格、库存、上下架",
+                "微信小店官方商品 API",
+                "商品管理",
+                "批量操作沿用现有逐项结果和操作日志",
+            ),
+            (
+                "订单备注、改价、地址、物流",
+                "微信小店官方订单 API",
+                "订单管理",
+                "订单操作在现有订单管理页面执行；不得修改普通客户测试订单",
+            ),
+            (
+                "售后同意与拒绝",
+                "微信小店官方售后 API",
+                "售后工单",
+                "必须有通过审批、金额一致、人工确认和写后回查",
+            ),
+            (
+                "退款",
+                "官方同意售后触发",
+                "售后工单",
+                "官方当前接口不支持指定部分退款金额，以申请金额为准",
+            ),
+            (
+                "售后协商、补发、换货",
+                "客户端方法存在，动销统一工作流未完成",
+                "—",
+                "不在统一动销任务中开放，避免伪装为已完成能力",
+            ),
+        )
+        for row in rows:
+            table.insert("", "end", values=row)
+        table.grid(row=4, column=0, sticky="nsew")
+        return view
+
+    def _open_business_page(self, page_key: str) -> None:
+        show_page = getattr(self.window, "show_page", None)
+        if not callable(show_page):
+            messagebox.showerror(
+                "真实操作管理",
+                "主窗口页面导航不可用。",
+                parent=self,
+            )
+            return
+        show_page(page_key)
+
     def _build_audit_view(self) -> ttk.Frame:
         view = ttk.Frame(self.section_host, style="Panel.TFrame")
         view.columnconfigure(0, weight=1)
@@ -1181,7 +2653,7 @@ class DongxiaoPage(BasePage):
         self.preflight_report_button.pack(side="left", padx=(0, 6))
         self.enable_platform_write_button = button(
             actions,
-            "开启平台写操作",
+            "开启当前店铺真实写操作",
             self._enable_platform_writes,
         )
         self.enable_platform_write_button.pack(side="left")
@@ -1309,12 +2781,21 @@ class DongxiaoPage(BasePage):
             self._load_pools()
         elif section.key == "tasks":
             self._load_tasks()
+        elif section.key == "accounts":
+            self._load_cart_accounts()
+        elif section.key == "cart_batch":
+            self._load_cart_accounts()
+            self._load_cart_batches()
+        elif section.key == "pending_orders":
+            self._load_pending_orders()
         elif section.key == "orders":
             self._load_orders()
         elif section.key == "aftersales":
             self._load_aftersales()
         elif section.key == "audit":
             self._load_audit()
+        elif section.key == "real_ops":
+            self._update_platform_write_status()
         elif section.key == "preflight":
             self._update_platform_write_status()
             self._load_api_calls()
@@ -1332,11 +2813,23 @@ class DongxiaoPage(BasePage):
             else ""
         )
         if (
-            self._active_section == "tasks"
+            self._active_section in {
+                "tasks",
+                "cart_batch",
+                "pending_orders",
+                "accounts",
+            }
             and scope
             and not self.window.has_running_task(scope)
         ):
-            self._load_tasks()
+            if self._active_section == "cart_batch":
+                self._refresh_cart_batches()
+            elif self._active_section == "pending_orders":
+                self._load_pending_orders()
+            elif self._active_section == "accounts":
+                self._load_cart_accounts()
+            else:
+                self._load_tasks()
         self.after(2000, self._task_activity_tick)
 
     def _current_store(self):
@@ -1409,19 +2902,13 @@ class DongxiaoPage(BasePage):
         store = self._current_store()
         if store is None:
             return
-        runtime = self.runtime
-        invalidate = getattr(
-            runtime,
-            "invalidate_platform_readonly_verification",
-            None,
-        )
-        if callable(invalidate):
-            invalidate()
         self._update_platform_write_status()
         self.active_store_var.set(f"当前店铺：{store.name}")
         self._page = 1
         self._load_products()
         self._load_pools()
+        self._load_cart_accounts()
+        self._load_cart_batches()
         self._load_overview_stats()
 
     def _load_overview_stats(self) -> None:
@@ -1514,8 +3001,22 @@ class DongxiaoPage(BasePage):
             page_size = int(self.page_size_var.get())
         except ValueError:
             page_size = 50
+        sales_max = self._parse_optional_int(
+            self.filter_sales_max_var.get(),
+            "最高销量",
+        )
+        if self.filter_low_sales_var.get() and sales_max is None:
+            sales_max = 10
+        listed_from = self._parse_optional_date(
+            self.filter_listed_from_var.get(),
+            "上架起始日期",
+            end=False,
+        )
+        if self.filter_new_7d_var.get() and listed_from is None:
+            listed_from = datetime.now(UTC) - timedelta(days=7)
         return ProductFilter(
             keyword=self.filter_keyword_var.get(),
+            title_exact=bool(self.filter_title_exact_var.get()),
             states=state_map.get(self.filter_state_var.get(), ()),
             product_ids=product_ids,
             min_price_cents=self._parse_optional_money(
@@ -1531,15 +3032,8 @@ class DongxiaoPage(BasePage):
                 self.filter_sales_min_var.get(),
                 "最低销量",
             ),
-            sales_max=self._parse_optional_int(
-                self.filter_sales_max_var.get(),
-                "最高销量",
-            ),
-            listed_from=self._parse_optional_date(
-                self.filter_listed_from_var.get(),
-                "上架起始日期",
-                end=False,
-            ),
+            sales_max=sales_max,
+            listed_from=listed_from,
             listed_to=self._parse_optional_date(
                 self.filter_listed_to_var.get(),
                 "上架结束日期",
@@ -1660,6 +3154,9 @@ class DongxiaoPage(BasePage):
         ):
             variable.set("")
         self.filter_state_var.set("全部状态")
+        self.filter_title_exact_var.set(False)
+        self.filter_new_7d_var.set(False)
+        self.filter_low_sales_var.set(False)
         self.filter_zero_sales_var.set(False)
         self._page = 1
         self._apply_filters()
@@ -1852,6 +3349,8 @@ class DongxiaoPage(BasePage):
             self._pools = list(pools)
             labels = [self._pool_label(pool) for pool in pools]
             self.pool_combo.configure(values=labels)
+            if hasattr(self, "cart_pool_combo"):
+                self.cart_pool_combo.configure(values=labels)
             current = self.pool_choice_var.get()
             if current not in labels:
                 self.pool_choice_var.set(labels[0] if labels else "")
@@ -3422,8 +4921,10 @@ class DongxiaoPage(BasePage):
 
     def _run_preflight_local(self) -> None:
         window = self.window
+        store = self._current_store()
         window.run_task(
             lambda _progress: self.preflight_service.run_local(
+                store=store,
                 actor_id=self._actor_id(),
                 permission_checker=self._permission_checker,
             ),
@@ -3555,15 +5056,15 @@ class DongxiaoPage(BasePage):
     def _disable_platform_writes_now(self) -> None:
         if not getattr(self, "preflight_service", None):
             return
-        self.platform_write_status_var.set("平台写操作：正在禁止")
+        self.platform_write_status_var.set("真实平台写操作：正在关闭")
         runtime = self.runtime
         if runtime is None:
             ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
             runtime = ensure() if callable(ensure) else None
         if runtime is None:
-            self.platform_write_status_var.set("平台写操作：禁止失败")
+            self.platform_write_status_var.set("真实平台写操作：关闭失败")
             messagebox.showerror(
-                "平台写操作",
+                "真实平台写操作",
                 "动销 Runtime 未初始化，无法更新总开关。",
                 parent=self,
             )
@@ -3573,18 +5074,53 @@ class DongxiaoPage(BasePage):
                 False,
                 actor_id=self._actor_id(),
                 permission_checker=self._permission_checker,
+                emergency=True,
             ),
             lambda _result: self._platform_gate_completed(False),
             self._platform_gate_failed,
-            log_title="立即禁止动销平台写操作",
+            log_title="紧急关闭动销真实平台写操作",
             task_scope="dongxiao:platform-write-disable",
+        )
+
+    def _disable_current_store_writes(self) -> None:
+        store = self._current_store()
+        if store is None:
+            messagebox.showwarning(
+                "真实平台写操作",
+                "请先选择店铺。",
+                parent=self,
+            )
+            return
+        runtime = self.runtime
+        if runtime is None:
+            ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
+            runtime = ensure() if callable(ensure) else None
+        if runtime is None:
+            messagebox.showerror(
+                "真实平台写操作",
+                "动销 Runtime 未初始化。",
+                parent=self,
+            )
+            return
+        self.window.run_task(
+            lambda _progress: runtime.set_platform_writes_enabled(
+                False,
+                store=store,
+                actor_id=self._actor_id(),
+                permission_checker=self._permission_checker,
+            ),
+            lambda _result: self._platform_gate_completed(False),
+            self._platform_gate_failed,
+            log_title="关闭当前店铺真实平台写操作",
+            task_scope=f"dongxiao:store-write-disable:{store.id}",
+            store_app_id=str(store.app_id),
         )
 
     def _enable_platform_writes(self) -> None:
         store = self._current_store()
         if store is None:
             messagebox.showwarning(
-                "平台写操作",
+                "真实平台写操作",
                 "请先选择并完成当前店铺的真实只读验收。",
                 parent=self,
             )
@@ -3594,12 +5130,12 @@ class DongxiaoPage(BasePage):
         ):
             messagebox.showwarning(
                 "平台写操作",
-                "当前账号没有修改平台写操作总开关的权限。",
+                "当前账号没有修改真实平台写操作开关的权限。",
                 parent=self,
             )
             return
         first = messagebox.askyesno(
-            "开启平台写操作",
+                "开启真实平台写操作",
             (
                 "开启后只允许创建“已经完成人工审批”的平台写任务，"
                 "不会自动同意、拒绝或退款。\n"
@@ -3627,7 +5163,7 @@ class DongxiaoPage(BasePage):
             runtime = ensure() if callable(ensure) else None
         if runtime is None:
             messagebox.showerror(
-                "平台写操作",
+                "真实平台写操作",
                 "动销 Runtime 未初始化，禁止开启平台写操作。",
                 parent=self,
             )
@@ -3647,21 +5183,21 @@ class DongxiaoPage(BasePage):
 
     def _platform_gate_completed(self, enabled: bool) -> None:
         self.platform_write_status_var.set(
-            "平台写操作：已开启（需逐单人工确认）"
+            "真实平台写操作：已开启（需逐单人工确认）"
             if enabled
-            else "平台写操作：已禁止"
+            else "真实平台写操作：已关闭"
         )
         self.window.set_status(
-            "动销平台写操作已开启"
+            "动销真实平台写操作已开启"
             if enabled
-            else "已立即禁止所有新的动销平台写操作",
+            else "已紧急关闭所有店铺的真实平台写操作",
             busy=False,
         )
 
     def _platform_gate_failed(self, error: str) -> None:
-        self.platform_write_status_var.set("平台写操作：状态更新失败")
+        self.platform_write_status_var.set("真实平台写操作：状态更新失败")
         messagebox.showerror(
-            "平台写操作",
+            "真实平台写操作",
             error,
             parent=self,
         )
@@ -3669,29 +5205,44 @@ class DongxiaoPage(BasePage):
     def _update_platform_write_status(self) -> None:
         runtime = self.runtime
         if runtime is None:
-            self.platform_write_status_var.set("平台写操作：已禁止")
+            self.platform_write_status_var.set(
+                "真实平台写操作：已关闭"
+            )
             return
         try:
-            enabled = runtime.platform_writes_enabled()
             store = self._current_store()
+            emergency_enabled = runtime.platform_writes_enabled()
+            enabled = (
+                runtime.store_platform_writes_enabled(str(store.app_id))
+                if store is not None
+                else emergency_enabled
+            )
             verification = (
                 runtime.platform_readonly_verification(str(store.app_id))
                 if store is not None and enabled
                 else None
             )
         except Exception:
-            self.platform_write_status_var.set("平台写操作：状态读取失败")
+            self.platform_write_status_var.set(
+                "真实平台写操作：状态读取失败"
+            )
             return
         if enabled and verification is not None:
             self.platform_write_status_var.set(
-                "平台写操作：已开启（当前店铺验收有效）"
+                "真实平台写操作：已开启（当前店铺验收有效）"
             )
         elif enabled:
             self.platform_write_status_var.set(
-                "平台写操作：已开启但当前店铺未验收，任务将被阻止"
+                "真实平台写操作：已开启但当前店铺验收失效，任务将被阻止"
+            )
+        elif emergency_enabled and store is None:
+            self.platform_write_status_var.set(
+                "真实平台写操作：其他店铺已开启；选择店铺查看"
             )
         else:
-            self.platform_write_status_var.set("平台写操作：已禁止")
+            self.platform_write_status_var.set(
+                "真实平台写操作：已关闭"
+            )
 
     def _load_api_calls(self) -> None:
         store = self._current_store()
