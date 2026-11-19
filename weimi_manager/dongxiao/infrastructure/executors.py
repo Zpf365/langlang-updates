@@ -281,10 +281,13 @@ class AftersaleDecisionExecutor:
         repository: DongxiaoRepository,
         adapter,
         aftersale_service: DongxiaoAftersaleService,
+        *,
+        platform_write_gate=None,
     ) -> None:
         self.repository = repository
         self.adapter = adapter
         self.aftersale_service = aftersale_service
+        self.platform_write_gate = platform_write_gate
 
     def execute(self, item: TaskExecutionItem) -> dict[str, object]:
         if item.subject_type != "aftersale":
@@ -325,6 +328,14 @@ class AftersaleDecisionExecutor:
             case,
             approved_amount_cents=amount,
         )
+        if (
+            self.platform_write_gate is not None
+            and not self.platform_write_gate(item.store_app_id)
+        ):
+            raise TaskExecutionError(
+                "platform_write_not_allowed",
+                "当前会话或店铺没有有效的真实只读验收，禁止发送平台写请求",
+            )
         action = str(item.payload.get("action") or "")
         previous_status = case.platform_status
         target_statuses = _target_platform_statuses(

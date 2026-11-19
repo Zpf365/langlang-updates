@@ -73,6 +73,53 @@ class _FakeSyncService:
         return self.client
 
 
+class _OfficialTransport:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def post_json(self, url: str, payload: dict) -> dict:
+        self.calls.append(url)
+        if "/stable_token" in url:
+            return {
+                "errcode": 0,
+                "access_token": "READ-ONLY-TOKEN",
+                "expires_in": 7200,
+            }
+        if "/product/list/get" in url:
+            return {
+                "errcode": 0,
+                "product_ids": [],
+                "next_key": "",
+            }
+        if "/order/list/get" in url:
+            return {
+                "errcode": 0,
+                "order_id_list": [],
+                "has_more": False,
+            }
+        if "/aftersale/getaftersalelist" in url:
+            return {
+                "errcode": 0,
+                "after_sale_order_id_list": [],
+                "has_more": False,
+            }
+        raise AssertionError(f"unexpected official stress URL: {url}")
+
+
+class _OfficialSyncService:
+    def __init__(self) -> None:
+        self.transport = _OfficialTransport()
+        self.client = WechatShopClient(
+            "wx-phase5-test",
+            "s" * 32,
+            transport=self.transport,
+            min_request_interval=0,
+        )
+
+    def client_for(self, _store):
+        return self.client
+
+
 def _create_environment(tmp_path: Path) -> tuple[Database, object]:
     db = Database(tmp_path / "langlang-phase5.db")
     store_id = db.add_store(
@@ -273,7 +320,7 @@ def test_task_service_gate_blocks_new_platform_write_task(
     db, store = _create_environment(tmp_path)
     service = DongxiaoTaskService(
         DongxiaoRepository(db.path),
-        platform_write_gate=lambda: False,
+        platform_write_gate=lambda _store_app_id: False,
     )
 
     with pytest.raises(PlatformWriteDisabled):
@@ -314,7 +361,7 @@ def test_scheduler_does_not_dispatch_platform_write_when_gate_closed(
     scheduler = DongxiaoTaskScheduler(
         DongxiaoRepository(db.path),
         Executor(),
-        platform_write_gate=lambda: False,
+        platform_write_gate=lambda _store_app_id: False,
         poll_interval_seconds=0.02,
     )
     assert scheduler.run_until_idle(timeout=0.15) is False
@@ -326,7 +373,6 @@ def test_local_preflight_distinguishes_passed_unverified_and_authorization(
 ) -> None:
     db, _store = _create_environment(tmp_path)
     runtime = DongxiaoRuntime(db.path, _FakeSyncService())
-    runtime.start()
     try:
         report = runtime.preflight_service.run_local(
             actor_id="tester",
@@ -355,7 +401,7 @@ def test_platform_preflight_requires_explicit_authorization_and_is_read_only(
     tmp_path: Path,
 ) -> None:
     db, store = _create_environment(tmp_path)
-    sync_service = _FakeSyncService()
+    sync_service = _OfficialSyncService()
     runtime = DongxiaoRuntime(db.path, sync_service)
     runtime.start()
     try:
@@ -381,10 +427,10 @@ def test_platform_preflight_requires_explicit_authorization_and_is_read_only(
     assert states["order_api"] is PreflightState.PASSED
     assert states["aftersale_read_api"] is PreflightState.PASSED
     assert all(
-        not call.startswith(("accept", "reject"))
-        for call in sync_service.client.calls
+        "/accept" not in call and "/reject" not in call
+        for call in sync_service.transport.calls
     )
-    assert "get_access_token" in sync_service.client.calls
+    assert any("/stable_token" in call for call in sync_service.transport.calls)
 
 
 def test_preflight_service_enforces_application_permission(

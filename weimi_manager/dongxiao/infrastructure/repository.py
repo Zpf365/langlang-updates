@@ -2711,6 +2711,59 @@ class DongxiaoRepository:
             ).fetchone()
         return row is not None and str(row["setting_value"]) == "1"
 
+    def reset_platform_writes_for_session(
+        self,
+        *,
+        session_id: str,
+    ) -> bool:
+        normalized_session = str(session_id).strip()
+        if not normalized_session:
+            raise ValueError("运行会话 ID 不能为空")
+        now = to_utc_iso(datetime.now(UTC))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute(
+                """
+                SELECT setting_value
+                FROM dongxiao_runtime_settings
+                WHERE setting_key='platform_writes_enabled'
+                """
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO dongxiao_runtime_settings(
+                    setting_key, setting_value, updated_by, updated_at
+                ) VALUES(
+                    'platform_writes_enabled', '0', ?, ?
+                )
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value='0',
+                    updated_by=excluded.updated_by,
+                    updated_at=excluded.updated_at
+                """,
+                (f"session:{normalized_session}", now),
+            )
+            self._insert_audit(
+                conn,
+                store_id=None,
+                store_app_id="",
+                actor_id=f"session:{normalized_session}",
+                action="platform_write_startup_reset",
+                entity_type="runtime",
+                entity_id="platform_writes_enabled",
+                request_id=normalized_session,
+                result=AuditResult.INFO,
+                detail={
+                    "enabled": False,
+                    "previous_enabled": (
+                        previous is not None
+                        and str(previous["setting_value"]) == "1"
+                    ),
+                    "message": "新进程启动，平台写操作强制关闭",
+                },
+            )
+        return False
+
     def set_platform_writes_enabled(
         self,
         enabled: bool,

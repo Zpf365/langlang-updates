@@ -78,6 +78,28 @@ class ApiCallRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class PlatformReadonlyVerification:
+    session_id: str
+    store_app_id: str
+    verified_at: datetime
+    expires_at: datetime
+    report_fingerprint: str
+
+    def is_valid(
+        self,
+        *,
+        session_id: str,
+        store_app_id: str,
+        now: datetime,
+    ) -> bool:
+        return (
+            self.session_id == session_id
+            and self.store_app_id == store_app_id
+            and now < self.expires_at
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OperationSyncResult:
     discovered: int
     saved: int

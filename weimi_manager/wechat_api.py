@@ -107,6 +107,25 @@ def _redact_sensitive_text(value: object) -> str:
     return re.sub(r"https?://[^\s]+", "[URL]", text)
 
 
+def _response_id_list(
+    result: dict[str, Any],
+    field: str,
+    label: str,
+) -> list[str]:
+    if field not in result:
+        raise WechatApiError(f"{label}缺少必要字段 {field}")
+    values = result.get(field)
+    if not isinstance(values, list):
+        raise WechatApiError(f"{label}字段 {field} 格式错误")
+    ids: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            raise WechatApiError(f"{label}字段 {field} 包含空 ID")
+        ids.append(text)
+    return ids
+
+
 class WechatApiError(RuntimeError):
     def __init__(
         self,
@@ -238,6 +257,8 @@ class WechatShopClient:
         self._token = ""
         self._token_expires_at = 0.0
         self._token_lock = threading.Lock()
+        self._last_call_lock = threading.Lock()
+        self._last_call_metadata: dict[str, Any] = {}
         self._rate_lock = threading.Lock()
         self._next_request_at = 0.0
         self._min_request_interval = (
@@ -307,9 +328,15 @@ class WechatShopClient:
             ),
         }
         try:
+            with self._last_call_lock:
+                self._last_call_metadata = dict(payload)
             self.call_observer(payload)
         except Exception:
             pass
+
+    def last_call_metadata(self) -> dict[str, Any]:
+        with self._last_call_lock:
+            return dict(self._last_call_metadata)
 
     def _safe_error_text(self, error: BaseException | None) -> str:
         if error is None:
@@ -365,7 +392,10 @@ class WechatShopClient:
                 raise
             token = str(result.get("access_token") or "")
             if not token:
-                raise WechatApiError("接口没有返回 access_token")
+                raise WechatApiError(
+                    "接口没有返回 access_token",
+                    request_id=request_id,
+                )
             self._token = token
             self._token_expires_at = time.time() + int(result.get("expires_in") or 7200)
             return token
@@ -403,7 +433,11 @@ class WechatShopClient:
             if next_key:
                 payload["next_key"] = next_key
             result = self._post_api(ORDER_LIST_PATH, payload)
-            page_ids = [str(value) for value in result.get("order_id_list", [])]
+            page_ids = _response_id_list(
+                result,
+                "order_id_list",
+                "订单列表",
+            )
             ids.extend(page_ids)
             has_more = result.get("has_more")
             next_key = str(result.get("next_key") or "")
@@ -445,7 +479,13 @@ class WechatShopClient:
             if next_key:
                 payload["next_key"] = next_key
             result = self._post_api(ORDER_LIST_PATH, payload)
-            ids.extend(str(value) for value in result.get("order_id_list", []))
+            ids.extend(
+                _response_id_list(
+                    result,
+                    "order_id_list",
+                    "订单列表",
+                )
+            )
             has_more = result.get("has_more")
             next_key = str(result.get("next_key") or "")
             if has_more is False:
@@ -507,8 +547,11 @@ class WechatShopClient:
         if next_key:
             payload["next_key"] = next_key
         result = self._post_api(PRODUCT_LIST_PATH, payload)
-        if not isinstance(result.get("product_ids"), list):
-            raise WechatApiError("微信商品目录返回格式异常")
+        product_ids = _response_id_list(
+            result,
+            "product_ids",
+            "商品目录",
+        )
         next_key = str(result.get("next_key") or "")
         has_more = bool(result.get("has_more", bool(next_key)))
         if has_more and not next_key:
@@ -516,7 +559,7 @@ class WechatShopClient:
                 "商品分页返回 has_more=true 但缺少 next_key"
             )
         return ApiListPage(
-            ids=[str(value) for value in result.get("product_ids", [])],
+            ids=product_ids,
             next_key=next_key,
             has_more=has_more,
         )
@@ -565,7 +608,13 @@ class WechatShopClient:
             if next_key:
                 payload["next_key"] = next_key
             result = self._post_api(AFTER_SALE_LIST_PATH, payload)
-            ids.extend(str(value) for value in result.get("after_sale_order_id_list", []))
+            ids.extend(
+                _response_id_list(
+                    result,
+                    "after_sale_order_id_list",
+                    "售后列表",
+                )
+            )
             has_more = result.get("has_more")
             next_key = str(result.get("next_key") or "")
             if has_more is False:

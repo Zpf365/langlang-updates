@@ -78,6 +78,8 @@ AUDIT_ACTION_LABELS = {
     "approval_decided": "审批决定",
     "order_synced": "同步真实订单",
     "aftersale_synced": "同步真实售后",
+    "platform_write_startup_reset": "启动时关闭平台写操作",
+    "platform_write_guard_changed": "平台写操作开关变更",
 }
 AUDIT_ENTITY_LABELS = {
     "task": "任务",
@@ -170,7 +172,7 @@ class DongxiaoPage(BasePage):
             platform = OfficialDongxiaoPlatformAdapter(self.window.service)
             self.task_service = DongxiaoTaskService(
                 self.repository,
-                platform_write_gate=lambda: False,
+                platform_write_gate=lambda _store_app_id: False,
             )
             self.order_service = DongxiaoOrderService(
                 self.repository,
@@ -1407,6 +1409,15 @@ class DongxiaoPage(BasePage):
         store = self._current_store()
         if store is None:
             return
+        runtime = self.runtime
+        invalidate = getattr(
+            runtime,
+            "invalidate_platform_readonly_verification",
+            None,
+        )
+        if callable(invalidate):
+            invalidate()
+        self._update_platform_write_status()
         self.active_store_var.set(f"当前店铺：{store.name}")
         self._page = 1
         self._load_products()
@@ -3570,6 +3581,14 @@ class DongxiaoPage(BasePage):
         )
 
     def _enable_platform_writes(self) -> None:
+        store = self._current_store()
+        if store is None:
+            messagebox.showwarning(
+                "平台写操作",
+                "请先选择并完成当前店铺的真实只读验收。",
+                parent=self,
+            )
+            return
         if not self._permission_checker(
             "dongxiao_platform_write_switch"
         ):
@@ -3583,7 +3602,9 @@ class DongxiaoPage(BasePage):
             "开启平台写操作",
             (
                 "开启后只允许创建“已经完成人工审批”的平台写任务，"
-                "不会自动同意、拒绝或退款。\n\n"
+                "不会自动同意、拒绝或退款。\n"
+                "当前店铺必须在最近 10 分钟内完成官方 Token、"
+                "商品、订单和售后只读验收。\n\n"
                 "是否进入准备状态？"
             ),
             parent=self,
@@ -3592,7 +3613,10 @@ class DongxiaoPage(BasePage):
             return
         second = messagebox.askyesno(
             "二次确认",
-            "确认开启平台写操作总开关？建议仅在实盘前检查全部通过后开启。",
+            (
+                "确认开启当前会话的平台写操作？"
+                "店铺切换或验收过期后会立即阻止写任务。"
+            ),
             parent=self,
         )
         if not second:
@@ -3611,6 +3635,7 @@ class DongxiaoPage(BasePage):
         self.window.run_task(
             lambda _progress: runtime.set_platform_writes_enabled(
                 True,
+                store=store,
                 actor_id=self._actor_id(),
                 permission_checker=self._permission_checker,
             ),
@@ -3648,14 +3673,25 @@ class DongxiaoPage(BasePage):
             return
         try:
             enabled = runtime.platform_writes_enabled()
+            store = self._current_store()
+            verification = (
+                runtime.platform_readonly_verification(str(store.app_id))
+                if store is not None and enabled
+                else None
+            )
         except Exception:
             self.platform_write_status_var.set("平台写操作：状态读取失败")
             return
-        self.platform_write_status_var.set(
-            "平台写操作：已开启（需逐单人工确认）"
-            if enabled
-            else "平台写操作：已禁止"
-        )
+        if enabled and verification is not None:
+            self.platform_write_status_var.set(
+                "平台写操作：已开启（当前店铺验收有效）"
+            )
+        elif enabled:
+            self.platform_write_status_var.set(
+                "平台写操作：已开启但当前店铺未验收，任务将被阻止"
+            )
+        else:
+            self.platform_write_status_var.set("平台写操作：已禁止")
 
     def _load_api_calls(self) -> None:
         store = self._current_store()

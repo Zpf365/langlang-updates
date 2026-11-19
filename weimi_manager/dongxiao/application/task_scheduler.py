@@ -60,7 +60,7 @@ class DongxiaoTaskScheduler:
         retry_policy: RetryPolicy | None = None,
         worker_id: str = "",
         poll_interval_seconds: float = 0.2,
-        platform_write_gate: Callable[[], bool] | None = None,
+        platform_write_gate: Callable[[str], bool] | None = None,
     ) -> None:
         self.repository = repository
         self.executor = executor
@@ -81,10 +81,10 @@ class DongxiaoTaskScheduler:
         self._wake = threading.Event()
         self._dispatcher: threading.Thread | None = None
 
-    def _platform_write_allowed(self) -> bool:
+    def _platform_write_allowed(self, store_app_id: str) -> bool:
         return bool(
             self.platform_write_gate is None
-            or self.platform_write_gate()
+            or self.platform_write_gate(str(store_app_id))
         )
 
     def is_healthy(self) -> bool:
@@ -259,7 +259,7 @@ class DongxiaoTaskScheduler:
                 continue
             if (
                 task.execution_mode == "platform_write"
-                and not self._platform_write_allowed()
+                and not self._platform_write_allowed(task.store_app_id)
             ):
                 continue
             if active_by_store.get(task.store_id, 0) >= self.max_tasks_per_store:
@@ -343,7 +343,7 @@ class DongxiaoTaskScheduler:
             return
         if (
             current.execution_mode == "platform_write"
-            and not self._platform_write_allowed()
+            and not self._platform_write_allowed(current.store_app_id)
         ):
             return
         if current.status is TaskStatus.PENDING:
@@ -431,7 +431,7 @@ class DongxiaoTaskScheduler:
                 return
             if (
                 latest.execution_mode == "platform_write"
-                and not self._platform_write_allowed()
+                and not self._platform_write_allowed(latest.store_app_id)
             ):
                 self.repository.transition_task(
                     latest.task_id,

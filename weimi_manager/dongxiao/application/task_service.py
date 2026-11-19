@@ -32,17 +32,18 @@ class DongxiaoTaskService:
         self,
         repository: DongxiaoRepository,
         *,
-        platform_write_gate: Callable[[], bool] | None = None,
+        platform_write_gate: Callable[[str], bool] | None = None,
     ) -> None:
         self.repository = repository
         self.platform_write_gate = platform_write_gate
 
-    def _assert_platform_write_allowed(self) -> None:
+    def _assert_platform_write_allowed(self, store) -> None:
         if self.platform_write_gate is None:
             return
-        if not bool(self.platform_write_gate()):
+        if not bool(self.platform_write_gate(str(store.app_id))):
             raise PlatformWriteDisabled(
-                "平台写操作总开关已关闭，禁止创建或执行新的平台写任务"
+                "当前会话或店铺未通过真实只读验收，"
+                "禁止创建或执行新的平台写任务"
             )
 
     def create_pool_validation_task(
@@ -270,7 +271,7 @@ class DongxiaoTaskService:
         requested_at: datetime | None = None,
         max_attempts: int = 1,
     ) -> tuple[Task, bool]:
-        self._assert_platform_write_allowed()
+        self._assert_platform_write_allowed(store)
         normalized_action = str(action or "").strip()
         if normalized_action not in {"accept", "reject"}:
             raise ValueError("售后执行动作必须是 accept 或 reject")
@@ -413,7 +414,7 @@ class DongxiaoTaskService:
         payload: dict[str, object],
     ) -> tuple[Task, bool]:
         if execution_mode == "platform_write":
-            self._assert_platform_write_allowed()
+            self._assert_platform_write_allowed(store)
         now = requested_at or datetime.now(UTC)
         signatures = [
             (subject_type, subject_id, product_id, sku_id)
