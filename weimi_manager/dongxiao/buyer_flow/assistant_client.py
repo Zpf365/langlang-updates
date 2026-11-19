@@ -75,5 +75,29 @@ class BuyerAssistantClient:
             {"assistant_task_id": str(assistant_task_id)},
         )
 
+    def record_order_match(
+        self,
+        *,
+        local_run_id: str,
+        platform_order_id: str,
+        match_status: str,
+        order_status: str,
+        total_amount_cents: int,
+        match_score: int = 100,
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "record_order_match",
+            {
+                "local_run_id": str(local_run_id),
+                "platform_order_id": str(platform_order_id),
+                "match_status": str(match_status),
+                "order_status": str(order_status),
+                "total_amount_cents": int(total_amount_cents),
+                "match_score": int(match_score),
+                "detail": dict(detail or {}),
+            },
+        )
+
     def save_integration_state(self, state: dict[str, Any]) -> dict[str, Any]:
         return self._request("save_integration_state", state)

@@ -209,6 +209,38 @@ Deno.serve(async (req) => {
       return jsonResponse(data);
     }
 
+    if (action === "record_order_match") {
+      const localRunId = String(body.local_run_id ?? "");
+      const orderId = String(body.platform_order_id ?? "");
+      const { data: task, error: taskError } = await admin
+        .from("buyer_assistant_tasks")
+        .select("assistant_task_id,buyer_identity_id,store_app_id")
+        .eq("owner_user_id", ownerId)
+        .eq("local_run_id", localRunId)
+        .maybeSingle();
+      if (taskError) throw taskError;
+      if (!task || !orderId) return jsonResponse({ error: "手机任务或订单号不存在" }, 404);
+      const { data, error } = await admin
+        .from("buyer_order_matches")
+        .upsert({
+          owner_user_id: ownerId,
+          assistant_task_id: task.assistant_task_id,
+          buyer_identity_id: task.buyer_identity_id,
+          store_app_id: task.store_app_id,
+          platform_order_id: orderId,
+          match_status: String(body.match_status ?? "unknown"),
+          order_status: String(body.order_status ?? ""),
+          total_amount_cents: Math.max(0, Number(body.total_amount_cents) || 0),
+          match_score: Math.max(0, Number(body.match_score) || 0),
+          detail_json: body.detail ?? {},
+          verified_at: new Date().toISOString(),
+        }, { onConflict: "assistant_task_id,platform_order_id" })
+        .select("*")
+        .single();
+      if (error) throw error;
+      return jsonResponse(data);
+    }
+
     return jsonResponse({ error: "未知桌面动作" }, 400);
   } catch (error) {
     console.error("buyer assistant desktop failed", error);

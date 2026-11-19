@@ -49,12 +49,19 @@ Deno.serve(async (req) => {
       );
     }
     const ticketHash = await sha256(ticket);
+    const miniSession = randomToken();
+    const sessionHash = await sha256(miniSession);
     const { data: pairing, error } = await admin
       .from("buyer_pairing_tickets")
-      .select("*")
+      .update({
+        status: "claimed",
+        claimed_at: new Date().toISOString(),
+        mini_session_hash: sessionHash,
+      })
       .eq("ticket_hash", ticketHash)
       .eq("status", "pending")
       .gt("expires_at", new Date().toISOString())
+      .select("*")
       .maybeSingle();
     if (error) throw error;
     if (!pairing) return jsonResponse({ error: "绑定票据无效或已使用" }, 409);
@@ -66,22 +73,26 @@ Deno.serve(async (req) => {
     );
     const codeData = await codeResponse.json().catch(() => ({}));
     if (!codeData.openid) {
+      await admin
+        .from("buyer_pairing_tickets")
+        .update({
+          status: "pending",
+          claimed_at: null,
+          mini_session_hash: null,
+        })
+        .eq("pairing_id", pairing.pairing_id)
+        .eq("mini_session_hash", sessionHash);
       return jsonResponse({ error: "微信登录交换失败", detail: codeData }, 502);
     }
-    const miniSession = randomToken();
-    const sessionHash = await sha256(miniSession);
     const { error: updateError } = await admin
       .from("buyer_pairing_tickets")
       .update({
-        status: "claimed",
-        claimed_at: new Date().toISOString(),
-        mini_session_hash: sessionHash,
         mini_appid: appid,
         mini_openid: String(codeData.openid),
         mini_unionid: codeData.unionid ? String(codeData.unionid) : null,
       })
       .eq("pairing_id", pairing.pairing_id)
-      .eq("status", "pending");
+      .eq("mini_session_hash", sessionHash);
     if (updateError) throw updateError;
     return jsonResponse({
       session_token: miniSession,
@@ -109,6 +120,18 @@ Deno.serve(async (req) => {
   if (!pairing) return jsonResponse({ error: "买家助手会话已失效" }, 401);
 
   if (action === "confirm_binding") {
+    if (pairing.status === "bound" && pairing.buyer_identity_id) {
+      const { data: existingIdentity } = await admin
+        .from("buyer_identities")
+        .select("buyer_identity_id,display_name")
+        .eq("buyer_identity_id", pairing.buyer_identity_id)
+        .maybeSingle();
+      return jsonResponse({
+        buyer_identity_id: pairing.buyer_identity_id,
+        display_name: existingIdentity?.display_name ?? "微信买家",
+        bound: true,
+      });
+    }
     const appid = String(pairing.mini_appid ?? "");
     const openid = String(pairing.mini_openid ?? "");
     if (!appid || !openid) {
@@ -130,11 +153,13 @@ Deno.serve(async (req) => {
     if (error) throw error;
     await admin
       .from("buyer_device_bindings")
-      .insert({
+      .upsert({
         buyer_identity_id: identity.buyer_identity_id,
         device_label: String(body.device_label ?? "微信"),
-      });
-    await admin
+        status: "active",
+        last_seen_at: new Date().toISOString(),
+      }, { onConflict: "buyer_identity_id,device_label" });
+    const { data: boundTicket } = await admin
       .from("buyer_pairing_tickets")
       .update({
         status: "bound",
@@ -142,7 +167,13 @@ Deno.serve(async (req) => {
         buyer_identity_id: identity.buyer_identity_id,
         expires_at: new Date(Date.now() + 30 * 86400 * 1000).toISOString(),
       })
-      .eq("pairing_id", pairing.pairing_id);
+      .eq("pairing_id", pairing.pairing_id)
+      .eq("status", "claimed")
+      .select("pairing_id")
+      .maybeSingle();
+    if (!boundTicket) {
+      return jsonResponse({ error: "绑定票据已被其他请求使用" }, 409);
+    }
     return jsonResponse({
       buyer_identity_id: identity.buyer_identity_id,
       display_name: identity.display_name,

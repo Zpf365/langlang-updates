@@ -24,7 +24,8 @@ create table if not exists public.buyer_device_bindings (
     check (status in ('active', 'revoked', 'expired')),
   created_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
-  revoked_at timestamptz
+  revoked_at timestamptz,
+  unique (buyer_identity_id, device_label)
 );
 
 create table if not exists public.buyer_pairing_tickets (

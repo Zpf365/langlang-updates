@@ -2182,14 +2182,7 @@ class DongxiaoPage(BasePage):
                 permission_checker=self._permission_checker,
                 actor_id=self._actor_id(),
             ),
-            lambda link: (
-                self._load_buyer_runs(),
-                self._load_orders(),
-                self.buyer_flow_status_var.set(
-                    f"官方订单核验：{link.status.value}；"
-                    "买家手机端仍需用户本人确认。"
-                ),
-            ),
+            lambda link: self._buyer_order_verified(link, run),
             lambda error: messagebox.showerror(
                 "官方订单核验失败",
                 error,
@@ -2198,6 +2191,43 @@ class DongxiaoPage(BasePage):
             log_title="核验真实买家待付款订单",
             task_scope=f"dongxiao:buyer-order-verify:{run.run_id}",
             store_app_id=str(store.app_id),
+        )
+
+    def _buyer_order_verified(self, link, run) -> None:
+        self._load_buyer_runs()
+        self._load_orders()
+        self.buyer_flow_status_var.set(
+            f"官方订单核验：{link.status.value}；"
+            "买家手机端仍需用户本人确认。"
+        )
+        client = getattr(self, "buyer_assistant_client", None)
+        if client is None:
+            return
+
+        def sync_cloud(_progress):
+            return client.record_order_match(
+                local_run_id=run.run_id,
+                platform_order_id=link.platform_order_id,
+                match_status=link.status.value,
+                order_status=link.status.value,
+                total_amount_cents=link.total_amount_cents,
+                detail={
+                    "store_app_id": link.store_app_id,
+                    "verified_locally": True,
+                },
+            )
+
+        self.window.run_task(
+            sync_cloud,
+            lambda _result: self.buyer_assistant_status_var.set(
+                "订单核验结果已同步到买家助手；"
+                "手机端可使用官方订单详情入口。"
+            ),
+            lambda error: self.buyer_assistant_status_var.set(
+                f"本地订单已核验，但云端同步失败：{error}"
+            ),
+            log_title="同步订单核验到买家助手",
+            task_scope=f"buyer-assistant:order-match:{run.run_id}",
         )
 
     def _build_cart_batch_view(self) -> ttk.Frame:

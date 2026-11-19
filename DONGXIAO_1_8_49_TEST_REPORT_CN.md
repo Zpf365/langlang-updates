@@ -18,7 +18,7 @@
 第一组：
 
 ```text
-381 passed, 2 subtests passed
+381 passed, 2 skipped, 2 subtests passed
 ```
 
 第二组：
@@ -30,14 +30,14 @@
 合计：
 
 ```text
-628 passed, 12 skipped, 18 subtests passed
+628 passed, 14 skipped, 18 subtests passed
 ```
 
-收集总数：640。
+收集总数：642。
 
 跳过原因：
 
-- 7 项为 Tcl/Tk 独立进程初始化路径问题。
+- 9 项为 Tcl/Tk 独立进程初始化路径问题。
 - 5 项为未提供真实发行安全凭据。
 
 未使用 Mock 冒充真实交易成功。
@@ -59,6 +59,8 @@
 - 配对票据和手机会话哈希。
 - Supabase 新迁移表和 RLS。
 - 小程序配置只含占位符。
+- 订单延迟、拆分、多候选、无候选和部分匹配规则。
+- 桌面订单核验结果写回买家助手云端匹配记录。
 
 ## 静态检查
 
