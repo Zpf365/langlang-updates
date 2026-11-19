@@ -77,3 +77,12 @@ def test_stable_source_package_includes_buyer_assistant_sources() -> None:
     assert "supabase/migrations/202611190001_buyer_assistant.sql" in files
     assert "DONGXIAO_1_8_49_WECHAT_CONFIG_CN.md" in files
     assert "buyer_assistant.env.example" in files
+
+
+def test_windows_build_uses_full_dependency_spec() -> None:
+    script = (ROOT / "tools" / "build_release.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "LangLang.spec" in script
+    assert '"launcher.py"' not in script
