@@ -1,0 +1,7 @@
+<view class="page">
+  <view class="card"><view class="title">任务历史</view></view>
+  <view class="empty" wx:if="{{!events.length}}">暂无历史</view>
+  <view class="card" wx:for="{{events}}" wx:key="event_id">
+    <view>{{item.action}}</view><view class="muted">{{item.created_at}}</view>
+  </view>
+</view>

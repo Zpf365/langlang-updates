@@ -1,0 +1,45 @@
+page {
+  background: #f4f1e8;
+  color: #203237;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei";
+}
+.page { padding: 28rpx; }
+.card {
+  background: #fff;
+  border: 1rpx solid #d7d2c7;
+  border-radius: 20rpx;
+  padding: 26rpx;
+  margin-bottom: 20rpx;
+  box-shadow: 0 8rpx 24rpx rgba(28, 58, 63, .06);
+}
+.title { color: #0b5560; font-size: 40rpx; font-weight: 700; margin-bottom: 14rpx; }
+.subtitle { color: #69777b; font-size: 26rpx; line-height: 1.6; }
+.row { display: flex; justify-content: space-between; align-items: center; }
+.muted { color: #7c888b; font-size: 24rpx; }
+.price { color: #b34d32; font-weight: 700; }
+.primary {
+  background: #0b5560 !important;
+  color: #fff !important;
+  border-radius: 12rpx;
+}
+.secondary {
+  background: #e5efed !important;
+  color: #0b5560 !important;
+  border-radius: 12rpx;
+}
+.danger {
+  background: #f8e7e1 !important;
+  color: #a33a2b !important;
+  border-radius: 12rpx;
+}
+.button-row { display: flex; gap: 16rpx; margin-top: 18rpx; }
+.button-row button { flex: 1; margin: 0; }
+.status {
+  display: inline-block;
+  background: #e5efed;
+  color: #0b5560;
+  padding: 6rpx 14rpx;
+  border-radius: 999rpx;
+  font-size: 22rpx;
+}
+.empty { padding: 80rpx 20rpx; text-align: center; color: #879296; }

@@ -1,0 +1,9 @@
+<view class="page">
+  <view class="card">
+    <view class="title">电脑扫码绑定</view>
+    <view class="subtitle">绑定票据只可使用一次。AppSecret、session_key 不会发送到手机。</view>
+    <view class="muted" wx:if="{{identityHint}}">{{identityHint}}</view>
+    <input value="{{displayName}}" bindinput="onNameInput" placeholder="买家显示名" />
+    <button class="primary" disabled="{{!claimed || loading}}" bindtap="confirm">确认绑定此电脑</button>
+  </view>
+</view>

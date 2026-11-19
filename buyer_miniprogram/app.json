@@ -1,0 +1,23 @@
+{
+  "pages": [
+    "pages/login/index",
+    "pages/bind/index",
+    "pages/identity/index",
+    "pages/tasks/index",
+    "pages/task-detail/index",
+    "pages/progress/index",
+    "pages/history/index",
+    "pages/orders/index",
+    "pages/order-detail/index",
+    "pages/account/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "澜琅买家助手",
+    "navigationBarBackgroundColor": "#0b5560",
+    "navigationBarTextStyle": "white",
+    "backgroundColor": "#f4f1e8",
+    "backgroundTextStyle": "dark"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}

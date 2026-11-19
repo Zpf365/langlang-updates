@@ -1,0 +1,10 @@
+{
+  "mini_appid": "wx0000000000000000",
+  "shop_appid": "",
+  "shop_name": "赤影云册精选",
+  "api_base_url": "https://YOUR-PROJECT.supabase.co/functions/v1",
+  "open_platform_linked": false,
+  "shop_partner_authorized": false,
+  "product_component_ready": false,
+  "order_component_ready": false
+}

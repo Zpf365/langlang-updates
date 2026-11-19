@@ -1,0 +1,7 @@
+<view class="page">
+  <view class="card">
+    <view class="title">订单详情</view>
+    <view class="subtitle">订单详情由微信小店原生页面展示。澜琅不会自动付款。</view>
+    <button class="primary" bindtap="open">打开微信小店订单</button>
+  </view>
+</view>

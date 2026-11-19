@@ -1,0 +1,20 @@
+<view class="page">
+  <store-home wx:if="{{shopAppId}}" appid="{{shopAppId}}" />
+  <view class="card">
+    <view class="title">商品任务</view>
+    <view class="subtitle">电脑生成任务后，手机逐件进入微信小店原生页面完成必要操作。</view>
+    <view class="button-row">
+      <button class="secondary" bindtap="history">任务历史</button>
+      <button class="secondary" bindtap="orders">订单查询</button>
+    </view>
+  </view>
+  <view class="empty" wx:if="{{!tasks.length}}">暂无商品任务</view>
+  <view class="card" wx:for="{{tasks}}" wx:key="assistant_task_id">
+    <view class="row">
+      <text>{{item.store_name}}</text>
+      <text class="status">{{item.status}}</text>
+    </view>
+    <view class="muted">商品 {{item.buyer_assistant_task_items.length}} 件 · {{item.created_at}}</view>
+    <button class="primary" data-id="{{item.assistant_task_id}}" bindtap="openTask">查看任务商品</button>
+  </view>
+</view>

@@ -19,6 +19,7 @@ from ..dongxiao.application.preflight_service import (
     DongxiaoPreflightService,
 )
 from ..dongxiao.application.task_service import DongxiaoTaskService
+from ..dongxiao.buyer_flow.assistant_client import BuyerAssistantClient
 from ..dongxiao.buyer_flow.domain import BuyerFlowMode
 from ..dongxiao.buyer_flow.repository import BuyerFlowRepository
 from ..dongxiao.buyer_flow.service import DongxiaoBuyerFlowService
@@ -257,6 +258,25 @@ class DongxiaoPage(BasePage):
                 BuyerSessionVault(database_path.parent),
                 order_service=self.order_service,
             )
+        auth_client = getattr(window, "auth_client", None)
+        auth_config = getattr(auth_client, "config", None)
+        auth_context = getattr(window, "auth_context", None)
+        access_token = str(
+            getattr(getattr(auth_context, "tokens", None), "access_token", "")
+            or ""
+        )
+        self.buyer_assistant_client = (
+            BuyerAssistantClient(
+                base_url=auth_config.base_url,
+                access_token=access_token,
+                timeout=float(getattr(auth_config, "request_timeout", 20.0)),
+            )
+            if auth_config is not None and access_token
+            else None
+        )
+        self._last_pairing_id = ""
+        self._last_pairing_identity_id = ""
+        self._last_assistant_task_id = ""
         self.official_catalog_service = ProductCatalogService(
             self.repository,
             build_catalog_adapter(
@@ -312,6 +332,9 @@ class DongxiaoPage(BasePage):
         self.buyer_selection_mode_var = tk.StringVar(value="自动挑选")
         self.buyer_manual_ids_var = tk.StringVar()
         self.buyer_order_id_var = tk.StringVar()
+        self.buyer_assistant_status_var = tk.StringVar(
+            value="买家助手：等待扫码绑定"
+        )
         self.audit_status_var = tk.StringVar(value="审计日志尚未读取")
         self.preflight_status_var = tk.StringVar(value="实盘检查尚未运行")
         self.platform_write_status_var = tk.StringVar(
@@ -1505,10 +1528,220 @@ class DongxiaoPage(BasePage):
             "已请求打开官方微信客户端；登录、扫码和验证码均由用户本人完成。"
         )
 
+    def _require_buyer_assistant_client(self):
+        client = getattr(self, "buyer_assistant_client", None)
+        if client is None:
+            raise ValueError(
+                "买家助手后端需要已配置的澜琅登录会话和 Supabase 地址"
+            )
+        return client
+
+    def _create_buyer_pairing(self) -> None:
+        store = self._current_store()
+        if store is None:
+            messagebox.showwarning(
+                "微信扫码绑定",
+                "请先选择目标店铺。",
+                parent=self,
+            )
+            return
+        try:
+            client = self._require_buyer_assistant_client()
+        except Exception as exc:
+            messagebox.showerror("微信扫码绑定", str(exc), parent=self)
+            return
+        self.window.run_task(
+            lambda _progress: client.create_pairing(str(store.app_id)),
+            self._buyer_pairing_created,
+            lambda error: messagebox.showerror(
+                "生成扫码绑定失败",
+                error,
+                parent=self,
+            ),
+            log_title="生成买家助手微信绑定",
+            task_scope=f"buyer-assistant:pairing:{store.id}",
+        )
+
+    def _buyer_pairing_created(self, result: dict) -> None:
+        self._last_pairing_id = str(result.get("pairing_id") or "")
+        self.buyer_assistant_status_var.set(
+            str(result.get("message") or "绑定票据已生成")
+        )
+        dialog = tk.Toplevel(self)
+        dialog.title("微信扫码绑定买家助手")
+        dialog.geometry("460x520")
+        dialog.transient(self.window)
+        ttk.Label(
+            dialog,
+            text="使用微信扫描绑定码",
+            font=("Microsoft YaHei UI", 14, "bold"),
+        ).pack(pady=(20, 8))
+        qr = str(result.get("qr_image_base64") or "")
+        if qr:
+            try:
+                image = tk.PhotoImage(data=qr, format="png")
+                label = ttk.Label(dialog, image=image)
+                label.image = image
+                label.pack(pady=10)
+            except tk.TclError:
+                ttk.Label(dialog, text="小程序码图片无法显示").pack(pady=10)
+        else:
+            ttk.Label(
+                dialog,
+                text="小程序码尚未生成，请完成小程序 AppID/AppSecret 配置。",
+                wraplength=400,
+                justify="center",
+            ).pack(pady=10)
+        ttk.Label(
+            dialog,
+            text=f"绑定票据：{result.get('ticket', '')}",
+            wraplength=410,
+        ).pack(pady=8)
+        ttk.Label(
+            dialog,
+            text=(
+                "票据 5 分钟有效且只能使用一次。\n"
+                "手机上需由用户本人 wx.login 并确认绑定。"
+            ),
+            justify="center",
+        ).pack(pady=8)
+        button(dialog, "关闭", dialog.destroy).pack(pady=8)
+
+    def _poll_buyer_pairing(self) -> None:
+        if not self._last_pairing_id:
+            messagebox.showwarning(
+                "绑定状态",
+                "请先生成扫码绑定。",
+                parent=self,
+            )
+            return
+        try:
+            client = self._require_buyer_assistant_client()
+        except Exception as exc:
+            messagebox.showerror("绑定状态", str(exc), parent=self)
+            return
+
+        def done(result: dict) -> None:
+            identity = result.get("identity") or {}
+            if identity.get("buyer_identity_id"):
+                self._last_pairing_identity_id = str(
+                    identity["buyer_identity_id"]
+                )
+            self.buyer_assistant_status_var.set(
+                f"绑定状态：{result.get('status', 'unknown')}"
+                + (
+                    f"；微信买家：{identity.get('display_name', '')}"
+                    if identity
+                    else ""
+                )
+            )
+
+        self.window.run_task(
+            lambda _progress: client.pairing_status(self._last_pairing_id),
+            done,
+            lambda error: messagebox.showerror("绑定状态", error, parent=self),
+            log_title="检查微信扫码绑定状态",
+            task_scope=f"buyer-assistant:pairing-status:{self._last_pairing_id}",
+        )
+
+    def _send_buyer_task_to_phone(self) -> None:
+        run = self._selected_buyer_run()
+        if run is None:
+            messagebox.showwarning(
+                "发送手机任务",
+                "请先选择电脑端买家流程。",
+                parent=self,
+            )
+            return
+        if not self._last_pairing_identity_id:
+            messagebox.showwarning(
+                "发送手机任务",
+                "请先生成扫码绑定并刷新到“已绑定”状态。",
+                parent=self,
+            )
+            return
+        try:
+            client = self._require_buyer_assistant_client()
+        except Exception as exc:
+            messagebox.showerror("发送手机任务", str(exc), parent=self)
+            return
+        items = self.buyer_flow_service.repository.list_items(run.run_id)
+        task = {
+            "buyer_identity_id": self._last_pairing_identity_id,
+            "store_app_id": run.store_app_id,
+            "store_name": run.store_name,
+            "local_run_id": run.run_id,
+            "idempotency_key": f"assistant:{run.idempotency_key}",
+            "requested_count": run.requested_count,
+            "items": [
+                {
+                    "product_id": item.product_id,
+                    "sku_id": item.sku_id,
+                    "title": item.title,
+                    "specs": dict(item.specs),
+                    "unit_price_cents": item.unit_price_cents,
+                    "quantity": item.quantity,
+                    "stock": item.stock,
+                }
+                for item in items[:10]
+            ],
+        }
+
+        def done(result: dict) -> None:
+            self._last_assistant_task_id = str(
+                result.get("assistant_task_id") or ""
+            )
+            self.buyer_assistant_status_var.set(
+                "商品任务已发送到手机；用户确认仅代表用户操作，"
+                "不代表购物车服务端核验。"
+            )
+
+        self.window.run_task(
+            lambda _progress: client.create_task(task),
+            done,
+            lambda error: messagebox.showerror("发送手机任务失败", error, parent=self),
+            log_title="发送商品任务到微信买家助手",
+            task_scope=f"buyer-assistant:send:{run.run_id}",
+        )
+
+    def _refresh_buyer_phone_progress(self) -> None:
+        if not self._last_assistant_task_id:
+            messagebox.showwarning(
+                "手机进度",
+                "当前没有已发送的手机任务。",
+                parent=self,
+            )
+            return
+        try:
+            client = self._require_buyer_assistant_client()
+        except Exception as exc:
+            messagebox.showerror("手机进度", str(exc), parent=self)
+            return
+
+        def done(result: dict) -> None:
+            items = result.get("buyer_assistant_task_items") or []
+            confirmed = sum(
+                item.get("status") == "user_confirmed"
+                for item in items
+            )
+            self.buyer_assistant_status_var.set(
+                f"手机操作进度：用户确认 {confirmed}/{len(items)}；"
+                f"任务状态 {result.get('status', '')}；"
+                "该进度不是平台购物车核验。"
+            )
+
+        self.window.run_task(
+            lambda _progress: client.task_status(self._last_assistant_task_id),
+            done,
+            lambda error: messagebox.showerror("手机进度", error, parent=self),
+            log_title="读取微信买家助手任务进度",
+            task_scope=f"buyer-assistant:status:{self._last_assistant_task_id}",
+        )
+
     def _build_buyer_flow_view(self) -> ttk.Frame:
         view = ttk.Frame(self.section_host, style="Panel.TFrame")
         view.columnconfigure(0, weight=1)
-        view.rowconfigure(5, weight=1)
+        view.rowconfigure(6, weight=1)
         ttk.Label(
             view,
             text="买家完整流程",
@@ -1598,15 +1831,43 @@ class DongxiaoPage(BasePage):
             "核验官方待付款订单",
             self._verify_buyer_order,
         ).pack(side="left", padx=(6, 0))
+        assistant_actions = ttk.Frame(view, style="Panel.TFrame")
+        assistant_actions.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        button(
+            assistant_actions,
+            "生成微信扫码绑定",
+            self._create_buyer_pairing,
+            "Primary",
+        ).pack(side="left")
+        button(
+            assistant_actions,
+            "刷新绑定状态",
+            self._poll_buyer_pairing,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            assistant_actions,
+            "发送任务到手机",
+            self._send_buyer_task_to_phone,
+        ).pack(side="left", padx=(6, 0))
+        button(
+            assistant_actions,
+            "刷新手机进度",
+            self._refresh_buyer_phone_progress,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            assistant_actions,
+            textvariable=self.buyer_assistant_status_var,
+            style="Subtitle.TLabel",
+        ).pack(side="left", padx=(12, 0))
         ttk.Label(
             view,
             textvariable=self.buyer_flow_status_var,
             style="Subtitle.TLabel",
             wraplength=850,
             justify="left",
-        ).grid(row=4, column=0, sticky="w", pady=(0, 6))
+        ).grid(row=5, column=0, sticky="w", pady=(0, 6))
         panes = ttk.Panedwindow(view, orient="vertical")
-        panes.grid(row=5, column=0, sticky="nsew")
+        panes.grid(row=6, column=0, sticky="nsew")
         runs_box = ttk.Frame(panes, style="Panel.TFrame")
         runs_box.columnconfigure(0, weight=1)
         runs_box.rowconfigure(1, weight=1)
