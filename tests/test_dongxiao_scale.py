@@ -71,3 +71,25 @@ def test_catalog_filtering_and_pagination_scale(
     assert page.total == product_count
     assert len(page.items) == min(500, max(0, product_count - 500))
     assert page.page_count == (product_count + 499) // 500
+
+
+def test_three_hundred_authorized_stores_remain_individually_selectable(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "stores-300.db")
+    for index in range(300):
+        db.add_store(
+            f"授权店铺 {index:03d}",
+            f"wx-store-scale-{index:03d}",
+            "x" * 32,
+        )
+
+    stores = db.list_stores()
+
+    assert len(stores) == 300
+    assert len({store.id for store in stores}) == 300
+    assert len({store.app_id for store in stores}) == 300
+    assert {stores[0].name, stores[-1].name} == {
+        "授权店铺 000",
+        "授权店铺 299",
+    }

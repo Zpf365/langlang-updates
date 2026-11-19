@@ -10,10 +10,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 class Refactor181Tests(unittest.TestCase):
     def test_release_metadata_uses_requested_name(self) -> None:
-        self.assertEqual(__version__, "1.8.49")
-        self.assertEqual(__display_version__, "重构1.8.49")
+        self.assertEqual(__version__, "1.8.50")
+        self.assertEqual(__display_version__, "重构1.8.50")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "1.8.49"', pyproject)
+        self.assertIn('version = "1.8.50"', pyproject)
         self.assertIn("1.6.63 原界面重构版", pyproject)
 
     def test_default_entry_uses_legacy_workspace_ui(self) -> None:

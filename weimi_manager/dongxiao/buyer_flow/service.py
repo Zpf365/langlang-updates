@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from ..application.order_service import DongxiaoOrderService
 from ..domain.enums import AuditResult, OrderStatus, ProductState
@@ -30,16 +32,36 @@ from .domain import (
     BuyerItemStatus,
     BuyerOrderLink,
     BuyerOrderPreview,
+    BuyerOrderStatus,
     BuyerOrderVerificationStatus,
     BuyerProvider,
+    BuyerRunRevalidation,
     BuyerSelectionItem,
 )
 from .repository import BuyerFlowRepository
 from .session_vault import BuyerSessionVault
+from .wechat_desktop import (
+    WechatDesktopClient,
+    WechatDesktopProbe,
+    WechatDesktopState,
+)
 
 
 class BuyerFlowServiceError(RuntimeError):
     pass
+
+
+def _profile_text(value: object, *, field: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) > limit:
+        raise ValueError(f"{field}不能超过 {limit} 个字符")
+    if re.search(
+        r"(?i)(password|passwd|cookie|authorization|access[_ -]?token|"
+        r"refresh[_ -]?token|appsecret|secret\s*=|bearer\s+)",
+        text,
+    ):
+        raise ValueError(f"{field}不能包含敏感凭据")
+    return text
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +84,7 @@ class DongxiaoBuyerFlowService:
         order_service: DongxiaoOrderService | None = None,
         official_adapter: BuyerFlowAdapter | None = None,
         mock_adapter: BuyerFlowAdapter | None = None,
+        wechat_client: WechatDesktopClient | None = None,
     ) -> None:
         self.repository = repository
         self.catalog_repository = catalog_repository
@@ -69,6 +92,11 @@ class DongxiaoBuyerFlowService:
         self.order_service = order_service
         self.official_adapter = official_adapter or OfficialBuyerFlowAdapter()
         self.mock_adapter = mock_adapter or MockBuyerFlowAdapter()
+        self.wechat_client = wechat_client or WechatDesktopClient(
+            screenshot_dir=repository.database_path.parent
+            / "diagnostics"
+            / "wechat-client"
+        )
 
     def capability(self, *, mock: bool = False) -> BuyerAdapterCapability:
         return (self.mock_adapter if mock else self.official_adapter).capability()
@@ -87,6 +115,9 @@ class DongxiaoBuyerFlowService:
         self,
         *,
         display_name: str,
+        wechat_nickname: str = "",
+        identity_label: str = "",
+        remark: str = "",
         permission_checker,
         actor_id: str,
     ) -> BuyerLoginResult:
@@ -95,6 +126,28 @@ class DongxiaoBuyerFlowService:
             "dongxiao_buyer_account_manage",
         )
         capability = self.official_adapter.capability()
+        display_name = _profile_text(
+            display_name,
+            field="买家显示名",
+            limit=100,
+        )
+        if not display_name:
+            raise ValueError("买家显示名不能为空")
+        wechat_nickname = _profile_text(
+            wechat_nickname,
+            field="微信昵称",
+            limit=100,
+        )
+        identity_label = _profile_text(
+            identity_label,
+            field="身份标识",
+            limit=200,
+        )
+        remark = _profile_text(
+            remark,
+            field="账号备注",
+            limit=500,
+        )
         now = datetime.now(UTC)
         account_id = uuid.uuid4().hex
         reference = hashlib.sha256(
@@ -120,6 +173,9 @@ class DongxiaoBuyerFlowService:
                 + " 当前账号只能用于用户本人操作的官方客户端人工交接，"
                 "身份未经官方接口验证。"
             ),
+            wechat_nickname=wechat_nickname,
+            identity_label=identity_label,
+            remark=remark,
         )
         saved, _created = self.repository.create_account(account)
         authorization = self.official_adapter.begin_authorization()
@@ -216,7 +272,11 @@ class DongxiaoBuyerFlowService:
                 "买家身份未通过官方验证，不能设为当前账号。"
                 "不能仅修改显示名称来确认身份。"
             )
-        saved = self.repository.set_current_account(buyer_account_id)
+        saved = self.repository.set_current_account(
+            buyer_account_id,
+            actor_id=actor_id,
+            reason="用户主动切换当前买家账号",
+        )
         self._audit(
             actor_id=actor_id,
             action="buyer_current_account_changed",
@@ -226,6 +286,207 @@ class DongxiaoBuyerFlowService:
             detail={"provider": saved.provider.value},
         )
         return saved
+
+    def update_account_profile(
+        self,
+        buyer_account_id: str,
+        *,
+        display_name: str | None = None,
+        wechat_nickname: str | None = None,
+        identity_label: str | None = None,
+        remark: str | None = None,
+        permission_checker,
+        actor_id: str,
+    ) -> BuyerAccount:
+        require_permission(
+            permission_checker,
+            "dongxiao_buyer_account_manage",
+        )
+        account = self.repository.get_account(buyer_account_id)
+        if account is None:
+            raise BuyerFlowServiceError("买家账号不存在")
+        clean_display = (
+            _profile_text(
+                display_name,
+                field="买家显示名",
+                limit=100,
+            )
+            if display_name is not None
+            else None
+        )
+        if clean_display == "":
+            raise ValueError("买家显示名不能为空")
+        saved = self.repository.update_account(
+            buyer_account_id,
+            display_name=clean_display,
+            wechat_nickname=(
+                _profile_text(
+                    wechat_nickname,
+                    field="微信昵称",
+                    limit=100,
+                )
+                if wechat_nickname is not None
+                else None
+            ),
+            identity_label=(
+                _profile_text(
+                    identity_label,
+                    field="身份标识",
+                    limit=200,
+                )
+                if identity_label is not None
+                else None
+            ),
+            remark=(
+                _profile_text(
+                    remark,
+                    field="账号备注",
+                    limit=500,
+                )
+                if remark is not None
+                else None
+            ),
+        )
+        self._audit(
+            actor_id=actor_id,
+            action="buyer_account_profile_updated",
+            entity_type="buyer_account",
+            entity_id=saved.buyer_account_id,
+            result="success",
+            detail={
+                "display_name": saved.display_name,
+                "wechat_nickname": saved.wechat_nickname,
+                "identity_label": saved.identity_label,
+                "remark": saved.remark,
+            },
+        )
+        return saved
+
+    def list_account_switch_events(
+        self,
+        *,
+        permission_checker,
+        limit: int = 200,
+    ):
+        require_permission(
+            permission_checker,
+            "dongxiao_buyer_account_manage",
+        )
+        return self.repository.list_account_switch_events(limit=limit)
+
+    def inspect_wechat_client(
+        self,
+        *,
+        buyer_account_id: str = "",
+        permission_checker,
+        actor_id: str,
+    ) -> WechatDesktopProbe:
+        require_permission(
+            permission_checker,
+            "dongxiao_buyer_account_manage",
+        )
+        probe = self.wechat_client.probe()
+        self.repository.record_client_event(
+            buyer_account_id=buyer_account_id,
+            client_state=probe.state.value,
+            window_title=probe.window_title,
+            process_id=probe.process_id or None,
+            detail={
+                "installed": probe.installed,
+                "running": probe.running,
+                "identity_confirmed": probe.identity_confirmed,
+                "visible_identity": probe.visible_identity,
+                "instructions": probe.instructions,
+            },
+            screenshot_path=probe.screenshot_path,
+        )
+        self._audit(
+            actor_id=actor_id,
+            action="buyer_wechat_client_checked",
+            entity_type="buyer_account",
+            entity_id=buyer_account_id or "unbound",
+            result=(
+                "success"
+                if probe.state
+                in {
+                    WechatDesktopState.LOGGED_IN,
+                    WechatDesktopState.IDENTITY_UNCERTAIN,
+                }
+                else "failed"
+            ),
+            detail={
+                "client_state": probe.state.value,
+                "running": probe.running,
+                "identity_confirmed": probe.identity_confirmed,
+            },
+        )
+        return probe
+
+    def confirm_wechat_identity(
+        self,
+        buyer_account_id: str,
+        *,
+        wechat_nickname: str,
+        identity_label: str,
+        permission_checker,
+        actor_id: str,
+    ) -> BuyerAccount:
+        require_permission(
+            permission_checker,
+            "dongxiao_buyer_account_manage",
+        )
+        account = self.repository.get_account(buyer_account_id)
+        if account is None:
+            raise BuyerFlowServiceError("买家账号不存在")
+        nickname = _profile_text(
+            wechat_nickname,
+            field="微信昵称",
+            limit=100,
+        )
+        label = _profile_text(
+            identity_label,
+            field="身份标识",
+            limit=200,
+        )
+        if not nickname or not label:
+            raise ValueError("微信昵称和身份标识必须由用户本人确认")
+        now = datetime.now(UTC)
+        saved = self.repository.update_account(
+            buyer_account_id,
+            wechat_nickname=nickname,
+            identity_label=label,
+            identity_status=BuyerIdentityStatus.USER_ASSERTED,
+            status=BuyerAccountStatus.ACTIVE,
+            last_verified_at=now,
+            status_reason=(
+                "用户本人在 Windows 官方微信客户端确认当前可见身份；"
+                "该确认不等同于官方买家接口身份验证。"
+            ),
+        )
+        self.repository.record_client_event(
+            buyer_account_id=buyer_account_id,
+            client_state="identity_confirmed",
+            detail={
+                "wechat_nickname": nickname,
+                "identity_label": label,
+                "source": "user_confirmed_windows_wechat",
+            },
+        )
+        self._audit(
+            actor_id=actor_id,
+            action="buyer_wechat_identity_confirmed",
+            entity_type="buyer_account",
+            entity_id=buyer_account_id,
+            result="success",
+            detail={
+                "wechat_nickname": nickname,
+                "identity_label": label,
+            },
+        )
+        return saved
+
+    def wechat_switch_instructions(self) -> str:
+        return self.wechat_client.switch_account_instructions()
 
     def check_account(
         self,
@@ -496,6 +757,7 @@ class DongxiaoBuyerFlowService:
             created_at=now,
             verified_at=now,
             detail={"source": "mock", "status_token": order.status_token},
+            order_status=BuyerOrderStatus.PENDING_PAYMENT,
         )
         self.repository.record_order_link(link)
         saved = self.repository.update_run(
@@ -531,6 +793,55 @@ class DongxiaoBuyerFlowService:
         run = self.repository.get_run(run_id)
         if run is None:
             raise BuyerFlowServiceError("买家流程不存在")
+        revalidation = self.revalidate_run(
+            run.run_id,
+            store=SimpleNamespace(
+                id=run.store_id,
+                app_id=run.store_app_id,
+                name=run.store_name,
+            ),
+            permission_checker=permission_checker,
+            actor_id=actor_id,
+        )
+        if revalidation.changed:
+            raise BuyerFlowServiceError(
+                "商品、SKU、价格或库存已变化，任务已暂停："
+                + "；".join(revalidation.reasons)
+            )
+        probe = self.wechat_client.probe()
+        self.repository.record_client_event(
+            buyer_account_id=run.buyer_account_id,
+            client_state=probe.state.value,
+            window_title=probe.window_title,
+            process_id=probe.process_id or None,
+            detail={
+                "action": "manual_handoff",
+                "installed": probe.installed,
+                "running": probe.running,
+                "identity_confirmed": probe.identity_confirmed,
+                "instructions": probe.instructions,
+            },
+            screenshot_path=probe.screenshot_path,
+        )
+        if not probe.installed:
+            raise BuyerFlowServiceError(
+                "未检测到 Windows 官方微信客户端，无法开始客户端交接。"
+            )
+        if not probe.running:
+            raise BuyerFlowServiceError(
+                f"Windows 官方微信未运行；{probe.instructions}"
+            )
+        if probe.state is WechatDesktopState.LOGIN_REQUIRED:
+            raise BuyerFlowServiceError(
+                f"Windows 官方微信尚未登录；{probe.instructions}"
+            )
+        if probe.state in {
+            WechatDesktopState.ERROR,
+            WechatDesktopState.UNSUPPORTED_VERSION,
+        }:
+            raise BuyerFlowServiceError(
+                f"Windows 官方微信状态异常：{probe.error or probe.instructions}"
+            )
         capability = self.capability(mock=False)
         if not capability.manual_handoff:
             raise BuyerFlowServiceError("当前没有可用的人工交接路径")
@@ -553,7 +864,107 @@ class DongxiaoBuyerFlowService:
             result="info",
             detail={},
         )
+        self.repository.record_task_event(
+            run_id=run.run_id,
+            buyer_account_id=run.buyer_account_id,
+            event_type="manual_handoff_started",
+            status=saved.status.value,
+            detail={"client_state": probe.state.value},
+        )
         return saved
+
+    def revalidate_run(
+        self,
+        run_id: str,
+        *,
+        store,
+        permission_checker,
+        actor_id: str,
+    ) -> BuyerRunRevalidation:
+        require_permission(
+            permission_checker,
+            "dongxiao_buyer_flow_execute",
+        )
+        run = self.repository.get_run(run_id)
+        if run is None:
+            raise BuyerFlowServiceError("买家流程不存在")
+        if (
+            run.store_id != int(store.id)
+            or run.store_app_id != str(store.app_id)
+        ):
+            raise BuyerFlowServiceError("买家流程不属于当前店铺")
+        items = self.repository.list_items(run_id)
+        snapshots = self.catalog_repository.catalog_snapshot_for_products(
+            int(store.id),
+            [item.product_id for item in items],
+        )
+        reasons: list[str] = []
+        for item in items:
+            snapshot = snapshots.get(item.product_id)
+            if snapshot is None:
+                reasons.append(f"商品 {item.product_id} 已失效或不在当前店铺")
+                continue
+            product, skus = snapshot
+            if product.state is not ProductState.ACTIVE:
+                reasons.append(f"商品 {item.product_id} 当前不是上架状态")
+            if product.title != item.title:
+                reasons.append(f"商品 {item.product_id} 标题已变化")
+            sku = next(
+                (candidate for candidate in skus if candidate.sku_id == item.sku_id),
+                None,
+            )
+            if sku is None:
+                reasons.append(
+                    f"商品 {item.product_id} 的 SKU {item.sku_id} 已失效"
+                )
+                continue
+            if not sku.available:
+                reasons.append(f"SKU {item.sku_id} 当前不可售")
+            if sku.price_cents != item.unit_price_cents:
+                reasons.append(
+                    f"SKU {item.sku_id} 价格由 "
+                    f"{item.unit_price_cents} 分变为 {sku.price_cents} 分"
+                )
+            if sku.stock < item.quantity:
+                reasons.append(
+                    f"SKU {item.sku_id} 库存不足："
+                    f"需要 {item.quantity}，当前 {sku.stock}"
+                )
+        checked_at = datetime.now(UTC)
+        changed = bool(reasons)
+        if changed:
+            self.repository.update_run(
+                run_id,
+                status=BuyerFlowStatus.PAUSED,
+                status_reason=(
+                    "商品状态、SKU、价格或库存发生变化，"
+                    "必须用户重新确认后继续："
+                    + "；".join(reasons)
+                )[:2000],
+            )
+            self.repository.record_task_event(
+                run_id=run.run_id,
+                buyer_account_id=run.buyer_account_id,
+                event_type="revalidation_changed",
+                status=BuyerFlowStatus.PAUSED.value,
+                detail={"reasons": reasons},
+            )
+            self._audit(
+                store_id=run.store_id,
+                store_app_id=run.store_app_id,
+                actor_id=actor_id,
+                action="buyer_flow_revalidation_changed",
+                entity_type="buyer_flow_run",
+                entity_id=run.run_id,
+                result="failed",
+                detail={"reasons": reasons},
+            )
+        return BuyerRunRevalidation(
+            run_id=run.run_id,
+            changed=changed,
+            reasons=tuple(reasons),
+            checked_at=checked_at,
+        )
 
     def mark_handoff_complete(
         self,
@@ -587,6 +998,13 @@ class DongxiaoBuyerFlowService:
             entity_type="buyer_flow_run",
             entity_id=run.run_id,
             result="success",
+            detail={},
+        )
+        self.repository.record_task_event(
+            run_id=run.run_id,
+            buyer_account_id=run.buyer_account_id,
+            event_type="handoff_user_confirmed",
+            status=saved.status.value,
             detail={},
         )
         return saved
@@ -628,6 +1046,11 @@ class DongxiaoBuyerFlowService:
             if order.status is OrderStatus.PENDING_PAYMENT
             else BuyerOrderVerificationStatus.STATUS_MISMATCH
         )
+        order_status = (
+            BuyerOrderStatus.UNKNOWN
+            if order.status is OrderStatus.UNKNOWN
+            else BuyerOrderStatus(order.status.value)
+        )
         link = BuyerOrderLink(
             link_id=uuid.uuid4().hex,
             run_id=run.run_id,
@@ -644,22 +1067,27 @@ class DongxiaoBuyerFlowService:
                 "source": "official_merchant_order_api",
                 "order_status": order.status.value,
             },
+            order_status=order_status,
         )
         saved = self.repository.record_order_link(link)
         self.repository.update_run(
             run.run_id,
             status=(
                 BuyerFlowStatus.ORDER_VERIFIED
-                if status is BuyerOrderVerificationStatus.PENDING_PAYMENT
+                if order_status is not BuyerOrderStatus.UNKNOWN
                 else BuyerFlowStatus.FAILED
             ),
             order_id=order.platform_order_id,
             verification_status=status,
+            order_status=order_status,
             status_reason=(
                 "官方商家订单接口确认订单处于待付款状态。"
                 "买家账号与订单的本人对应关系仍需手机微信人工确认。"
                 if status is BuyerOrderVerificationStatus.PENDING_PAYMENT
-                else "官方订单状态不是待付款，需人工检查。"
+                else (
+                    f"官方商家订单接口确认订单状态为 {order.status.value}。"
+                    "买家账号与订单的本人对应关系仍需手机微信人工确认。"
+                )
             ),
         )
         self._audit(
@@ -675,6 +1103,16 @@ class DongxiaoBuyerFlowService:
                 else "failed"
             ),
             detail={"run_id": run.run_id, "status": status.value},
+        )
+        self.repository.record_task_event(
+            run_id=run.run_id,
+            buyer_account_id=run.buyer_account_id,
+            event_type="merchant_order_verified",
+            status=status.value,
+            detail={
+                "platform_order_id": saved.platform_order_id,
+                "total_amount_cents": saved.total_amount_cents,
+            },
         )
         return saved
 
@@ -735,11 +1173,19 @@ class DongxiaoBuyerFlowService:
             status = BuyerFlowStatus.CANCELLED
         else:
             raise BuyerFlowServiceError("当前流程状态不允许该操作")
-        return self.repository.update_run(
+        saved = self.repository.update_run(
             run_id,
             status=status,
             status_reason=f"用户操作：{action}",
         )
+        self.repository.record_task_event(
+            run_id=run.run_id,
+            buyer_account_id=run.buyer_account_id,
+            event_type=action,
+            status=saved.status.value,
+            detail={},
+        )
+        return saved
 
     def _select_products(
         self,
@@ -839,6 +1285,17 @@ class DongxiaoBuyerFlowService:
     def open_official_wechat_client(self) -> bool:
         if os.name != "nt":
             raise BuyerFlowServiceError("官方微信交接仅支持 Windows")
+        probe = self.wechat_client.probe()
+        if probe.installed and probe.running:
+            return True
+        if probe.installed and probe.executable_path:
+            try:
+                os.startfile(probe.executable_path)  # type: ignore[attr-defined]
+                return True
+            except OSError as exc:
+                raise BuyerFlowServiceError(
+                    "启动 Windows 官方微信失败，请手动打开后再继续"
+                ) from exc
         try:
             os.startfile("weixin://")  # type: ignore[attr-defined]
         except OSError as exc:

@@ -79,6 +79,17 @@ class BuyerOrderVerificationStatus(StrEnum):
     NOT_FOUND = "not_found"
 
 
+class BuyerOrderStatus(StrEnum):
+    UNKNOWN = "unknown"
+    PENDING_PAYMENT = "pending_payment"
+    PAID = "paid"
+    SHIPPED = "shipped"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    REFUNDING = "refunding"
+    REFUNDED = "refunded"
+
+
 @dataclass(frozen=True, slots=True)
 class BuyerAdapterCapability:
     state: BuyerCapabilityState
@@ -133,6 +144,10 @@ class BuyerAccount:
     updated_at: datetime
     is_current: bool = False
     status_reason: str = ""
+    wechat_nickname: str = ""
+    identity_label: str = ""
+    remark: str = ""
+    last_used_at: datetime | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -167,6 +182,23 @@ class BuyerAccount:
             "status_reason",
             str(self.status_reason or "")[:2000],
         )
+        for name, limit in (
+            ("wechat_nickname", 100),
+            ("identity_label", 200),
+            ("remark", 500),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                str(getattr(self, name) or "").strip()[:limit],
+            )
+        object.__setattr__(
+            self,
+            "last_used_at",
+            ensure_utc(self.last_used_at, field="买家账号最近使用时间")
+            if self.last_used_at is not None
+            else None,
+        )
 
     @property
     def verified_identity(self) -> bool:
@@ -174,6 +206,38 @@ class BuyerAccount:
             BuyerIdentityStatus.VERIFIED_OFFICIAL,
             BuyerIdentityStatus.VERIFIED_MOCK,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class BuyerAccountSwitchEvent:
+    switch_id: str
+    from_buyer_account_id: str
+    to_buyer_account_id: str
+    actor_id: str
+    reason: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        for name in (
+            "switch_id",
+            "to_buyer_account_id",
+            "actor_id",
+        ):
+            text = str(getattr(self, name) or "").strip()
+            if not text:
+                raise ValueError(f"{name}不能为空")
+            object.__setattr__(self, name, text)
+        object.__setattr__(
+            self,
+            "from_buyer_account_id",
+            str(self.from_buyer_account_id or "").strip(),
+        )
+        object.__setattr__(self, "reason", str(self.reason or "")[:500])
+        object.__setattr__(
+            self,
+            "created_at",
+            ensure_utc(self.created_at, field="买家账号切换时间"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +315,7 @@ class BuyerFlowRun:
     )
     status_reason: str = ""
     capability: Mapping[str, object] = field(default_factory=dict)
+    order_status: BuyerOrderStatus = BuyerOrderStatus.UNKNOWN
 
     def __post_init__(self) -> None:
         for name in (
@@ -313,6 +378,35 @@ class BuyerFlowRun:
             "capability",
             sanitize_audit_detail(dict(self.capability)),
         )
+        object.__setattr__(
+            self,
+            "order_status",
+            BuyerOrderStatus(self.order_status),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BuyerRunRevalidation:
+    run_id: str
+    changed: bool
+    reasons: tuple[str, ...]
+    checked_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run_id", str(self.run_id or "").strip())
+        if not self.run_id:
+            raise ValueError("重新核验任务 ID 不能为空")
+        object.__setattr__(
+            self,
+            "reasons",
+            tuple(str(reason)[:500] for reason in self.reasons),
+        )
+        object.__setattr__(self, "changed", bool(self.changed))
+        object.__setattr__(
+            self,
+            "checked_at",
+            ensure_utc(self.checked_at, field="重新核验时间"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +423,7 @@ class BuyerOrderLink:
     created_at: datetime
     verified_at: datetime
     detail: Mapping[str, object] = field(default_factory=dict)
+    order_status: BuyerOrderStatus = BuyerOrderStatus.UNKNOWN
 
     def __post_init__(self) -> None:
         for name in (
@@ -368,6 +463,11 @@ class BuyerOrderLink:
             self,
             "detail",
             sanitize_audit_detail(dict(self.detail)),
+        )
+        object.__setattr__(
+            self,
+            "order_status",
+            BuyerOrderStatus(self.order_status),
         )
 
 

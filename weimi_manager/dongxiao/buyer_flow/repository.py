@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from ..domain.rules import (
 from .domain import (
     BuyerAccount,
     BuyerAccountStatus,
+    BuyerAccountSwitchEvent,
     BuyerFlowItem,
     BuyerFlowMode,
     BuyerFlowRun,
@@ -24,6 +26,7 @@ from .domain import (
     BuyerIdentityStatus,
     BuyerItemStatus,
     BuyerOrderLink,
+    BuyerOrderStatus,
     BuyerOrderVerificationStatus,
     BuyerProvider,
 )
@@ -125,8 +128,9 @@ class BuyerFlowRepository:
                     buyer_account_id, display_name, account_ref_hash,
                     provider, identity_status, status, is_current,
                     authorization_at, last_verified_at, status_reason,
-                    created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, wechat_nickname,
+                    identity_label, remark, last_used_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account.buyer_account_id,
@@ -149,6 +153,14 @@ class BuyerFlowRepository:
                     account.status_reason,
                     to_utc_iso(account.created_at),
                     to_utc_iso(account.updated_at),
+                    account.wechat_nickname,
+                    account.identity_label,
+                    account.remark,
+                    (
+                        to_utc_iso(account.last_used_at)
+                        if account.last_used_at
+                        else None
+                    ),
                 ),
             )
             row = conn.execute(
@@ -201,6 +213,9 @@ class BuyerFlowRepository:
         buyer_account_id: str,
         *,
         display_name: str | None = None,
+        wechat_nickname: str | None = None,
+        identity_label: str | None = None,
+        remark: str | None = None,
         identity_status: BuyerIdentityStatus | str | None = None,
         status: BuyerAccountStatus | str | None = None,
         authorization_at: datetime | None = None,
@@ -211,6 +226,9 @@ class BuyerFlowRepository:
         values: list[object] = [to_utc_iso(datetime.now(UTC))]
         for name, value in (
             ("display_name", display_name),
+            ("wechat_nickname", wechat_nickname),
+            ("identity_label", identity_label),
+            ("remark", remark),
             (
                 "identity_status",
                 BuyerIdentityStatus(identity_status).value
@@ -254,9 +272,23 @@ class BuyerFlowRepository:
             ).fetchone()
         return self._account_from_row(row)
 
-    def set_current_account(self, buyer_account_id: str) -> BuyerAccount:
+    def set_current_account(
+        self,
+        buyer_account_id: str,
+        *,
+        actor_id: str = "",
+        reason: str = "",
+    ) -> BuyerAccount:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute(
+                """
+                SELECT buyer_account_id
+                  FROM dongxiao_buyer_accounts
+                 WHERE is_current=1
+                 LIMIT 1
+                """
+            ).fetchone()
             account = conn.execute(
                 """
                 SELECT identity_status, status, provider
@@ -267,6 +299,29 @@ class BuyerFlowRepository:
             ).fetchone()
             if account is None:
                 raise BuyerFlowRepositoryError("买家账号不存在")
+            current_id = (
+                str(previous["buyer_account_id"])
+                if previous is not None
+                else ""
+            )
+            if current_id and current_id != str(buyer_account_id):
+                active = conn.execute(
+                    """
+                    SELECT 1
+                      FROM dongxiao_buyer_flow_runs
+                     WHERE buyer_account_id=?
+                       AND status IN (
+                           'prepared', 'waiting_user_handoff',
+                           'waiting_order_id', 'paused', 'unknown'
+                       )
+                     LIMIT 1
+                    """,
+                    (current_id,),
+                ).fetchone()
+                if active is not None:
+                    raise BuyerFlowRepositoryError(
+                        "当前买家账号存在未完成任务，禁止切换账号"
+                    )
             verified = account["identity_status"] in {
                 BuyerIdentityStatus.VERIFIED_OFFICIAL.value,
                 BuyerIdentityStatus.VERIFIED_MOCK.value,
@@ -285,11 +340,34 @@ class BuyerFlowRepository:
             conn.execute(
                 """
                 UPDATE dongxiao_buyer_accounts
-                   SET is_current=1, updated_at=?
+                   SET is_current=1, last_used_at=?, updated_at=?
                  WHERE buyer_account_id=?
                 """,
-                (now, str(buyer_account_id)),
+                (now, now, str(buyer_account_id)),
             )
+            if str(previous["buyer_account_id"] if previous else "") != str(
+                buyer_account_id
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO dongxiao_buyer_account_switch_events(
+                        switch_id, from_buyer_account_id,
+                        to_buyer_account_id, actor_id, reason, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        (
+                            str(previous["buyer_account_id"])
+                            if previous is not None
+                            else None
+                        ),
+                        str(buyer_account_id),
+                        str(actor_id or "system"),
+                        str(reason or "")[:500],
+                        now,
+                    ),
+                )
             row = conn.execute(
                 """
                 SELECT *
@@ -299,6 +377,176 @@ class BuyerFlowRepository:
                 (str(buyer_account_id),),
             ).fetchone()
         return self._account_from_row(row)
+
+    def list_account_switch_events(
+        self,
+        *,
+        limit: int = 200,
+    ) -> list[BuyerAccountSwitchEvent]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                  FROM dongxiao_buyer_account_switch_events
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT ?
+                """,
+                (max(1, min(10_000, int(limit))),),
+            ).fetchall()
+        return [
+            BuyerAccountSwitchEvent(
+                switch_id=str(row["switch_id"]),
+                from_buyer_account_id=str(
+                    row["from_buyer_account_id"] or ""
+                ),
+                to_buyer_account_id=str(row["to_buyer_account_id"]),
+                actor_id=str(row["actor_id"]),
+                reason=str(row["reason"] or ""),
+                created_at=parse_utc_iso(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def record_client_event(
+        self,
+        *,
+        buyer_account_id: str,
+        client_state: str,
+        window_title: str = "",
+        process_id: int | None = None,
+        detail: dict[str, object] | None = None,
+        screenshot_path: str = "",
+    ) -> dict[str, Any]:
+        created_at = to_utc_iso(datetime.now(UTC))
+        event_id = uuid.uuid4().hex
+        with self.connect() as conn:
+            if buyer_account_id and conn.execute(
+                """
+                SELECT 1 FROM dongxiao_buyer_accounts
+                 WHERE buyer_account_id=?
+                """,
+                (str(buyer_account_id),),
+            ).fetchone() is None:
+                raise BuyerFlowRepositoryError("买家账号不存在")
+            conn.execute(
+                """
+                INSERT INTO dongxiao_buyer_client_events(
+                    event_id, buyer_account_id, client_state,
+                    window_title, process_id, detail_json,
+                    screenshot_path, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    str(buyer_account_id) or None,
+                    str(client_state),
+                    str(window_title or "")[:500],
+                    int(process_id) if process_id else None,
+                    _json(detail or {}),
+                    str(screenshot_path or "")[:2000],
+                    created_at,
+                ),
+            )
+        return {
+            "event_id": event_id,
+            "buyer_account_id": str(buyer_account_id),
+            "client_state": str(client_state),
+            "window_title": str(window_title or ""),
+            "process_id": int(process_id) if process_id else None,
+            "detail": dict(detail or {}),
+            "screenshot_path": str(screenshot_path or ""),
+            "created_at": created_at,
+        }
+
+    def list_client_events(
+        self,
+        *,
+        buyer_account_id: str = "",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        args: list[object] = []
+        if buyer_account_id:
+            clauses.append("buyer_account_id=?")
+            args.append(str(buyer_account_id))
+        sql = "SELECT * FROM dongxiao_buyer_client_events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        args.append(max(1, min(10_000, int(limit))))
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [
+            {
+                "event_id": str(row["event_id"]),
+                "buyer_account_id": str(row["buyer_account_id"] or ""),
+                "client_state": str(row["client_state"]),
+                "window_title": str(row["window_title"] or ""),
+                "process_id": (
+                    int(row["process_id"])
+                    if row["process_id"] is not None
+                    else None
+                ),
+                "detail": _load_dict(row["detail_json"]),
+                "screenshot_path": str(row["screenshot_path"] or ""),
+                "created_at": parse_utc_iso(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def record_task_event(
+        self,
+        *,
+        run_id: str,
+        buyer_account_id: str,
+        event_type: str,
+        status: str,
+        detail: dict[str, object] | None = None,
+    ) -> str:
+        event_id = uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO dongxiao_buyer_task_events(
+                    event_id, run_id, buyer_account_id,
+                    event_type, status, detail_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    str(run_id),
+                    str(buyer_account_id),
+                    str(event_type),
+                    str(status),
+                    _json(detail or {}),
+                    to_utc_iso(datetime.now(UTC)),
+                ),
+            )
+        return event_id
+
+    def list_task_events(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                  FROM dongxiao_buyer_task_events
+                 WHERE run_id=?
+                 ORDER BY created_at, rowid
+                """,
+                (str(run_id),),
+            ).fetchall()
+        return [
+            {
+                "event_id": str(row["event_id"]),
+                "run_id": str(row["run_id"]),
+                "buyer_account_id": str(row["buyer_account_id"]),
+                "event_type": str(row["event_type"]),
+                "status": str(row["status"]),
+                "detail": _load_dict(row["detail_json"]),
+                "created_at": parse_utc_iso(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     def delete_account(self, buyer_account_id: str) -> None:
         with self.connect() as conn:
@@ -510,6 +758,7 @@ class BuyerFlowRepository:
         handoff_token: str | None = None,
         order_id: str | None = None,
         verification_status: BuyerOrderVerificationStatus | str | None = None,
+        order_status: BuyerOrderStatus | str | None = None,
         status_reason: str | None = None,
     ) -> BuyerFlowRun:
         clauses = ["updated_at=?"]
@@ -525,6 +774,12 @@ class BuyerFlowRepository:
                     if verification_status
                     else None
                 ),
+            ),
+            (
+                "order_status",
+                BuyerOrderStatus(order_status).value
+                if order_status is not None
+                else None,
             ),
             ("status_reason", status_reason),
         ):
@@ -556,14 +811,15 @@ class BuyerFlowRepository:
                     link_id, run_id, store_id, store_app_id,
                     buyer_account_id, platform_order_id, status,
                     total_amount_cents, item_count, detail_json,
-                    created_at, verified_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, verified_at, order_status
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, platform_order_id) DO UPDATE SET
                     status=excluded.status,
                     total_amount_cents=excluded.total_amount_cents,
                     item_count=excluded.item_count,
                     detail_json=excluded.detail_json,
-                    verified_at=excluded.verified_at
+                    verified_at=excluded.verified_at,
+                    order_status=excluded.order_status
                 """,
                 (
                     link.link_id,
@@ -578,6 +834,7 @@ class BuyerFlowRepository:
                     _json(dict(link.detail)),
                     to_utc_iso(link.created_at),
                     to_utc_iso(link.verified_at),
+                    link.order_status.value,
                 ),
             )
             row = conn.execute(
@@ -627,6 +884,10 @@ class BuyerFlowRepository:
             authorization_at=_time(row["authorization_at"]),
             last_verified_at=_time(row["last_verified_at"]),
             status_reason=str(row["status_reason"] or ""),
+            wechat_nickname=str(row["wechat_nickname"] or ""),
+            identity_label=str(row["identity_label"] or ""),
+            remark=str(row["remark"] or ""),
+            last_used_at=_time(row["last_used_at"]),
             created_at=parse_utc_iso(row["created_at"]),
             updated_at=parse_utc_iso(row["updated_at"]),
         )
@@ -653,6 +914,9 @@ class BuyerFlowRepository:
             ),
             status_reason=str(row["status_reason"] or ""),
             capability=_load_dict(row["capability_json"]),
+            order_status=BuyerOrderStatus(
+                row["order_status"] or BuyerOrderStatus.UNKNOWN.value
+            ),
             created_at=parse_utc_iso(row["created_at"]),
             updated_at=parse_utc_iso(row["updated_at"]),
         )
@@ -686,6 +950,9 @@ class BuyerFlowRepository:
             total_amount_cents=int(row["total_amount_cents"]),
             item_count=int(row["item_count"]),
             detail=_load_dict(row["detail_json"]),
+            order_status=BuyerOrderStatus(
+                row["order_status"] or BuyerOrderStatus.UNKNOWN.value
+            ),
             created_at=parse_utc_iso(row["created_at"]),
             verified_at=parse_utc_iso(row["verified_at"]),
         )

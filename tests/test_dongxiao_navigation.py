@@ -44,7 +44,7 @@ def test_formal_sales_related_route_opens_dongxiao_center(
             "批量加购",
             "待付款订单",
             "多账号任务",
-            "买家完整流程",
+            "买家业务工作台",
             "任务中心",
             "订单与售后",
             "售后工单",
@@ -109,8 +109,19 @@ def test_formal_sales_related_route_opens_dongxiao_center(
         assert "status" in page.pending_order_tree["columns"]
         assert page.buyer_account_tree.winfo_exists()
         assert "identity" in page.buyer_account_tree["columns"]
+        assert "nickname" in page.buyer_account_tree["columns"]
+        assert "remark" in page.buyer_account_tree["columns"]
+        assert page.wechat_client_check_button.cget("text") == "检查微信客户端"
+        assert page.buyer_profile_edit_button.cget("text") == "编辑买家资料"
+        assert page.buyer_identity_confirm_button.cget("text") == "人工确认身份"
+        assert page.buyer_switch_history_button.cget("text") == "切换历史"
+        assert page.wechat_switch_help_button.cget("text") == "官方切换说明"
+        assert page.official_product_button.cget("text") == "打开官方商品链接"
+        assert page.buyer_task_events_button.cget("text") == "任务事件日志"
+        assert page.buyer_revalidate_button.cget("text") == "重新核验价格库存"
         assert page.buyer_run_tree.winfo_exists()
         assert "order" in page.buyer_run_tree["columns"]
+        assert "order_status" in page.buyer_run_tree["columns"]
         page.section_buttons["orders"].invoke()
         window.update_idletasks()
         assert page.section_title_var.get() == "订单与售后"

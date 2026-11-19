@@ -103,7 +103,10 @@ AUDIT_ACTION_LABELS = {
     "buyer_mock_account_created": "添加 Mock 买家账号",
     "buyer_current_account_changed": "切换当前买家账号",
     "buyer_account_checked": "检查买家账号",
+    "buyer_account_profile_updated": "编辑买家账号资料",
     "buyer_account_deleted": "删除买家账号",
+    "buyer_wechat_client_checked": "检查 Windows 微信客户端",
+    "buyer_wechat_identity_confirmed": "人工确认微信身份",
     "buyer_flow_prepared": "准备买家流程",
     "buyer_manual_handoff_started": "开始官方客户端交接",
     "buyer_handoff_user_confirmed": "用户确认完成官方操作",
@@ -327,11 +330,15 @@ class DongxiaoPage(BasePage):
         self.cart_concurrency_var = tk.StringVar(value="1")
         self.cart_batch_name_var = tk.StringVar(value="桌面批量加购")
         self.buyer_account_status_var = tk.StringVar(value="买家账号尚未读取")
+        self.wechat_client_status_var = tk.StringVar(
+            value="Windows 微信客户端尚未检查"
+        )
         self.buyer_flow_status_var = tk.StringVar(value="买家完整流程尚未准备")
         self.buyer_count_var = tk.StringVar(value="5")
         self.buyer_selection_mode_var = tk.StringVar(value="自动挑选")
         self.buyer_manual_ids_var = tk.StringVar()
         self.buyer_order_id_var = tk.StringVar()
+        self.buyer_official_url_var = tk.StringVar()
         self.buyer_assistant_status_var = tk.StringVar(
             value="买家助手：等待扫码绑定"
         )
@@ -1061,11 +1068,41 @@ class DongxiaoPage(BasePage):
             "打开官方微信",
             self._open_official_wechat_client,
         ).pack(side="left", padx=(6, 0))
+        self.wechat_client_check_button = button(
+            buyer_toolbar,
+            "检查微信客户端",
+            self._inspect_wechat_client,
+        )
+        self.wechat_client_check_button.pack(side="left", padx=(6, 0))
+        self.wechat_switch_help_button = button(
+            buyer_toolbar,
+            "官方切换说明",
+            self._show_wechat_switch_help,
+        )
+        self.wechat_switch_help_button.pack(side="left", padx=(6, 0))
         button(
             buyer_toolbar,
             "检查身份",
             self._check_selected_buyer_account,
         ).pack(side="left", padx=(6, 0))
+        self.buyer_identity_confirm_button = button(
+            buyer_toolbar,
+            "人工确认身份",
+            self._confirm_selected_buyer_identity,
+        )
+        self.buyer_identity_confirm_button.pack(side="left", padx=(6, 0))
+        self.buyer_profile_edit_button = button(
+            buyer_toolbar,
+            "编辑买家资料",
+            self._edit_selected_buyer_account,
+        )
+        self.buyer_profile_edit_button.pack(side="left", padx=(6, 0))
+        self.buyer_switch_history_button = button(
+            buyer_toolbar,
+            "切换历史",
+            self._show_buyer_switch_history,
+        )
+        self.buyer_switch_history_button.pack(side="left", padx=(6, 0))
         button(
             buyer_toolbar,
             "设为当前",
@@ -1078,7 +1115,19 @@ class DongxiaoPage(BasePage):
         ).pack(side="left", padx=(6, 0))
         self.buyer_account_tree = ttk.Treeview(
             view,
-            columns=("current", "name", "provider", "identity", "status", "auth", "verified"),
+            columns=(
+                "current",
+                "name",
+                "nickname",
+                "identity_label",
+                "provider",
+                "identity",
+                "status",
+                "last_used",
+                "auth",
+                "verified",
+                "remark",
+            ),
             show="headings",
             selectmode="browse",
             height=5,
@@ -1086,15 +1135,23 @@ class DongxiaoPage(BasePage):
         for key, label, width in (
             ("current", "当前", 50),
             ("name", "买家显示名", 130),
+            ("nickname", "微信昵称", 120),
+            ("identity_label", "身份标识", 150),
             ("provider", "授权来源", 115),
             ("identity", "真实身份", 125),
             ("status", "会话状态", 125),
+            ("last_used", "最近使用", 140),
             ("auth", "授权时间", 145),
             ("verified", "最近验证", 145),
+            ("remark", "备注", 200),
         ):
             self.buyer_account_tree.heading(key, text=label)
             self.buyer_account_tree.column(key, width=width, anchor="w")
         self.buyer_account_tree.grid(row=7, column=0, sticky="nsew")
+        self.buyer_account_tree.bind(
+            "<Double-1>",
+            lambda _event: self._edit_selected_buyer_account(),
+        )
         ttk.Label(
             view,
             textvariable=self.buyer_account_status_var,
@@ -1102,6 +1159,13 @@ class DongxiaoPage(BasePage):
             wraplength=850,
             justify="left",
         ).grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(
+            view,
+            textvariable=self.wechat_client_status_var,
+            style="Subtitle.TLabel",
+            wraplength=850,
+            justify="left",
+        ).grid(row=9, column=0, sticky="w", pady=(3, 0))
         return view
 
     def _load_cart_accounts(self) -> None:
@@ -1320,6 +1384,14 @@ class DongxiaoPage(BasePage):
                 "expired": "身份已失效",
                 "revoked": "身份已撤销",
             }
+            account_status_labels = {
+                "pending_authorization": "等待授权",
+                "active": "账号可用",
+                "expired": "授权失效",
+                "disconnected": "未连接",
+                "mock_ready": "Mock 可用",
+                "official_unsupported": "官方能力不支持",
+            }
             for account in accounts:
                 tree.insert(
                     "",
@@ -1328,14 +1400,21 @@ class DongxiaoPage(BasePage):
                     values=(
                         "是" if account.is_current else "",
                         account.display_name,
+                        account.wechat_nickname,
+                        account.identity_label,
                         provider_labels.get(account.provider.value, account.provider.value),
                         identity_labels.get(
                             account.identity_status.value,
                             account.identity_status.value,
                         ),
-                        account.status.value,
+                        account_status_labels.get(
+                            account.status.value,
+                            account.status.value,
+                        ),
+                        _date_time(account.last_used_at),
                         _date_time(account.authorization_at),
                         _date_time(account.last_verified_at),
+                        account.remark,
                     ),
                 )
         current = next(
@@ -1363,10 +1442,28 @@ class DongxiaoPage(BasePage):
         )
         if not display_name:
             return
+        wechat_nickname = simpledialog.askstring(
+            "添加真实买家账号",
+            "微信昵称（可留空，之后人工确认）：",
+            parent=self,
+        ) or ""
+        identity_label = simpledialog.askstring(
+            "添加真实买家账号",
+            "用户确认的身份标识（可留空；不要填手机号或凭据）：",
+            parent=self,
+        ) or ""
+        remark = simpledialog.askstring(
+            "添加真实买家账号",
+            "账号备注（可留空）：",
+            parent=self,
+        ) or ""
 
         def work(_progress):
             return self.buyer_flow_service.create_official_account(
                 display_name=display_name,
+                wechat_nickname=wechat_nickname,
+                identity_label=identity_label,
+                remark=remark,
                 permission_checker=self._permission_checker,
                 actor_id=self._actor_id(),
             )
@@ -1527,6 +1624,247 @@ class DongxiaoPage(BasePage):
         self.buyer_account_status_var.set(
             "已请求打开官方微信客户端；登录、扫码和验证码均由用户本人完成。"
         )
+
+    def _inspect_wechat_client(self) -> None:
+        account = self._selected_buyer_account()
+
+        def work(_progress):
+            return self.buyer_flow_service.inspect_wechat_client(
+                buyer_account_id=(
+                    account.buyer_account_id if account is not None else ""
+                ),
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            )
+
+        def done(probe) -> None:
+            self.wechat_client_status_var.set(
+                f"微信客户端：{probe.state.value}；"
+                f"窗口：{probe.window_title or '未发现'}；"
+                f"{probe.instructions}"
+            )
+            messagebox.showinfo(
+                "Windows 微信客户端",
+                (
+                    f"状态：{probe.state.value}\n"
+                    f"已安装：{'是' if probe.installed else '否'}\n"
+                    f"运行中：{'是' if probe.running else '否'}\n"
+                    f"可见身份：{probe.visible_identity or '未可靠识别'}\n\n"
+                    f"{probe.instructions}"
+                    + (
+                        f"\n\n已保存异常截图：{probe.screenshot_path}"
+                        if probe.screenshot_path
+                        else ""
+                    )
+                ),
+                parent=self,
+            )
+
+        self.window.run_task(
+            work,
+            done,
+            lambda error: messagebox.showerror(
+                "检查 Windows 微信失败",
+                error,
+                parent=self,
+            ),
+            log_title="检查 Windows 官方微信客户端",
+            task_scope="dongxiao:wechat-client-check",
+        )
+
+    def _show_wechat_switch_help(self) -> None:
+        messagebox.showinfo(
+            "官方微信账号切换",
+            (
+                self.buyer_flow_service.wechat_switch_instructions()
+                + "\n\n切换完成后请点击“检查微信客户端”并执行"
+                "“人工确认身份”。"
+            ),
+            parent=self,
+        )
+
+    def _edit_selected_buyer_account(self) -> None:
+        account = self._selected_buyer_account()
+        if account is None:
+            messagebox.showwarning(
+                "编辑买家资料",
+                "请先选择一个买家账号。",
+                parent=self,
+            )
+            return
+        display_name = simpledialog.askstring(
+            "编辑买家资料",
+            "买家显示名：",
+            initialvalue=account.display_name,
+            parent=self,
+        )
+        if display_name is None:
+            return
+        nickname = simpledialog.askstring(
+            "编辑买家资料",
+            "微信昵称：",
+            initialvalue=account.wechat_nickname,
+            parent=self,
+        )
+        if nickname is None:
+            return
+        identity_label = simpledialog.askstring(
+            "编辑买家资料",
+            "用户确认的身份标识（不要填密码、Cookie、Token）：",
+            initialvalue=account.identity_label,
+            parent=self,
+        )
+        if identity_label is None:
+            return
+        remark = simpledialog.askstring(
+            "编辑买家资料",
+            "账号备注：",
+            initialvalue=account.remark,
+            parent=self,
+        )
+        if remark is None:
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.update_account_profile(
+                account.buyer_account_id,
+                display_name=display_name,
+                wechat_nickname=nickname,
+                identity_label=identity_label,
+                remark=remark,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda _saved: (
+                self._load_buyer_accounts(),
+                self.buyer_account_status_var.set("买家资料已更新"),
+            ),
+            lambda error: messagebox.showerror(
+                "编辑买家资料失败",
+                error,
+                parent=self,
+            ),
+            log_title="编辑买家账号资料",
+            task_scope=f"dongxiao:buyer-profile:{account.buyer_account_id}",
+        )
+
+    def _confirm_selected_buyer_identity(self) -> None:
+        account = self._selected_buyer_account()
+        if account is None:
+            messagebox.showwarning(
+                "人工确认身份",
+                "请先选择一个买家账号。",
+                parent=self,
+            )
+            return
+        nickname = simpledialog.askstring(
+            "人工确认微信身份",
+            "请输入当前官方微信窗口可见的买家昵称：",
+            initialvalue=account.wechat_nickname,
+            parent=self,
+        )
+        if not nickname:
+            return
+        identity_label = simpledialog.askstring(
+            "人工确认微信身份",
+            "请输入用户本人可核对的简短身份标识。\n"
+            "不要输入手机号、微信密码、Cookie 或 Token：",
+            initialvalue=account.identity_label,
+            parent=self,
+        )
+        if not identity_label:
+            return
+        if not messagebox.askyesno(
+            "确认当前微信身份",
+            (
+                f"请确认官方微信当前显示的就是“{nickname}”。\n"
+                "此操作记录为“用户确认”，不等同于官方买家接口验证。\n\n"
+                "是否确认？"
+            ),
+            parent=self,
+        ):
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.confirm_wechat_identity(
+                account.buyer_account_id,
+                wechat_nickname=nickname,
+                identity_label=identity_label,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda _saved: (
+                self._load_buyer_accounts(),
+                self.wechat_client_status_var.set(
+                    "微信身份已由用户本人人工确认；未标记为官方接口验证。"
+                ),
+            ),
+            lambda error: messagebox.showerror(
+                "人工确认身份失败",
+                error,
+                parent=self,
+            ),
+            log_title="人工确认当前微信身份",
+            task_scope=f"dongxiao:buyer-identity:{account.buyer_account_id}",
+        )
+
+    def _show_buyer_switch_history(self) -> None:
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.list_account_switch_events(
+                permission_checker=self._permission_checker,
+                limit=500,
+            ),
+            self._render_buyer_switch_history,
+            lambda error: messagebox.showerror(
+                "读取切换历史失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取买家账号切换历史",
+            task_scope="dongxiao:buyer-switch-history",
+        )
+
+    def _render_buyer_switch_history(self, events) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("买家账号切换历史")
+        dialog.geometry("900x480")
+        dialog.transient(self.window)
+        account_names = {
+            account.buyer_account_id: account.display_name
+            for account in self._buyer_accounts
+        }
+        tree = ttk.Treeview(
+            dialog,
+            columns=("time", "from", "to", "actor", "reason"),
+            show="headings",
+        )
+        for key, label, width in (
+            ("time", "时间", 150),
+            ("from", "原账号", 170),
+            ("to", "新账号", 170),
+            ("actor", "操作人", 120),
+            ("reason", "原因", 280),
+        ):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor="w")
+        tree.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        for event in events:
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    _date_time(event.created_at),
+                    account_names.get(
+                        event.from_buyer_account_id,
+                        event.from_buyer_account_id or "无",
+                    ),
+                    account_names.get(
+                        event.to_buyer_account_id,
+                        event.to_buyer_account_id,
+                    ),
+                    event.actor_id,
+                    event.reason,
+                ),
+            )
+        button(dialog, "关闭", dialog.destroy).pack(pady=(0, 12))
 
     def _require_buyer_assistant_client(self):
         client = getattr(self, "buyer_assistant_client", None)
@@ -1738,13 +2076,141 @@ class DongxiaoPage(BasePage):
             task_scope=f"buyer-assistant:status:{self._last_assistant_task_id}",
         )
 
+    def _open_buyer_official_product(self) -> None:
+        url = self.buyer_official_url_var.get().strip()
+        if not url:
+            messagebox.showwarning(
+                "打开官方商品链接",
+                "请先粘贴官方 weixin.qq.com 商品链接。",
+                parent=self,
+            )
+            return
+        try:
+            self.buyer_flow_service.wechat_client.open_official_url(url)
+        except Exception as exc:
+            messagebox.showerror(
+                "打开官方商品链接失败",
+                (
+                    f"{exc}\n\n"
+                    "Windows 微信若不支持该商品或小程序页面，"
+                    "可保留链接并使用手机微信官方入口继续。"
+                ),
+                parent=self,
+            )
+            return
+        self.buyer_flow_status_var.set(
+            "已交给 Windows 默认官方入口；实际页面兼容性需由用户本人核验。"
+        )
+
+    def _show_buyer_task_events(self) -> None:
+        run = self._selected_buyer_run()
+        if run is None:
+            messagebox.showwarning(
+                "任务事件日志",
+                "请先选择一个买家任务。",
+                parent=self,
+            )
+            return
+        repository = self.buyer_flow_service.repository
+        self.window.run_task(
+            lambda _progress: repository.list_task_events(run.run_id),
+            lambda events: self._render_buyer_task_events(run, events),
+            lambda error: messagebox.showerror(
+                "读取任务事件失败",
+                error,
+                parent=self,
+            ),
+            log_title="读取买家任务事件日志",
+            task_scope=f"dongxiao:buyer-events:{run.run_id}",
+            store_app_id=run.store_app_id,
+        )
+
+    def _revalidate_buyer_task(self) -> None:
+        run = self._selected_buyer_run()
+        store = self._current_store()
+        if run is None or store is None:
+            messagebox.showwarning(
+                "重新核验价格库存",
+                "请先选择当前店铺和买家任务。",
+                parent=self,
+            )
+            return
+
+        def done(result) -> None:
+            if result.changed:
+                messagebox.showwarning(
+                    "价格、库存或 SKU 已变化",
+                    (
+                        "任务已暂停，请重新确认：\n\n"
+                        + "\n".join(result.reasons)
+                    ),
+                    parent=self,
+                )
+            else:
+                messagebox.showinfo(
+                    "重新核验通过",
+                    "当前任务商品、SKU、价格和库存与准备时一致。",
+                    parent=self,
+                )
+            self._load_buyer_runs()
+
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.revalidate_run(
+                run.run_id,
+                store=store,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            done,
+            lambda error: messagebox.showerror(
+                "重新核验失败",
+                error,
+                parent=self,
+            ),
+            log_title="重新核验买家任务价格和库存",
+            task_scope=f"dongxiao:buyer-revalidate:{run.run_id}",
+            store_app_id=run.store_app_id,
+        )
+
+    def _render_buyer_task_events(self, run, events) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title(f"买家任务事件日志 · {run.run_id}")
+        dialog.geometry("920x480")
+        dialog.transient(self.window)
+        tree = ttk.Treeview(
+            dialog,
+            columns=("time", "event", "status", "detail"),
+            show="headings",
+        )
+        for key, label, width in (
+            ("time", "时间", 150),
+            ("event", "事件", 190),
+            ("status", "状态", 140),
+            ("detail", "详情", 400),
+        ):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor="w")
+        tree.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        for event in events:
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    _date_time(event["created_at"]),
+                    event["event_type"],
+                    event["status"],
+                    json.dumps(event["detail"], ensure_ascii=False),
+                ),
+            )
+        button(dialog, "关闭", dialog.destroy).pack(pady=(0, 12))
+
     def _build_buyer_flow_view(self) -> ttk.Frame:
         view = ttk.Frame(self.section_host, style="Panel.TFrame")
         view.columnconfigure(0, weight=1)
         view.rowconfigure(6, weight=1)
         ttk.Label(
             view,
-            text="买家完整流程",
+            text="买家业务工作台",
             font=("Microsoft YaHei UI", 15, "bold"),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
@@ -1787,6 +2253,15 @@ class DongxiaoPage(BasePage):
             form,
             textvariable=self.buyer_order_id_var,
             width=24,
+        ).pack(side="left", padx=(5, 0))
+        ttk.Label(form, text="官方商品链接").pack(
+            side="left",
+            padx=(12, 0),
+        )
+        ttk.Entry(
+            form,
+            textvariable=self.buyer_official_url_var,
+            width=36,
         ).pack(side="left", padx=(5, 0))
         actions = ttk.Frame(view, style="Panel.TFrame")
         actions.grid(row=3, column=0, sticky="ew", pady=(0, 6))
@@ -1854,6 +2329,24 @@ class DongxiaoPage(BasePage):
             "刷新手机进度",
             self._refresh_buyer_phone_progress,
         ).pack(side="left", padx=(6, 0))
+        self.official_product_button = button(
+            assistant_actions,
+            "打开官方商品链接",
+            self._open_buyer_official_product,
+        )
+        self.official_product_button.pack(side="left", padx=(6, 0))
+        self.buyer_task_events_button = button(
+            assistant_actions,
+            "任务事件日志",
+            self._show_buyer_task_events,
+        )
+        self.buyer_task_events_button.pack(side="left", padx=(6, 0))
+        self.buyer_revalidate_button = button(
+            assistant_actions,
+            "重新核验价格库存",
+            self._revalidate_buyer_task,
+        )
+        self.buyer_revalidate_button.pack(side="left", padx=(6, 0))
         ttk.Label(
             assistant_actions,
             textvariable=self.buyer_assistant_status_var,
@@ -1878,7 +2371,16 @@ class DongxiaoPage(BasePage):
         ).grid(row=0, column=0, sticky="w")
         self.buyer_run_tree = ttk.Treeview(
             runs_box,
-            columns=("created", "store", "items", "mode", "status", "order", "reason"),
+            columns=(
+                "created",
+                "store",
+                "items",
+                "mode",
+                "status",
+                "order_status",
+                "order",
+                "reason",
+            ),
             show="headings",
             selectmode="browse",
             height=8,
@@ -1889,6 +2391,7 @@ class DongxiaoPage(BasePage):
             ("items", "商品数", 65),
             ("mode", "选择方式", 105),
             ("status", "状态", 140),
+            ("order_status", "订单状态", 100),
             ("order", "真实订单号", 190),
             ("reason", "说明", 420),
         ):
@@ -1967,6 +2470,16 @@ class DongxiaoPage(BasePage):
             "failed": "失败",
             "unknown": "结果未知",
         }
+        order_status_labels = {
+            "unknown": "未知",
+            "pending_payment": "待付款",
+            "paid": "已付款",
+            "shipped": "已发货",
+            "completed": "已完成",
+            "cancelled": "已取消",
+            "refunding": "退款中",
+            "refunded": "已退款",
+        }
         for run in runs:
             tree.insert(
                 "",
@@ -1978,6 +2491,10 @@ class DongxiaoPage(BasePage):
                     run.item_count,
                     run.mode.value,
                     labels.get(run.status.value, run.status.value),
+                    order_status_labels.get(
+                        run.order_status.value,
+                        run.order_status.value,
+                    ),
                     run.order_id,
                     run.status_reason,
                 ),

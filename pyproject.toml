@@ -1,6 +1,6 @@
 [project]
 name = "weimi-manager"
-version = "1.8.49"
+version = "1.8.50"
 description = "澜琅微信小店多店铺运营工作台（1.6.63 原界面重构版）"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
     "psutil>=6,<8",
     "opencv-python>=4.10,<6",
     "rapidocr-onnxruntime>=1.4,<2",
+    "pywinauto>=0.6.9,<0.7",
 ]
 
 [project.optional-dependencies]

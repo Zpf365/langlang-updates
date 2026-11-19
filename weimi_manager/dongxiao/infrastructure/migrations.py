@@ -23,8 +23,8 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 8
-DONGXIAO_MIGRATION_NAME = "dongxiao_real_buyer_flow_v8"
+DONGXIAO_MIGRATION_VERSION = 9
+DONGXIAO_MIGRATION_NAME = "dongxiao_buyer_workspace_v9"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
 )
@@ -48,6 +48,9 @@ DONGXIAO_V7_CHECKSUM = (
 )
 DONGXIAO_V8_CHECKSUM = (
     "bc537cd23725489e984967fa90fef629688f449eda74f97d26cdaaf7f5d330a3"
+)
+DONGXIAO_V9_CHECKSUM = (
+    "842a0b8adcc386d769853135c56aa66d50a58e18459ff0b35ac120b6bf1d3dd1"
 )
 
 
@@ -1450,6 +1453,80 @@ END;
 """
 
 
+def _migration_v9_sql() -> str:
+    return """
+ALTER TABLE dongxiao_buyer_accounts
+    ADD COLUMN wechat_nickname TEXT NOT NULL DEFAULT '';
+ALTER TABLE dongxiao_buyer_accounts
+    ADD COLUMN identity_label TEXT NOT NULL DEFAULT '';
+ALTER TABLE dongxiao_buyer_accounts
+    ADD COLUMN remark TEXT NOT NULL DEFAULT '';
+ALTER TABLE dongxiao_buyer_accounts
+    ADD COLUMN last_used_at TEXT;
+ALTER TABLE dongxiao_buyer_flow_runs
+    ADD COLUMN order_status TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE dongxiao_buyer_order_links
+    ADD COLUMN order_status TEXT NOT NULL DEFAULT 'unknown';
+
+CREATE TABLE IF NOT EXISTS dongxiao_buyer_account_switch_events (
+    switch_id TEXT PRIMARY KEY,
+    from_buyer_account_id TEXT,
+    to_buyer_account_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (from_buyer_account_id)
+        REFERENCES dongxiao_buyer_accounts(buyer_account_id)
+        ON DELETE SET NULL,
+    FOREIGN KEY (to_buyer_account_id)
+        REFERENCES dongxiao_buyer_accounts(buyer_account_id)
+        ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_switch_account_v9
+    ON dongxiao_buyer_account_switch_events(
+        to_buyer_account_id, created_at DESC
+    );
+
+CREATE TABLE IF NOT EXISTS dongxiao_buyer_client_events (
+    event_id TEXT PRIMARY KEY,
+    buyer_account_id TEXT,
+    client_state TEXT NOT NULL,
+    window_title TEXT NOT NULL DEFAULT '',
+    process_id INTEGER,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    screenshot_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (buyer_account_id)
+        REFERENCES dongxiao_buyer_accounts(buyer_account_id)
+        ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_client_events_account_v9
+    ON dongxiao_buyer_client_events(
+        buyer_account_id, created_at DESC
+    );
+
+CREATE TABLE IF NOT EXISTS dongxiao_buyer_task_events (
+    event_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    buyer_account_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id)
+        REFERENCES dongxiao_buyer_flow_runs(run_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (buyer_account_id)
+        REFERENCES dongxiao_buyer_accounts(buyer_account_id)
+        ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_task_events_run_v9
+    ON dongxiao_buyer_task_events(run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_task_events_account_v9
+    ON dongxiao_buyer_task_events(buyer_account_id, created_at DESC);
+"""
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
@@ -1460,6 +1537,7 @@ def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
         (6, "dongxiao_release_candidate_v6", _migration_v6_sql),
         (7, "dongxiao_final_release_v7", _migration_v7_sql),
         (8, "dongxiao_real_buyer_flow_v8", _migration_v8_sql),
+        (9, "dongxiao_buyer_workspace_v9", _migration_v9_sql),
     )
 
 
@@ -1558,6 +1636,10 @@ def migrate_dongxiao_schema(
             raise sqlite3.IntegrityError(
                 "动销中心 v8 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
+        if version == 9 and current_checksum != DONGXIAO_V9_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v9 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:
             conn.executescript(
@@ -1640,6 +1722,9 @@ def _verify_required_tables(conn: sqlite3.Connection) -> None:
         "dongxiao_buyer_flow_runs",
         "dongxiao_buyer_flow_items",
         "dongxiao_buyer_order_links",
+        "dongxiao_buyer_account_switch_events",
+        "dongxiao_buyer_client_events",
+        "dongxiao_buyer_task_events",
     }
     tables = {
         str(row[0])

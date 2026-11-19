@@ -6,6 +6,8 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 hiddenimports = ['playwright.sync_api', 'playwright.async_api']
 hiddenimports += collect_submodules('playwright')
+hiddenimports += collect_submodules('pywinauto')
+hiddenimports += collect_submodules('comtypes')
 rapid_datas, rapid_binaries, rapid_hidden = collect_all('rapidocr_onnxruntime')
 onnx_datas, onnx_binaries, onnx_hidden = collect_all('onnxruntime')
 hiddenimports += rapid_hidden + onnx_hidden
