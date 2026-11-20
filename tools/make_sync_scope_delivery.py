@@ -31,6 +31,7 @@ ARTIFACTS = ROOT / "artifacts" / f"release_{RELEASE_TOKEN}"
 REPORT_NAMES = {
     "1.8.53": "DONGXIAO_1_8_53_SYNC_SCOPE_CN.md",
     "1.8.54": "DONGXIAO_1_8_54_REAL_WRITE_CN.md",
+    "1.8.55": "DONGXIAO_1_8_55_REFRESH_SELECTION_CN.md",
 }
 if VERSION not in REPORT_NAMES:
     raise RuntimeError(f"Unsupported delivery version: {VERSION}")
@@ -129,7 +130,7 @@ def main() -> int:
         delivery_focus = (
             "真实平台写操作恢复"
             if VERSION == "1.8.54"
-            else "店铺刷新范围修复"
+            else "店铺刷新选择范围"
         )
         (stage / "README_交付说明_CN.md").write_text(
             f"""# 澜琅 {VERSION} {delivery_focus}

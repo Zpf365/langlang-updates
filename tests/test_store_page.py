@@ -397,6 +397,72 @@ class StorePageContractTests(unittest.TestCase):
 
         pull.assert_called_once_with()
 
+    def test_manual_refresh_uses_filter_when_no_store_is_checked(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "stores.db")
+            first_id = db.add_store(
+                "筛选外店铺",
+                "wx-filter-out",
+                "secret-one",
+            )
+            db.update_web_status(first_id, "已登录", "ok")
+            second_id = db.add_store(
+                "目标筛选店铺",
+                "wx-filter-target",
+                "secret-two",
+            )
+            db.update_web_status(second_id, "已登录", "ok")
+            probed: list[str] = []
+
+            class FakeWindow:
+                @staticmethod
+                def set_status(*_args, **_kwargs):
+                    return None
+
+                @staticmethod
+                def _post(callback, *args):
+                    callback(*args)
+
+                @staticmethod
+                def store_data_changed():
+                    return None
+
+                @staticmethod
+                def run_task(work, done, _error, **kwargs):
+                    done(work(None))
+                    return True
+
+            page = object.__new__(StorePage)
+            page.db = db
+            page.window = FakeWindow()
+            page.window.web_session = SimpleNamespace(
+                probe=lambda store: (
+                    probed.append(store.app_id)
+                    or ("已登录", "ok")
+                )
+            )
+            page.window.service = SimpleNamespace(
+                refresh_store_metrics=lambda _store: {}
+            )
+            page._selected_stores = lambda: []
+            page._filtered_ids = [second_id]
+            page.search_var = SimpleNamespace(
+                get=lambda: "目标筛选"
+            )
+            page.active_filter = "all"
+            page.group_var = SimpleNamespace(
+                get=lambda: "全部分组"
+            )
+            page.refresh = lambda: None
+            page.invalidate_metrics_cache = lambda: None
+            page._cancel_incremental_refresh = lambda: None
+
+            page._refresh_store_data()
+
+        assert probed == ["wx-filter-target"]
+
     def test_empty_store_view_reloads_database_from_disk(self) -> None:
         expected = [
             SimpleNamespace(id=1, name="店铺一"),

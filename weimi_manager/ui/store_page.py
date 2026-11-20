@@ -1011,6 +1011,36 @@ class StorePage(ttk.Frame):
             if store_id in self._checked_ids and store_id in by_id
         ]
 
+    def _refresh_requested_stores(self) -> list[Store]:
+        checked = self._selected_stores()
+        if checked:
+            return checked
+        search_var = getattr(self, "search_var", None)
+        search_text = (
+            str(search_var.get()).strip()
+            if search_var is not None
+            else ""
+        )
+        group_var = getattr(self, "group_var", None)
+        selected_group = (
+            str(group_var.get())
+            if group_var is not None
+            else "全部分组"
+        )
+        filter_active = bool(
+            search_text
+            or getattr(self, "active_filter", "all") != "all"
+            or selected_group != "全部分组"
+        )
+        if not filter_active:
+            return []
+        filtered_ids = set(getattr(self, "_filtered_ids", []))
+        return [
+            store
+            for store in self.db.list_stores()
+            if store.id in filtered_ids
+        ]
+
     def _primary_store(self) -> Store | None:
         selected = self._selected_stores()
         if selected:
@@ -1261,7 +1291,7 @@ class StorePage(ttk.Frame):
         selected = (
             list(stores)
             if stores is not None
-            else self._selected_stores()
+            else self._refresh_requested_stores()
         )
         account_sync = getattr(self.window, "account_store_sync", None)
         if not selected and account_sync is None and not self.db.list_stores():
