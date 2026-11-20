@@ -350,11 +350,6 @@ def select_sku(
             if not incomplete_reason:
                 incomplete_reason = "SKU 价格、库存或状态数据不完整"
             continue
-        if not bool(candidate.purchase_min_verified):
-            incomplete = True
-            if not incomplete_reason:
-                incomplete_reason = "接口未提供可信起购数量，无法确定"
-            continue
         if expected is not None and int(candidate.price_cents) != expected:
             price_changed = True
             continue
@@ -372,7 +367,11 @@ def select_sku(
         if maximum is not None and price > maximum:
             over_price_cap = True
             continue
-        minimum = max(1, int(candidate.purchase_min))
+        minimum = (
+            max(1, int(candidate.purchase_min))
+            if bool(candidate.purchase_min_verified)
+            else 1
+        )
         if quantity < minimum:
             below_limit = True
             continue

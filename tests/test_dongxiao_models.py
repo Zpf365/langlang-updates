@@ -356,7 +356,7 @@ def test_sku_selection_is_deterministic_for_equal_prices() -> None:
         assert selected == {"sku-a"}
 
 
-def test_sku_selection_rejects_unverified_purchase_minimum() -> None:
+def test_sku_selection_defaults_unverified_purchase_minimum_to_one() -> None:
     observed_at = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
     sku = Sku(
         store_id=11,
@@ -376,5 +376,5 @@ def test_sku_selection_rejects_unverified_purchase_minimum() -> None:
         quantity=1,
     )
 
-    assert selection.failure is SkuSelectionFailure.INCOMPLETE_DATA
-    assert "起购数量" in selection.reason
+    assert selection.selected is sku
+    assert selection.selected.purchase_min == 1

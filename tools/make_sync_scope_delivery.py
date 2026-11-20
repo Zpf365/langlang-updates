@@ -32,6 +32,7 @@ REPORT_NAMES = {
     "1.8.53": "DONGXIAO_1_8_53_SYNC_SCOPE_CN.md",
     "1.8.54": "DONGXIAO_1_8_54_REAL_WRITE_CN.md",
     "1.8.55": "DONGXIAO_1_8_55_REFRESH_SELECTION_CN.md",
+    "1.8.56": "DONGXIAO_1_8_56_SKU_FALLBACK_CN.md",
 }
 if VERSION not in REPORT_NAMES:
     raise RuntimeError(f"Unsupported delivery version: {VERSION}")
@@ -127,18 +128,18 @@ def main() -> int:
             git_info(),
             encoding="utf-8",
         )
-        delivery_focus = (
-            "真实平台写操作恢复"
-            if VERSION == "1.8.54"
-            else "店铺刷新选择范围"
-        )
+        delivery_focus = {
+            "1.8.54": "真实平台写操作恢复",
+            "1.8.55": "店铺刷新选择范围",
+            "1.8.56": "SKU 起购兼容修复",
+        }.get(VERSION, "店铺刷新范围修复")
         (stage / "README_交付说明_CN.md").write_text(
             f"""# 澜琅 {VERSION} {delivery_focus}
 
 启动：双击 `02_Windows程序/LangLang/LangLang.exe`。
 
-真实平台写操作永久开启，不再依赖只读验收或启动重置。
-保留金额核验、逐单人工确认、UNKNOWN 防重放和审计日志。
+本版本修复 SKU 起购数量缺失导致的预检阻断。
+真实平台写操作保持永久开启，资金操作仍保留人工确认和金额核验。
 
 本包不包含真实数据库或凭据，未部署远程发布，不覆盖已有交付包。
 """,
