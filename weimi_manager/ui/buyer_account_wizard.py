@@ -34,6 +34,13 @@ STATE_RECOVERY_HINTS = {
     WechatDesktopState.ERROR: "请查看诊断详情并按提示处理后重新检查。",
 }
 
+PROFILE_FIELD_LIMITS = (
+    ("买家显示名", "display_name_var", 100),
+    ("微信昵称", "nickname_var", 100),
+    ("身份标识", "identity_label_var", 200),
+    ("账号备注", "remark_var", 500),
+)
+
 
 def wechat_state_label(state: WechatDesktopState | str) -> str:
     """Return the user-facing Chinese label for a WeChat probe state."""
@@ -132,25 +139,30 @@ class BuyerAccountWizard(tk.Toplevel):
         self.nickname_var = tk.StringVar()
         self.identity_label_var = tk.StringVar()
         self.remark_var = tk.StringVar()
-        for row, (label, variable, hint) in enumerate(
+        self.field_entries: dict[str, ttk.Entry] = {}
+        for row, (label, variable_name, variable, hint) in enumerate(
             (
                 (
                     "买家显示名",
+                    "display_name_var",
                     self.display_name_var,
                     "澜琅内部显示，可自行填写",
                 ),
                 (
                     "当前微信昵称",
+                    "nickname_var",
                     self.nickname_var,
                     "请核对官方微信窗口后填写",
                 ),
                 (
                     "身份标识",
+                    "identity_label_var",
                     self.identity_label_var,
                     "填写本人可核对的简短标识，不填手机号或凭据",
                 ),
                 (
                     "账号备注",
+                    "remark_var",
                     self.remark_var,
                     "可选",
                 ),
@@ -163,13 +175,29 @@ class BuyerAccountWizard(tk.Toplevel):
                 sticky="w",
                 pady=(4, 0),
             )
-            ttk.Entry(form, textvariable=variable).grid(
+            entry = ttk.Entry(form, textvariable=variable)
+            self.field_entries[variable_name] = entry
+            entry.grid(
                 row=row * 2,
                 column=1,
                 sticky="ew",
                 padx=(12, 0),
                 pady=(4, 0),
             )
+            if variable_name == "nickname_var":
+                self.nickname_entry = entry
+                self.clear_nickname_button = ttk.Button(
+                    form,
+                    text="清空昵称",
+                    command=self._clear_nickname,
+                )
+                self.clear_nickname_button.grid(
+                    row=row * 2,
+                    column=2,
+                    sticky="w",
+                    padx=(6, 0),
+                    pady=(4, 0),
+                )
             ttk.Label(
                 form,
                 text=hint,
@@ -205,6 +233,10 @@ class BuyerAccountWizard(tk.Toplevel):
             padx=(8, 0),
         )
         self.after(50, self._inspect_wechat)
+
+    def _clear_nickname(self) -> None:
+        self.nickname_var.set("")
+        self.nickname_entry.focus_set()
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -331,6 +363,19 @@ class BuyerAccountWizard(tk.Toplevel):
                 parent=self,
             )
             return
+        for label, variable_name, limit in PROFILE_FIELD_LIMITS:
+            if len(getattr(self, variable_name).get().strip()) > limit:
+                entry = self.field_entries.get(variable_name)
+                if entry is not None:
+                    entry.focus_set()
+                    entry.selection_range(0, "end")
+                messagebox.showwarning(
+                    "添加微信账号",
+                    f"{label}不能超过 {limit} 个字符。\n"
+                    "请只填写该字段本身，不要粘贴整段说明文字。",
+                    parent=self,
+                )
+                return
         if not messagebox.askyesno(
             "确认当前微信身份",
             (
@@ -381,10 +426,16 @@ class BuyerAccountWizard(tk.Toplevel):
 
     def _register_failed(self, error: Any) -> None:
         self._set_busy(False)
-        self.status_var.set(f"添加失败：{error}")
+        message = str(error) or "未知错误"
+        self.status_var.set(f"添加失败：{message}")
         self.detail_var.set(
             "未生成成功绑定。请重新检查微信、核对身份，"
             "或在官方微信完成登录后重试。"
+        )
+        messagebox.showerror(
+            "添加微信账号失败",
+            message,
+            parent=self,
         )
 
     def _cancel(self) -> None:

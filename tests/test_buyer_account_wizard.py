@@ -88,6 +88,7 @@ class _ThreadedWindow(_ImmediateWindow):
 class _FakeService:
     def __init__(self) -> None:
         self.open_thread_name = ""
+        self.register_calls = 0
 
     @staticmethod
     def inspect_wechat_client(**_kwargs) -> WechatDesktopProbe:
@@ -107,8 +108,8 @@ class _FakeService:
         self.open_thread_name = threading.current_thread().name
         return True
 
-    @staticmethod
-    def register_current_official_account(**kwargs):
+    def register_current_official_account(self, **kwargs):
+        self.register_calls += 1
         now = datetime.now(UTC)
         return (
             BuyerAccount(
@@ -209,5 +210,77 @@ def test_wizard_opens_wechat_outside_the_tk_main_thread() -> None:
         assert service.open_thread_name
         assert service.open_thread_name != threading.main_thread().name
         assert "已请求打开官方微信" in wizard.status_var.get()
+    finally:
+        root.destroy()
+
+
+def test_wizard_rejects_overlong_nickname_before_confirmation() -> None:
+    root, parent = _root()
+    service = _FakeService()
+    try:
+        wizard = BuyerAccountWizard(
+            parent,
+            service,
+            on_completed=lambda _account: None,
+        )
+        root.update_idletasks()
+        root.update()
+        wizard._probe = service.inspect_wechat_client()
+        wizard.display_name_var.set("测试买家")
+        wizard.nickname_var.set("微" * 101)
+        wizard.identity_label_var.set("测试标识")
+        with (
+            mock.patch(
+                "weimi_manager.ui.buyer_account_wizard.messagebox.askyesno"
+            ) as confirm,
+            mock.patch(
+                "weimi_manager.ui.buyer_account_wizard.messagebox.showwarning"
+            ) as warning,
+        ):
+            wizard._submit_binding()
+        assert not confirm.called
+        assert service.register_calls == 0
+        assert "100" in warning.call_args.args[1]
+        assert wizard.nickname_entry.selection_present()
+    finally:
+        root.destroy()
+
+
+def test_wizard_clear_nickname_button_removes_pasted_text() -> None:
+    root, parent = _root()
+    try:
+        wizard = BuyerAccountWizard(
+            parent,
+            _FakeService(),
+            on_completed=lambda _account: None,
+        )
+        root.update_idletasks()
+        root.update()
+        wizard.nickname_var.set("粘贴进来的整段文字")
+        wizard.clear_nickname_button.invoke()
+        assert wizard.nickname_var.get() == ""
+    finally:
+        root.destroy()
+
+
+def test_wizard_shows_registration_failure_in_a_modal() -> None:
+    root, parent = _root()
+    try:
+        wizard = BuyerAccountWizard(
+            parent,
+            _FakeService(),
+            on_completed=lambda _account: None,
+        )
+        root.update_idletasks()
+        root.update()
+        with mock.patch(
+            "weimi_manager.ui.buyer_account_wizard.messagebox.showerror"
+        ) as error_box:
+            wizard._register_failed(
+                ValueError("微信昵称不能超过 100 个字符")
+            )
+        assert error_box.called
+        assert "100" in error_box.call_args.args[1]
+        assert "添加失败" in wizard.status_var.get()
     finally:
         root.destroy()

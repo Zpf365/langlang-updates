@@ -26,20 +26,21 @@ Get-ChildItem tests -Filter 'test_*.py' | ForEach-Object {
 
 ```text
 81 个测试文件全部退出码为 0
-687 passed, 7 skipped, 18 subtests passed
+689 passed, 8 skipped, 18 subtests passed
 ```
 
 原始分组输出保存为
 `artifacts/release_1_8_52/pytest-full-final.log`。这不是跳过未运行文件：
-81 个测试文件和 694 个测试节点均已启动，无失败文件。
+81 个测试文件和 697 个测试节点均已启动，无失败文件。
 
 ## 跳过项说明
 
 - 5 项为 `TesterAuthTests`：发行安全基线故意不包含
   `assets/tester_accounts.json`，因此不运行包含固定测试账号密码的旧测试。
-- 2 项为 `AuthWindowTests` 的 Tcl/Tk 初始化瞬时跳过；本机
-  `tk.tcl` 偶发报告无法读取实际存在的 `menu.tcl`/`spinbox.tcl`。
-  对应登录窗口在隔离 UI 验收和单独重跑中已通过。
+- 3 项为 Tcl/Tk 初始化瞬时跳过：`AuthWindowTests` 2 项、
+  `UploadPageContractTests` 1 项。本机 `tk.tcl` 偶发报告无法读取
+  实际存在的 `menu.tcl`、`spinbox.tcl` 或 `classicTheme.tcl`。
+  按文件重新启动进程后其余用例通过；对应界面已有独立 UI 验收。
 - 虚拟发行凭据测试 `tests/test_dongxiao_final_virtual_credentials.py`
   使用运行时生成的虚拟凭据，已纳入全量测试，不使用真实用户凭据。
 
@@ -48,6 +49,7 @@ Get-ChildItem tests -Filter 'test_*.py' | ForEach-Object {
 已覆盖并通过：
 
 - 一键向导构造、中文状态映射和当前会话绑定。
+- 微信昵称一键清空、超长内容提交前拦截、自动全选和失败弹窗。
 - 打开官方微信调用在后台线程执行。
 - 同一微信会话复用账号，不重复创建。
 - 账号切换、旧身份失效、活跃任务暂停和切换历史。
