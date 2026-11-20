@@ -107,6 +107,9 @@ AUDIT_ACTION_LABELS = {
     "buyer_account_deleted": "删除买家账号",
     "buyer_wechat_client_checked": "检查 Windows 微信客户端",
     "buyer_wechat_identity_confirmed": "人工确认微信身份",
+    "buyer_account_switch_started": "开始买家账号切换",
+    "buyer_account_switch_completed": "完成买家账号切换",
+    "buyer_account_switch_failed": "买家账号切换失败",
     "buyer_flow_prepared": "准备买家流程",
     "buyer_manual_handoff_started": "开始官方客户端交接",
     "buyer_handoff_user_confirmed": "用户确认完成官方操作",
@@ -280,6 +283,7 @@ class DongxiaoPage(BasePage):
         self._last_pairing_id = ""
         self._last_pairing_identity_id = ""
         self._last_assistant_task_id = ""
+        self._pending_switch_target_id = ""
         self.official_catalog_service = ProductCatalogService(
             self.repository,
             build_catalog_adapter(
@@ -1080,6 +1084,25 @@ class DongxiaoPage(BasePage):
             self._show_wechat_switch_help,
         )
         self.wechat_switch_help_button.pack(side="left", padx=(6, 0))
+        self.buyer_switch_start_button = button(
+            buyer_toolbar,
+            "开始切换账号",
+            self._begin_buyer_account_switch,
+            "Primary",
+        )
+        self.buyer_switch_start_button.pack(side="left", padx=(6, 0))
+        self.buyer_switch_complete_button = button(
+            buyer_toolbar,
+            "完成切换确认",
+            self._complete_buyer_account_switch,
+        )
+        self.buyer_switch_complete_button.pack(side="left", padx=(6, 0))
+        self.buyer_switch_cancel_button = button(
+            buyer_toolbar,
+            "取消切换",
+            self._cancel_buyer_account_switch,
+        )
+        self.buyer_switch_cancel_button.pack(side="left", padx=(6, 0))
         button(
             buyer_toolbar,
             "检查身份",
@@ -1123,6 +1146,8 @@ class DongxiaoPage(BasePage):
                 "provider",
                 "identity",
                 "status",
+                "switch_state",
+                "session",
                 "last_used",
                 "auth",
                 "verified",
@@ -1140,6 +1165,8 @@ class DongxiaoPage(BasePage):
             ("provider", "授权来源", 115),
             ("identity", "真实身份", 125),
             ("status", "会话状态", 125),
+            ("switch_state", "切换状态", 125),
+            ("session", "确认会话", 130),
             ("last_used", "最近使用", 140),
             ("auth", "授权时间", 145),
             ("verified", "最近验证", 145),
@@ -1392,6 +1419,15 @@ class DongxiaoPage(BasePage):
                 "mock_ready": "Mock 可用",
                 "official_unsupported": "官方能力不支持",
             }
+            switch_state_labels = {
+                "not_started": "未切换",
+                "switching": "切换中",
+                "waiting_confirmation": "等待确认",
+                "confirmed": "已确认",
+                "login_invalid": "登录已失效",
+                "failed": "切换失败",
+                "unknown": "未知",
+            }
             for account in accounts:
                 tree.insert(
                     "",
@@ -1411,6 +1447,11 @@ class DongxiaoPage(BasePage):
                             account.status.value,
                             account.status.value,
                         ),
+                        switch_state_labels.get(
+                            account.switch_state.value,
+                            account.switch_state.value,
+                        ),
+                        account.confirmed_client_session[-24:],
                         _date_time(account.last_used_at),
                         _date_time(account.authorization_at),
                         _date_time(account.last_verified_at),
@@ -1640,6 +1681,7 @@ class DongxiaoPage(BasePage):
         def done(probe) -> None:
             self.wechat_client_status_var.set(
                 f"微信客户端：{probe.state.value}；"
+                f"版本：{probe.client_version or '未读取'}；"
                 f"窗口：{probe.window_title or '未发现'}；"
                 f"{probe.instructions}"
             )
@@ -1649,6 +1691,8 @@ class DongxiaoPage(BasePage):
                     f"状态：{probe.state.value}\n"
                     f"已安装：{'是' if probe.installed else '否'}\n"
                     f"运行中：{'是' if probe.running else '否'}\n"
+                    f"客户端版本：{probe.client_version or '未读取'}\n"
+                    f"运行会话：{probe.session_id or '未读取'}\n"
                     f"可见身份：{probe.visible_identity or '未可靠识别'}\n\n"
                     f"{probe.instructions}"
                     + (
@@ -1681,6 +1725,171 @@ class DongxiaoPage(BasePage):
                 "“人工确认身份”。"
             ),
             parent=self,
+        )
+
+    def _begin_buyer_account_switch(self) -> None:
+        account = self._selected_buyer_account()
+        if account is None:
+            messagebox.showwarning(
+                "开始切换账号",
+                "请先选择目标买家账号。",
+                parent=self,
+            )
+            return
+        if account.is_current:
+            messagebox.showinfo(
+                "开始切换账号",
+                "选择的账号已经是当前买家账号。",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "开始切换账号",
+            (
+                "软件将检查当前未完成任务和 Windows 微信状态。\n"
+                "开始切换后，旧身份确认会立即失效。\n"
+                "随后由你本人在官方微信中退出并重新登录目标账号。\n\n"
+                f"目标账号：{account.display_name}\n是否开始？"
+            ),
+            parent=self,
+        ):
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.begin_account_switch(
+                account.buyer_account_id,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            self._buyer_switch_begun,
+            lambda error: messagebox.showerror(
+                "开始账号切换失败",
+                error,
+                parent=self,
+            ),
+            log_title="开始买家微信账号切换",
+            task_scope=f"dongxiao:buyer-switch-start:{account.buyer_account_id}",
+        )
+
+    def _buyer_switch_begun(self, operation) -> None:
+        self._pending_switch_target_id = operation.target_account_id
+        self._load_buyer_accounts()
+        self.buyer_account_status_var.set(
+            f"正在切换到目标账号；{operation.instructions}"
+        )
+        messagebox.showinfo(
+            "请切换官方微信账号",
+            (
+                operation.instructions
+                + "\n\n完成登录后回到本页面点击“完成切换确认”。"
+            ),
+            parent=self,
+        )
+
+    def _complete_buyer_account_switch(self) -> None:
+        selected = self._selected_buyer_account()
+        target_id = (
+            self._pending_switch_target_id
+            or (selected.buyer_account_id if selected is not None else "")
+        )
+        if not target_id:
+            messagebox.showwarning(
+                "完成切换确认",
+                "没有待确认的目标账号，请先点击“开始切换账号”。",
+                parent=self,
+            )
+            return
+        account = next(
+            (
+                item
+                for item in self._buyer_accounts
+                if item.buyer_account_id == target_id
+            ),
+            selected,
+        )
+        nickname = simpledialog.askstring(
+            "完成切换确认",
+            "请确认官方微信当前显示的买家昵称：",
+            initialvalue=account.wechat_nickname if account else "",
+            parent=self,
+        )
+        if not nickname:
+            return
+        identity_label = simpledialog.askstring(
+            "完成切换确认",
+            "请输入用户本人可核对的身份标识。\n"
+            "不要输入手机号、密码、Cookie 或 Token：",
+            initialvalue=account.identity_label if account else "",
+            parent=self,
+        )
+        if not identity_label:
+            return
+        if not messagebox.askyesno(
+            "完成账号切换",
+            (
+                f"请确认官方微信当前登录的是“{nickname}”。\n"
+                "确认后会保存为当前买家账号。\n\n是否确认？"
+            ),
+            parent=self,
+        ):
+            return
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.complete_account_switch(
+                target_id,
+                wechat_nickname=nickname,
+                identity_label=identity_label,
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            self._buyer_switch_completed,
+            lambda error: messagebox.showerror(
+                "完成账号切换失败",
+                error,
+                parent=self,
+            ),
+            log_title="完成买家微信账号切换",
+            task_scope=f"dongxiao:buyer-switch-complete:{target_id}",
+        )
+
+    def _buyer_switch_completed(self, account) -> None:
+        self._pending_switch_target_id = ""
+        self._load_buyer_accounts()
+        self.buyer_account_status_var.set(
+            f"账号切换完成，当前买家：{account.display_name}；"
+            "身份来源为用户人工确认。"
+        )
+
+    def _cancel_buyer_account_switch(self) -> None:
+        target_id = self._pending_switch_target_id
+        if not target_id:
+            messagebox.showinfo(
+                "取消切换",
+                "当前没有正在进行的账号切换。",
+                parent=self,
+            )
+            return
+        reason = simpledialog.askstring(
+            "取消账号切换",
+            "请输入取消原因（可留空）：",
+            parent=self,
+        )
+        self.window.run_task(
+            lambda _progress: self.buyer_flow_service.fail_account_switch(
+                target_id,
+                reason=reason or "用户取消账号切换",
+                permission_checker=self._permission_checker,
+                actor_id=self._actor_id(),
+            ),
+            lambda _account: (
+                setattr(self, "_pending_switch_target_id", ""),
+                self._load_buyer_accounts(),
+            ),
+            lambda error: messagebox.showerror(
+                "取消账号切换失败",
+                error,
+                parent=self,
+            ),
+            log_title="取消买家微信账号切换",
+            task_scope=f"dongxiao:buyer-switch-cancel:{target_id}",
         )
 
     def _edit_selected_buyer_account(self) -> None:

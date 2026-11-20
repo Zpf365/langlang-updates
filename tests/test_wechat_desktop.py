@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from weimi_manager.dongxiao.buyer_flow.wechat_desktop import (
@@ -17,11 +18,15 @@ class FakeBackend:
         installs: tuple[Path, ...] = (),
         windows: tuple[DesktopWindow, ...] = (),
         snapshots: dict[int, WindowSnapshot] | None = None,
+        client_version: str = "",
+        snapshot_delay: float = 0,
     ) -> None:
         self.installs = installs
         self.windows = windows
         self.snapshots = snapshots or {}
         self.captures: list[Path] = []
+        self.client_version = client_version
+        self.snapshot_delay = snapshot_delay
 
     def installation_paths(self) -> tuple[Path, ...]:
         return self.installs
@@ -30,7 +35,12 @@ class FakeBackend:
         return self.windows
 
     def snapshot(self, _window: DesktopWindow) -> WindowSnapshot:
+        if self.snapshot_delay:
+            time.sleep(self.snapshot_delay)
         return self.snapshots.get(_window.hwnd, WindowSnapshot())
+
+    def version(self, _window: DesktopWindow) -> str:
+        return self.client_version
 
     def capture(self, _window: DesktopWindow, target: Path) -> bool:
         target.write_bytes(b"png")
@@ -136,6 +146,65 @@ def test_wechat_probe_detects_login_and_visible_identity(
     assert signed.state is WechatDesktopState.LOGGED_IN
     assert signed.visible_identity == "微信买家甲"
     assert signed.identity_confirmed is True
+
+
+def test_wechat_probe_reports_client_version(tmp_path: Path) -> None:
+    window = _window()
+    probe = WechatDesktopClient(
+        backend=FakeBackend(
+            installs=(tmp_path / "Weixin.exe",),
+            windows=(window,),
+            snapshots={
+                window.hwnd: WindowSnapshot(main_window=True)
+            },
+            client_version="4.1.0.16",
+        ),
+        screenshot_dir=tmp_path,
+    ).probe()
+
+    assert probe.client_version == "4.1.0.16"
+
+
+def test_wechat_uia_timeout_returns_error_without_blocking(
+    tmp_path: Path,
+) -> None:
+    window = _window()
+    probe = WechatDesktopClient(
+        backend=FakeBackend(
+            installs=(tmp_path / "Weixin.exe",),
+            windows=(window,),
+            snapshot_delay=0.25,
+        ),
+        screenshot_dir=tmp_path,
+        uia_timeout=0.05,
+    ).probe()
+
+    assert probe.state is WechatDesktopState.ERROR
+    assert "UIA" in probe.error
+    assert "0.05" in probe.error
+
+
+def test_multiple_wechat_processes_fail_without_selecting_one(
+    tmp_path: Path,
+) -> None:
+    first = _window()
+    second = DesktopWindow(
+        hwnd=456,
+        process_id=789,
+        title="微信",
+        class_name="WeChatMainWndForPC",
+        executable_name="Weixin.exe",
+    )
+    probe = WechatDesktopClient(
+        backend=FakeBackend(
+            installs=(tmp_path / "Weixin.exe",),
+            windows=(first, second),
+        ),
+        screenshot_dir=tmp_path,
+    ).probe()
+
+    assert probe.state is WechatDesktopState.ERROR
+    assert "多个" in probe.error
 
 
 def test_wechat_probe_captures_unexpected_client_errors(

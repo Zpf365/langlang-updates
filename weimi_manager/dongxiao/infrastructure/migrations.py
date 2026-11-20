@@ -23,8 +23,8 @@ from ..domain.enums import (
     TaskStatus,
 )
 
-DONGXIAO_MIGRATION_VERSION = 9
-DONGXIAO_MIGRATION_NAME = "dongxiao_buyer_workspace_v9"
+DONGXIAO_MIGRATION_VERSION = 10
+DONGXIAO_MIGRATION_NAME = "dongxiao_buyer_switch_v10"
 DONGXIAO_V1_CHECKSUM = (
     "6eee2177549390bc74e220626e4f7e395fd7ceb2c069389ab38994f125a3002f"
 )
@@ -51,6 +51,9 @@ DONGXIAO_V8_CHECKSUM = (
 )
 DONGXIAO_V9_CHECKSUM = (
     "842a0b8adcc386d769853135c56aa66d50a58e18459ff0b35ac120b6bf1d3dd1"
+)
+DONGXIAO_V10_CHECKSUM = (
+    "d112d88f8d823515849001a307a6e4f8831834f903afe0ac4449463d4cbcf32c"
 )
 
 
@@ -1527,6 +1530,20 @@ CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_task_events_account_v9
 """
 
 
+def _migration_v10_sql() -> str:
+    return """
+ALTER TABLE dongxiao_buyer_accounts
+    ADD COLUMN switch_state TEXT NOT NULL DEFAULT 'not_started';
+ALTER TABLE dongxiao_buyer_accounts
+    ADD COLUMN confirmed_client_session TEXT NOT NULL DEFAULT '';
+ALTER TABLE dongxiao_buyer_accounts
+    ADD COLUMN last_client_check_at TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_dongxiao_buyer_switch_state_v10
+    ON dongxiao_buyer_accounts(switch_state, updated_at DESC);
+"""
+
+
 def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
     return (
         (1, "dongxiao_core_v1", _migration_sql),
@@ -1538,6 +1555,7 @@ def _migrations() -> tuple[tuple[int, str, Callable[[], str]], ...]:
         (7, "dongxiao_final_release_v7", _migration_v7_sql),
         (8, "dongxiao_real_buyer_flow_v8", _migration_v8_sql),
         (9, "dongxiao_buyer_workspace_v9", _migration_v9_sql),
+        (10, "dongxiao_buyer_switch_v10", _migration_v10_sql),
     )
 
 
@@ -1639,6 +1657,10 @@ def migrate_dongxiao_schema(
         if version == 9 and current_checksum != DONGXIAO_V9_CHECKSUM:
             raise sqlite3.IntegrityError(
                 "动销中心 v9 迁移 SQL 已变更，禁止覆盖已发布版本"
+            )
+        if version == 10 and current_checksum != DONGXIAO_V10_CHECKSUM:
+            raise sqlite3.IntegrityError(
+                "动销中心 v10 迁移 SQL 已变更，禁止覆盖已发布版本"
             )
         applied_at = datetime.now(UTC).isoformat(timespec="seconds")
         try:

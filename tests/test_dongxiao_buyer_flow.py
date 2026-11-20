@@ -106,9 +106,36 @@ def _service(tmp_path: Path, *, order_service=None, wechat_client=None):
         catalog,
         BuyerSessionVault(tmp_path),
         order_service=order_service,
-        wechat_client=wechat_client,
+        wechat_client=wechat_client or ReadyWechatClient(),
     )
     return db, store, catalog, repository, service
+
+
+class ReadyWechatClient:
+    session_id = "wechat-session-1"
+
+    @classmethod
+    def probe(cls) -> WechatDesktopProbe:
+        return WechatDesktopProbe(
+            state=WechatDesktopState.LOGGED_IN,
+            installed=True,
+            running=True,
+            checked_at=datetime.now(UTC),
+            executable_name="Weixin.exe",
+            window_title="微信",
+            visible_identity="",
+            identity_confirmed=False,
+            session_id=cls.session_id,
+            instructions="等待用户人工确认身份。",
+        )
+
+    @staticmethod
+    def switch_account_instructions() -> str:
+        return "请在官方微信内退出并重新登录。"
+
+    @staticmethod
+    def open_official_url(_url: str) -> bool:
+        return True
 
 
 def test_buyer_session_vault_is_dpapi_protected_and_round_trips(
@@ -150,6 +177,13 @@ def test_official_buyer_account_fails_closed_without_official_login(
     assert result.capability.official_login is False
     assert result.capability.official_cart_write is False
     assert "官方开放接口" in result.capability.reason
+    service.confirm_wechat_identity(
+        result.account.buyer_account_id,
+        wechat_nickname="真实买家",
+        identity_label="本人确认",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
     current = service.set_current_account(
         result.account.buyer_account_id,
         permission_checker=lambda _permission: True,
@@ -194,6 +228,13 @@ def test_buyer_account_profile_and_switch_history_are_auditable(
         permission_checker=lambda _permission: True,
         actor_id="tester",
     ).account
+    service.confirm_wechat_identity(
+        first.buyer_account_id,
+        wechat_nickname="微信甲",
+        identity_label="本人确认-A",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
     service.set_current_account(
         first.buyer_account_id,
         permission_checker=lambda _permission: True,
@@ -205,6 +246,13 @@ def test_buyer_account_profile_and_switch_history_are_auditable(
         wechat_nickname="微信甲昵称",
         identity_label="本人确认-A2",
         remark="主用测试账号",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    service.confirm_wechat_identity(
+        second.buyer_account_id,
+        wechat_nickname="微信乙",
+        identity_label="本人确认-B",
         permission_checker=lambda _permission: True,
         actor_id="tester",
     )
@@ -321,41 +369,40 @@ def test_manual_handoff_blocks_when_windows_wechat_is_not_running(
         def open_official_url(_url: str) -> bool:
             return True
 
-    _db, store, _catalog_repo, _repository, service = _service(
-        tmp_path,
-        wechat_client=MissingClient(),
-    )
+    _db, store, _catalog_repo, _repository, service = _service(tmp_path)
     account = service.create_official_account(
         display_name="未启动客户端买家",
         permission_checker=lambda _permission: True,
         actor_id="tester",
     ).account
+    service.confirm_wechat_identity(
+        account.buyer_account_id,
+        wechat_nickname="未启动微信买家",
+        identity_label="确认后关闭微信",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
     service.set_current_account(
         account.buyer_account_id,
         permission_checker=lambda _permission: True,
         actor_id="tester",
     )
-    run, _items = service.prepare_run(
-        store,
-        buyer_account_id=account.buyer_account_id,
-        mode=BuyerFlowMode.AUTO_SELECT,
-        requested_count=5,
-        manual_product_ids=[],
-        quantities={},
-        idempotency_key="missing-client-handoff",
-        permission_checker=lambda _permission: True,
-        actor_id="tester",
-    )
-
+    service.wechat_client = MissingClient()
     with pytest.raises(Exception, match="未运行"):
-        service.start_manual_handoff(
-            run.run_id,
+        service.prepare_run(
+            store,
+            buyer_account_id=account.buyer_account_id,
+            mode=BuyerFlowMode.AUTO_SELECT,
+            requested_count=5,
+            manual_product_ids=[],
+            quantities={},
+            idempotency_key="missing-client-handoff",
             permission_checker=lambda _permission: True,
             actor_id="tester",
         )
 
 
-def test_buyer_account_switch_is_blocked_by_active_task(
+def test_buyer_account_switch_pauses_active_tasks_before_switching(
     tmp_path: Path,
 ) -> None:
     _db, store, _catalog_repo, _repository, service = _service(tmp_path)
@@ -369,12 +416,19 @@ def test_buyer_account_switch_is_blocked_by_active_task(
         permission_checker=lambda _permission: True,
         actor_id="tester",
     ).account
+    service.confirm_wechat_identity(
+        first.buyer_account_id,
+        wechat_nickname="任务中微信",
+        identity_label="本人确认",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
     service.set_current_account(
         first.buyer_account_id,
         permission_checker=lambda _permission: True,
         actor_id="tester",
     )
-    service.prepare_run(
+    run, _items = service.prepare_run(
         store,
         buyer_account_id=first.buyer_account_id,
         mode=BuyerFlowMode.AUTO_SELECT,
@@ -386,12 +440,234 @@ def test_buyer_account_switch_is_blocked_by_active_task(
         actor_id="tester",
     )
 
-    with pytest.raises(Exception, match="未完成"):
-        service.set_current_account(
-            second.buyer_account_id,
+    operation = service.begin_account_switch(
+        second.buyer_account_id,
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+
+    assert operation.target_account_id == second.buyer_account_id
+    saved = service.repository.get_run(run.run_id)
+    assert saved is not None
+    assert saved.status is BuyerFlowStatus.PAUSED
+
+
+def test_old_account_task_cannot_resume_under_new_current_buyer(
+    tmp_path: Path,
+) -> None:
+    _db, store, _catalog_repo, repository, service = _service(tmp_path)
+    first = service.create_official_account(
+        display_name="原任务买家",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    ).account
+    second = service.create_official_account(
+        display_name="新当前买家",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    ).account
+    service.confirm_wechat_identity(
+        first.buyer_account_id,
+        wechat_nickname="原微信",
+        identity_label="本人确认",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    service.set_current_account(
+        first.buyer_account_id,
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    run, _items = service.prepare_run(
+        store,
+        buyer_account_id=first.buyer_account_id,
+        mode=BuyerFlowMode.AUTO_SELECT,
+        requested_count=5,
+        manual_product_ids=[],
+        quantities={},
+        idempotency_key="old-account-resume-guard",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    service.begin_account_switch(
+        second.buyer_account_id,
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    service.complete_account_switch(
+        second.buyer_account_id,
+        wechat_nickname="新微信",
+        identity_label="本人确认",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+
+    with pytest.raises(Exception, match="当前买家"):
+        service.set_run_status(
+            run.run_id,
+            "resume",
             permission_checker=lambda _permission: True,
             actor_id="tester",
         )
+    saved = repository.get_run(run.run_id)
+    assert saved is not None
+    assert saved.status is BuyerFlowStatus.PAUSED
+
+
+def test_completed_account_switch_invalidates_old_identity_confirmation(
+    tmp_path: Path,
+) -> None:
+    _db, _store, _catalog_repo, repository, service = _service(
+        tmp_path,
+        wechat_client=ReadyWechatClient(),
+    )
+    first = service.create_official_account(
+        display_name="当前买家",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    ).account
+    first = service.confirm_wechat_identity(
+        first.buyer_account_id,
+        wechat_nickname="当前微信",
+        identity_label="本人确认-当前",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    service.set_current_account(
+        first.buyer_account_id,
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    second = service.create_official_account(
+        display_name="目标买家",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    ).account
+
+    begun = service.begin_account_switch(
+        second.buyer_account_id,
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    assert begun.target_account_id == second.buyer_account_id
+    assert begun.status.value == "waiting_confirmation"
+    switched = service.complete_account_switch(
+        second.buyer_account_id,
+        wechat_nickname="目标微信",
+        identity_label="本人确认-目标",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+
+    assert switched.is_current is True
+    assert switched.confirmed_client_session == ReadyWechatClient.session_id
+    accounts = {account.buyer_account_id: account for account in repository.list_accounts()}
+    assert accounts[first.buyer_account_id].confirmed_client_session == ""
+    assert accounts[first.buyer_account_id].switch_state.value == "login_invalid"
+
+
+def test_cancelled_account_switch_never_marks_target_as_logged_in(
+    tmp_path: Path,
+) -> None:
+    _db, _store, _catalog_repo, repository, service = _service(tmp_path)
+    first = service.create_official_account(
+        display_name="取消前买家",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    ).account
+    service.confirm_wechat_identity(
+        first.buyer_account_id,
+        wechat_nickname="取消前微信",
+        identity_label="本人确认",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    service.set_current_account(
+        first.buyer_account_id,
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+    target = service.create_official_account(
+        display_name="取消目标买家",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    ).account
+    service.begin_account_switch(
+        target.buyer_account_id,
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+
+    failed = service.fail_account_switch(
+        target.buyer_account_id,
+        reason="用户取消扫码",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    )
+
+    assert failed.is_current is False
+    assert failed.switch_state.value == "failed"
+    assert failed.confirmed_client_session == ""
+    assert repository.current_account().buyer_account_id == first.buyer_account_id
+
+
+def test_unconfirmed_manual_identity_cannot_start_business_task(
+    tmp_path: Path,
+) -> None:
+    _db, store, _catalog_repo, _repository, service = _service(tmp_path)
+    account = service.create_official_account(
+        display_name="未确认身份买家",
+        permission_checker=lambda _permission: True,
+        actor_id="tester",
+    ).account
+    with pytest.raises(Exception, match="人工确认"):
+        service.set_current_account(
+            account.buyer_account_id,
+            permission_checker=lambda _permission: True,
+            actor_id="tester",
+        )
+
+
+def test_wechat_session_change_invalidates_previous_identity_confirmation(
+    tmp_path: Path,
+) -> None:
+    original_session = ReadyWechatClient.session_id
+    ReadyWechatClient.session_id = "wechat-session-before"
+    try:
+        _db, _store, _catalog_repo, repository, service = _service(tmp_path)
+        account = service.create_official_account(
+            display_name="会话变化买家",
+            permission_checker=lambda _permission: True,
+            actor_id="tester",
+        ).account
+        service.confirm_wechat_identity(
+            account.buyer_account_id,
+            wechat_nickname="会话买家",
+            identity_label="切换前确认",
+            permission_checker=lambda _permission: True,
+            actor_id="tester",
+        )
+        service.set_current_account(
+            account.buyer_account_id,
+            permission_checker=lambda _permission: True,
+            actor_id="tester",
+        )
+        ReadyWechatClient.session_id = "wechat-session-after-restart"
+
+        probe = service.inspect_wechat_client(
+            buyer_account_id=account.buyer_account_id,
+            permission_checker=lambda _permission: True,
+            actor_id="tester",
+        )
+
+        assert probe.session_id == "wechat-session-after-restart"
+        saved = repository.get_account(account.buyer_account_id)
+        assert saved is not None
+        assert saved.confirmed_client_session == ""
+        assert saved.switch_state.value == "login_invalid"
+        assert "失效" in saved.status_reason
+    finally:
+        ReadyWechatClient.session_id = original_session
 
 
 def test_mock_buyer_selects_five_unique_items_and_verifies_cart_state(

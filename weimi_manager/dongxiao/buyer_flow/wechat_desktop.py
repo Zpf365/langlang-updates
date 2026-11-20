@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -56,6 +58,8 @@ class WechatDesktopProbe:
     process_id: int = 0
     window_title: str = ""
     executable_name: str = ""
+    session_id: str = ""
+    client_version: str = ""
     visible_identity: str = ""
     identity_confirmed: bool = False
     error: str = ""
@@ -260,6 +264,27 @@ class WindowsWechatBackend:
             error_texts=error_texts,
         )
 
+    def version(self, window: DesktopWindow) -> str:
+        try:
+            import psutil
+            import win32api
+
+            executable = psutil.Process(window.process_id).exe()
+            info = win32api.GetFileVersionInfo(executable, "\\")
+            ms = int(info.get("FileVersionMS") or 0)
+            ls = int(info.get("FileVersionLS") or 0)
+            return ".".join(
+                str(part)
+                for part in (
+                    ms >> 16,
+                    ms & 0xFFFF,
+                    ls >> 16,
+                    ls & 0xFFFF,
+                )
+            )
+        except Exception:
+            return ""
+
     def capture(self, window: DesktopWindow, target: Path) -> bool:
         try:
             from pywinauto import Desktop
@@ -280,9 +305,34 @@ class WechatDesktopClient:
         backend: WechatDesktopBackend | None = None,
         *,
         screenshot_dir: Path,
+        uia_timeout: float = 8.0,
     ) -> None:
         self.backend = backend or WindowsWechatBackend()
         self.screenshot_dir = Path(screenshot_dir)
+        self.uia_timeout = max(0.05, float(uia_timeout))
+
+    @staticmethod
+    def _call_with_timeout(callback, timeout: float):
+        output: queue.Queue = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                output.put((True, callback()))
+            except Exception as exc:
+                output.put((False, exc))
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="langlang-wechat-uia",
+        )
+        thread.start()
+        try:
+            return output.get(timeout=timeout)
+        except queue.Empty:
+            return False, TimeoutError(
+                f"微信 UIA 调用超时（{timeout:g} 秒）"
+            )
 
     def probe(self) -> WechatDesktopProbe:
         checked_at = datetime.now(UTC)
@@ -312,14 +362,59 @@ class WechatDesktopClient:
                     else "未检测到 Windows 官方微信客户端，请通过官方渠道安装。"
                 ),
             )
+        process_ids = {window.process_id for window in windows}
+        if len(process_ids) > 1:
+            return WechatDesktopProbe(
+                state=WechatDesktopState.ERROR,
+                installed=installed,
+                running=True,
+                checked_at=checked_at,
+                executable_path=str(installs[0]) if installs else "",
+                error="检测到多个微信进程，拒绝猜测当前买家身份",
+                instructions=(
+                    "请只保留一个 Windows 官方微信客户端，并关闭其他微信实例。"
+                ),
+                details={"process_ids": sorted(process_ids)},
+            )
         window = windows[0]
-        snapshot = self.backend.snapshot(window)
+        session_id = (
+            f"{window.executable_name.casefold()}:"
+            f"{window.process_id}:{window.hwnd}"
+        )
+        snapshot_ok, snapshot_value = self._call_with_timeout(
+            lambda: self.backend.snapshot(window),
+            self.uia_timeout,
+        )
+        snapshot = (
+            snapshot_value
+            if snapshot_ok
+            else WindowSnapshot(
+                error_texts=(
+                    str(snapshot_value)
+                    if isinstance(snapshot_value, TimeoutError)
+                    else f"UIA 调用失败：{snapshot_value}",
+                )
+            )
+        )
+        version_callback = getattr(self.backend, "version", None)
+        client_version = ""
+        if callable(version_callback):
+            version_ok, version_value = self._call_with_timeout(
+                lambda: version_callback(window),
+                min(self.uia_timeout, 3.0),
+            )
+            if version_ok:
+                client_version = str(version_value or "")
         screenshot_path = ""
         if snapshot.error_texts:
             target = self.screenshot_dir / (
                 f"wechat-client-{checked_at.strftime('%Y%m%d-%H%M%S')}.png"
             )
-            if self.backend.capture(window, target):
+            capture_ok, capture_value = self._call_with_timeout(
+                lambda: self.backend.capture(window, target),
+                min(self.uia_timeout, 5.0),
+            )
+            if capture_ok and capture_value:
                 screenshot_path = str(target)
         base = {
             "installed": True,
@@ -330,6 +425,8 @@ class WechatDesktopClient:
             "process_id": window.process_id,
             "window_title": window.title,
             "executable_name": window.executable_name,
+            "session_id": session_id,
+            "client_version": client_version,
             "screenshot_path": screenshot_path,
             "details": {
                 "class_name": window.class_name,

@@ -29,6 +29,7 @@ from .domain import (
     BuyerOrderStatus,
     BuyerOrderVerificationStatus,
     BuyerProvider,
+    BuyerSwitchState,
 )
 
 
@@ -129,8 +130,12 @@ class BuyerFlowRepository:
                     provider, identity_status, status, is_current,
                     authorization_at, last_verified_at, status_reason,
                     created_at, updated_at, wechat_nickname,
-                    identity_label, remark, last_used_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    identity_label, remark, last_used_at,
+                    switch_state, confirmed_client_session,
+                    last_client_check_at
+                ) VALUES(
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     account.buyer_account_id,
@@ -159,6 +164,13 @@ class BuyerFlowRepository:
                     (
                         to_utc_iso(account.last_used_at)
                         if account.last_used_at
+                        else None
+                    ),
+                    account.switch_state.value,
+                    account.confirmed_client_session,
+                    (
+                        to_utc_iso(account.last_client_check_at)
+                        if account.last_client_check_at
                         else None
                     ),
                 ),
@@ -216,6 +228,9 @@ class BuyerFlowRepository:
         wechat_nickname: str | None = None,
         identity_label: str | None = None,
         remark: str | None = None,
+        switch_state: BuyerSwitchState | str | None = None,
+        confirmed_client_session: str | None = None,
+        last_client_check_at: datetime | None = None,
         identity_status: BuyerIdentityStatus | str | None = None,
         status: BuyerAccountStatus | str | None = None,
         authorization_at: datetime | None = None,
@@ -229,6 +244,21 @@ class BuyerFlowRepository:
             ("wechat_nickname", wechat_nickname),
             ("identity_label", identity_label),
             ("remark", remark),
+            (
+                "switch_state",
+                BuyerSwitchState(switch_state).value
+                if switch_state is not None
+                else None,
+            ),
+            ("confirmed_client_session", confirmed_client_session),
+            (
+                "last_client_check_at",
+                (
+                    to_utc_iso(last_client_check_at)
+                    if last_client_check_at
+                    else None
+                ),
+            ),
             (
                 "identity_status",
                 BuyerIdentityStatus(identity_status).value
@@ -272,6 +302,244 @@ class BuyerFlowRepository:
             ).fetchone()
         return self._account_from_row(row)
 
+    def begin_account_switch(
+        self,
+        target_buyer_account_id: str,
+        *,
+        client_session: str,
+        actor_id: str,
+    ) -> tuple[BuyerAccount, BuyerAccount]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = to_utc_iso(datetime.now(UTC))
+            source = conn.execute(
+                """
+                SELECT * FROM dongxiao_buyer_accounts
+                 WHERE is_current=1
+                 LIMIT 1
+                """
+            ).fetchone()
+            target = conn.execute(
+                """
+                SELECT * FROM dongxiao_buyer_accounts
+                 WHERE buyer_account_id=?
+                """,
+                (str(target_buyer_account_id),),
+            ).fetchone()
+            if target is None:
+                raise BuyerFlowRepositoryError("目标买家账号不存在")
+            if source is None:
+                raise BuyerFlowRepositoryError("当前没有活动买家账号")
+            if str(source["buyer_account_id"]) == str(target_buyer_account_id):
+                raise BuyerFlowRepositoryError("目标账号已经是当前买家账号")
+            active_rows = conn.execute(
+                """
+                SELECT run_id, status
+                  FROM dongxiao_buyer_flow_runs
+                 WHERE buyer_account_id=?
+                   AND status IN (
+                       'prepared', 'waiting_user_handoff',
+                       'waiting_order_id', 'unknown'
+                   )
+                """,
+                (str(source["buyer_account_id"]),),
+            ).fetchall()
+            unknown_runs = [
+                row for row in active_rows if row["status"] == "unknown"
+            ]
+            if unknown_runs:
+                raise BuyerFlowRepositoryError(
+                    "当前账号存在结果未知任务，必须先核验远端结果再切换"
+                )
+            for row in active_rows:
+                conn.execute(
+                    """
+                    UPDATE dongxiao_buyer_flow_runs
+                       SET status='paused',
+                           status_reason=?,
+                           updated_at=?
+                     WHERE run_id=?
+                    """,
+                    (
+                        "微信账号切换前自动暂停，切换后需核验任务归属",
+                        now,
+                        str(row["run_id"]),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO dongxiao_buyer_task_events(
+                        event_id, run_id, buyer_account_id,
+                        event_type, status, detail_json, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        str(row["run_id"]),
+                        str(source["buyer_account_id"]),
+                        "paused_for_account_switch",
+                        "paused",
+                        _json(
+                            {
+                                "target_buyer_account_id": str(
+                                    target_buyer_account_id
+                                )
+                            }
+                        ),
+                        now,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE dongxiao_buyer_accounts
+                   SET confirmed_client_session='',
+                       switch_state=?,
+                       status_reason=?,
+                       updated_at=?
+                 WHERE buyer_account_id=?
+                """,
+                (
+                    BuyerSwitchState.LOGIN_INVALID.value,
+                    "开始切换微信账号，旧身份确认已失效",
+                    now,
+                    str(source["buyer_account_id"]),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE dongxiao_buyer_accounts
+                   SET switch_state=?,
+                       confirmed_client_session='',
+                       last_client_check_at=?,
+                       status_reason=?,
+                       updated_at=?
+                 WHERE buyer_account_id=?
+                """,
+                (
+                    BuyerSwitchState.WAITING_CONFIRMATION.value,
+                    now,
+                    "请在官方微信完成账号切换后重新人工确认身份",
+                    now,
+                    str(target_buyer_account_id),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO dongxiao_buyer_account_switch_events(
+                    switch_id, from_buyer_account_id,
+                    to_buyer_account_id, actor_id, reason, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    str(source["buyer_account_id"]),
+                    str(target_buyer_account_id),
+                    str(actor_id or "system"),
+                    f"开始官方微信账号切换；会话 {client_session[:120]}",
+                    now,
+                ),
+            )
+            source_row = conn.execute(
+                "SELECT * FROM dongxiao_buyer_accounts WHERE buyer_account_id=?",
+                (str(source["buyer_account_id"]),),
+            ).fetchone()
+            target_row = conn.execute(
+                "SELECT * FROM dongxiao_buyer_accounts WHERE buyer_account_id=?",
+                (str(target_buyer_account_id),),
+            ).fetchone()
+        return (
+            self._account_from_row(source_row),
+            self._account_from_row(target_row),
+        )
+
+    def complete_account_switch(
+        self,
+        target_buyer_account_id: str,
+        *,
+        client_session: str,
+        actor_id: str,
+        display_name: str | None = None,
+        wechat_nickname: str | None = None,
+        identity_label: str | None = None,
+    ) -> BuyerAccount:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = to_utc_iso(datetime.now(UTC))
+            target = conn.execute(
+                """
+                SELECT * FROM dongxiao_buyer_accounts
+                 WHERE buyer_account_id=?
+                """,
+                (str(target_buyer_account_id),),
+            ).fetchone()
+            if target is None:
+                raise BuyerFlowRepositoryError("目标买家账号不存在")
+            if target["switch_state"] != BuyerSwitchState.WAITING_CONFIRMATION.value:
+                raise BuyerFlowRepositoryError("目标账号没有待确认的切换流程")
+            source = conn.execute(
+                "SELECT buyer_account_id FROM dongxiao_buyer_accounts WHERE is_current=1 LIMIT 1"
+            ).fetchone()
+            conn.execute(
+                "UPDATE dongxiao_buyer_accounts SET is_current=0 WHERE is_current=1"
+            )
+            clauses = [
+                "is_current=1",
+                "switch_state=?",
+                "confirmed_client_session=?",
+                "identity_status=?",
+                "status=?",
+                "last_verified_at=?",
+                "last_used_at=?",
+                "last_client_check_at=?",
+                "updated_at=?",
+            ]
+            values: list[object] = [
+                BuyerSwitchState.CONFIRMED.value,
+                str(client_session),
+                BuyerIdentityStatus.USER_ASSERTED.value,
+                BuyerAccountStatus.ACTIVE.value,
+                now,
+                now,
+                now,
+                now,
+            ]
+            for name, value in (
+                ("display_name", display_name),
+                ("wechat_nickname", wechat_nickname),
+                ("identity_label", identity_label),
+            ):
+                if value is not None:
+                    clauses.append(f"{name}=?")
+                    values.append(value)
+            values.append(str(target_buyer_account_id))
+            conn.execute(
+                "UPDATE dongxiao_buyer_accounts SET "
+                + ", ".join(clauses)
+                + " WHERE buyer_account_id=?",
+                values,
+            )
+            conn.execute(
+                """
+                INSERT INTO dongxiao_buyer_account_switch_events(
+                    switch_id, from_buyer_account_id,
+                    to_buyer_account_id, actor_id, reason, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    str(source["buyer_account_id"]) if source else None,
+                    str(target_buyer_account_id),
+                    str(actor_id or "system"),
+                    f"账号切换完成并人工确认；客户端会话 {client_session[:120]}",
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM dongxiao_buyer_accounts WHERE buyer_account_id=?",
+                (str(target_buyer_account_id),),
+            ).fetchone()
+        return self._account_from_row(row)
+
     def set_current_account(
         self,
         buyer_account_id: str,
@@ -291,7 +559,8 @@ class BuyerFlowRepository:
             ).fetchone()
             account = conn.execute(
                 """
-                SELECT identity_status, status, provider
+                SELECT identity_status, status, provider,
+                       switch_state, confirmed_client_session
                   FROM dongxiao_buyer_accounts
                  WHERE buyer_account_id=?
                 """,
@@ -333,6 +602,14 @@ class BuyerFlowRepository:
             )
             if not verified and not manual_handoff:
                 raise BuyerFlowRepositoryError("买家身份未经官方验证，不能设为当前账号")
+            if manual_handoff and (
+                account["switch_state"]
+                != BuyerSwitchState.CONFIRMED.value
+                or not str(account["confirmed_client_session"] or "")
+            ):
+                raise BuyerFlowRepositoryError(
+                    "请先检查 Windows 微信并人工确认当前买家身份"
+                )
             conn.execute(
                 "UPDATE dongxiao_buyer_accounts SET is_current=0 WHERE is_current=1"
             )
@@ -888,6 +1165,13 @@ class BuyerFlowRepository:
             identity_label=str(row["identity_label"] or ""),
             remark=str(row["remark"] or ""),
             last_used_at=_time(row["last_used_at"]),
+            switch_state=BuyerSwitchState(
+                row["switch_state"] or BuyerSwitchState.NOT_STARTED.value
+            ),
+            confirmed_client_session=str(
+                row["confirmed_client_session"] or ""
+            ),
+            last_client_check_at=_time(row["last_client_check_at"]),
             created_at=parse_utc_iso(row["created_at"]),
             updated_at=parse_utc_iso(row["updated_at"]),
         )

@@ -38,6 +38,16 @@ class BuyerAccountStatus(StrEnum):
     OFFICIAL_UNSUPPORTED = "official_unsupported"
 
 
+class BuyerSwitchState(StrEnum):
+    NOT_STARTED = "not_started"
+    SWITCHING = "switching"
+    WAITING_CONFIRMATION = "waiting_confirmation"
+    CONFIRMED = "confirmed"
+    LOGIN_INVALID = "login_invalid"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 class BuyerCapabilityState(StrEnum):
     AVAILABLE = "available"
     AWAITING_AUTHORIZATION = "awaiting_authorization"
@@ -148,6 +158,9 @@ class BuyerAccount:
     identity_label: str = ""
     remark: str = ""
     last_used_at: datetime | None = None
+    switch_state: BuyerSwitchState = BuyerSwitchState.NOT_STARTED
+    confirmed_client_session: str = ""
+    last_client_check_at: datetime | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -199,6 +212,26 @@ class BuyerAccount:
             if self.last_used_at is not None
             else None,
         )
+        object.__setattr__(
+            self,
+            "switch_state",
+            BuyerSwitchState(self.switch_state),
+        )
+        object.__setattr__(
+            self,
+            "confirmed_client_session",
+            str(self.confirmed_client_session or "").strip()[:500],
+        )
+        object.__setattr__(
+            self,
+            "last_client_check_at",
+            ensure_utc(
+                self.last_client_check_at,
+                field="微信客户端最近检查时间",
+            )
+            if self.last_client_check_at is not None
+            else None,
+        )
 
     @property
     def verified_identity(self) -> bool:
@@ -237,6 +270,33 @@ class BuyerAccountSwitchEvent:
             self,
             "created_at",
             ensure_utc(self.created_at, field="买家账号切换时间"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BuyerSwitchOperation:
+    source_account_id: str
+    target_account_id: str
+    status: BuyerSwitchState
+    client_session: str
+    instructions: str
+
+    def __post_init__(self) -> None:
+        for name in ("source_account_id", "target_account_id"):
+            text = str(getattr(self, name) or "").strip()
+            if not text:
+                raise ValueError(f"{name}不能为空")
+            object.__setattr__(self, name, text)
+        object.__setattr__(self, "status", BuyerSwitchState(self.status))
+        object.__setattr__(
+            self,
+            "client_session",
+            str(self.client_session or "")[:500],
+        )
+        object.__setattr__(
+            self,
+            "instructions",
+            str(self.instructions or "")[:2000],
         )
 
 

@@ -19,6 +19,7 @@ from weimi_manager.dongxiao.infrastructure.migrations import (
     DONGXIAO_V7_CHECKSUM,
     DONGXIAO_V8_CHECKSUM,
     DONGXIAO_V9_CHECKSUM,
+    DONGXIAO_V10_CHECKSUM,
     migrate_dongxiao_schema,
 )
 from weimi_manager.sales_related.migrations import (
@@ -101,11 +102,11 @@ def test_dongxiao_migration_creates_isolated_schema(
         }
         assert changed is True
         assert REQUIRED_TABLES.issubset(tables)
-        assert backups == ["pre-dongxiao-v9"]
+        assert backups == ["pre-dongxiao-v10"]
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations"
         ).fetchall() == [
-            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)
         ]
         product_columns = {
             str(row[1])
@@ -192,7 +193,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
             lambda label: backups.append(label) or backup,
         )
 
-        assert backups == ["pre-dongxiao-v9"]
+        assert backups == ["pre-dongxiao-v10"]
         assert conn.execute(
             "SELECT COUNT(*) FROM sales_audit_logs"
         ).fetchone()[0] == 1
@@ -204,7 +205,7 @@ def test_dongxiao_migration_is_repeatable_and_preserves_legacy_sales_data(
         ).fetchone()[0] == old_checksum
         assert conn.execute(
             "SELECT COUNT(*) FROM dongxiao_schema_migrations"
-        ).fetchone()[0] == 9
+        ).fetchone()[0] == 10
     finally:
         conn.close()
 
@@ -316,6 +317,12 @@ def test_v9_checksum_is_frozen_for_buyer_workspace_migration() -> None:
     assert hashlib.sha256(
         migration_module._migration_v9_sql().encode("utf-8")
     ).hexdigest() == DONGXIAO_V9_CHECKSUM
+
+
+def test_v10_checksum_is_frozen_for_buyer_switch_migration() -> None:
+    assert hashlib.sha256(
+        migration_module._migration_v10_sql().encode("utf-8")
+    ).hexdigest() == DONGXIAO_V10_CHECKSUM
 
 
 def test_failed_v3_migration_rolls_back_only_v3_and_keeps_v2_complete(
@@ -639,7 +646,7 @@ def test_v5_upgrades_v4_history_and_deduplicates_pending_approvals(
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
         ).fetchall() == [
-            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)
         ]
     finally:
         conn.close()
@@ -871,7 +878,7 @@ def test_v6_upgrades_v5_history_and_defaults_platform_writes_off(
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
         ).fetchall() == [
-            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)
         ]
         assert not migrate_dongxiao_schema(
             conn,
@@ -1144,7 +1151,7 @@ def test_v8_upgrades_v7_with_real_buyer_flow_schema(
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
         ).fetchall() == [
-            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)
         ]
         assert not migrate_dongxiao_schema(
             conn,
@@ -1245,7 +1252,97 @@ def test_v9_upgrades_v8_without_losing_buyer_accounts(
         assert conn.execute(
             "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
         ).fetchall() == [
-            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)
+        ]
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        conn.close()
+
+
+def test_v10_upgrades_v9_with_switch_session_fields(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "upgrade-v10.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE stores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id TEXT NOT NULL UNIQUE
+            );
+            INSERT INTO stores(app_id) VALUES('wx-store-v10');
+            """
+        )
+        conn.commit()
+        migrations = list(migration_module._migrations())
+        monkeypatch.setattr(
+            migration_module,
+            "_migrations",
+            lambda: migrations[:9],
+        )
+        monkeypatch.setattr(
+            migration_module,
+            "_verify_required_tables",
+            lambda _conn: None,
+        )
+        migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".v9.backup"),
+        )
+        conn.execute(
+            """
+            INSERT INTO dongxiao_buyer_accounts(
+                buyer_account_id, display_name, account_ref_hash,
+                provider, identity_status, status, is_current,
+                authorization_at, last_verified_at, status_reason,
+                created_at, updated_at, wechat_nickname,
+                identity_label, remark, last_used_at
+            ) VALUES(
+                'buyer-v10', '切换前买家', 'hash-v10',
+                'manual_handoff', 'user_asserted', 'active', 1,
+                NULL, '2026-11-20T01:00:00+00:00', '',
+                '2026-11-20T00:00:00+00:00',
+                '2026-11-20T01:00:00+00:00', '微信买家', '本人确认',
+                '主账号', '2026-11-20T01:00:00+00:00'
+            )
+            """
+        )
+        conn.commit()
+        monkeypatch.undo()
+
+        assert migrate_dongxiao_schema(
+            conn,
+            path,
+            lambda _label: path.with_suffix(".v10.backup"),
+        )
+
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(dongxiao_buyer_accounts)"
+            ).fetchall()
+        }
+        assert {
+            "switch_state",
+            "confirmed_client_session",
+            "last_client_check_at",
+        } <= columns
+        row = conn.execute(
+            """
+            SELECT display_name, wechat_nickname, switch_state,
+                   confirmed_client_session
+              FROM dongxiao_buyer_accounts
+             WHERE buyer_account_id='buyer-v10'
+            """
+        ).fetchone()
+        assert row == ("切换前买家", "微信买家", "not_started", "")
+        assert conn.execute(
+            "SELECT version FROM dongxiao_schema_migrations ORDER BY version"
+        ).fetchall() == [
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)
         ]
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:

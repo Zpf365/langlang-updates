@@ -1,4 +1,4 @@
-"""Build the single LangLang 1.8.50 Dongxiao delivery ZIP."""
+"""Build the single current LangLang Dongxiao delivery ZIP."""
 
 # ruff: noqa: E402, I001
 
@@ -19,37 +19,39 @@ if str(ROOT) not in sys.path:
 
 from weimi_manager import __version__
 from weimi_manager.dongxiao.infrastructure.migrations import (
-    _migration_v9_sql,
+    DONGXIAO_MIGRATION_VERSION,
+    _migration_v10_sql,
 )
 
 
-DELIVERY_ROOT = ROOT / "deliveries" / "1.8.50"
-OUTPUT = DELIVERY_ROOT / "LangLang_1.8.50_Dongxiao_Final.zip"
-WINDOWS_PROGRAM = ROOT / "release" / "LangLang_1.8.50_Windows_x64"
-SOURCE_ZIP = ROOT / "release" / "LangLang_1.8.50_Source.zip"
+VERSION = __version__
+DELIVERY_ROOT = ROOT / "deliveries" / VERSION
+OUTPUT = DELIVERY_ROOT / f"LangLang_{VERSION}_Dongxiao_Final.zip"
+WINDOWS_PROGRAM = ROOT / "release" / f"LangLang_{VERSION}_Windows_x64"
+SOURCE_ZIP = ROOT / "release" / f"LangLang_{VERSION}_Source.zip"
 BASELINE_SOURCE = (
     ROOT
     / "artifacts"
-    / "v1_8_50_baseline_check"
-    / "LangLang_1.8.49_Source.zip"
+    / "v1_8_51_baseline"
+    / "LangLang_1.8.50_HEAD_18aa0d1.zip"
 )
 DOCUMENTS = (
-    "DONGXIAO_1_8_50_REPORT_CN.md",
-    "DONGXIAO_1_8_50_TEST_REPORT_CN.md",
-    "DONGXIAO_1_8_50_WECHAT_COMPATIBILITY_CN.md",
-    "DONGXIAO_1_8_50_DATABASE_MIGRATION_CN.md",
-    "DONGXIAO_1_8_50_USAGE_CN.md",
-    "DONGXIAO_1_8_50_UNRESOLVED_CN.md",
+    "DONGXIAO_1_8_51_REPORT_CN.md",
+    "DONGXIAO_1_8_51_TEST_REPORT_CN.md",
+    "DONGXIAO_1_8_51_WECHAT_COMPATIBILITY_CN.md",
+    "DONGXIAO_1_8_51_DATABASE_MIGRATION_CN.md",
+    "DONGXIAO_1_8_51_USAGE_CN.md",
+    "DONGXIAO_1_8_51_UNRESOLVED_CN.md",
     "FEATURE_REGRESSION_CHECKLIST_CN.md",
-    "RELEASE_NOTES_1.8.50.md",
-    "HANDOFF_1.8.50.md",
+    f"RELEASE_NOTES_{VERSION}.md",
+    f"HANDOFF_{VERSION}.md",
 )
 TEST_ARTIFACTS = (
-    "artifacts/release_1_8_50/pytest-full-category-fix.log",
-    "artifacts/release_1_8_50/pyinstaller-build-category-fix.log",
-    "artifacts/release_1_8_50/generate-release-category-fix.log",
-    "artifacts/release_1_8_50/make-final-delivery-category-fix.log",
-    "artifacts/release_1_8_50/wechat-probe.json",
+    f"artifacts/release_{VERSION.replace('.', '_')}/pytest-full.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/pyinstaller-build.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/generate-release.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/make-final-delivery.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/wechat-probe.json",
 )
 
 
@@ -94,12 +96,12 @@ def git_info() -> str:
 
 
 def write_readme(stage: Path) -> None:
-    text = f"""# 澜琅 {__version__} 动销中心最终交付
+    text = f"""# 澜琅 {VERSION} 动销中心最终交付
 
 ## 目录
 
-- `00_基线备份/`：官方 1.8.49 源码包，不包含真实凭据。
-- `01_完整源码/`：1.8.50 完整源码。
+- `00_基线备份/`：开工时 1.8.50 源码快照，不包含真实凭据。
+- `01_完整源码/`：{VERSION} 完整源码。
 - `02_Windows程序/LangLang/`：完整 Windows onedir 运行目录。
 - `03_文档/`：开发、测试、兼容性、迁移和使用手册。
 - `04_测试与日志/`：全量测试、构建和实际 Windows 微信探测日志。
@@ -136,7 +138,7 @@ def main() -> int:
         prefix="langlang-1.8.50-delivery-",
         dir=ROOT / "artifacts",
     ) as temporary:
-        stage = Path(temporary) / "LangLang_1.8.50_Dongxiao_Final"
+        stage = Path(temporary) / f"LangLang_{VERSION}_Dongxiao_Final"
         stage.mkdir()
         baseline = stage / "00_基线备份"
         baseline.mkdir()
@@ -164,13 +166,14 @@ def main() -> int:
                 shutil.copy2(source, tests / source.name)
         migration = stage / "05_数据库迁移"
         migration.mkdir()
-        (migration / "20261119_v9_buyer_workspace.sql").write_text(
-            _migration_v9_sql().strip() + "\n",
+        (migration / f"v{DONGXIAO_MIGRATION_VERSION}_buyer_switch.sql").write_text(
+            _migration_v10_sql().strip() + "\n",
             encoding="utf-8",
         )
         shutil.copy2(
-            ROOT / "DONGXIAO_1_8_50_DATABASE_MIGRATION_CN.md",
-            migration / "DONGXIAO_1_8_50_DATABASE_MIGRATION_CN.md",
+            ROOT / f"DONGXIAO_{VERSION.replace('.', '_')}_DATABASE_MIGRATION_CN.md",
+            migration
+            / f"DONGXIAO_{VERSION.replace('.', '_')}_DATABASE_MIGRATION_CN.md",
         )
         git_dir = stage / "06_Git信息"
         git_dir.mkdir()
