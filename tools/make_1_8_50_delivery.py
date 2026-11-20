@@ -45,9 +45,10 @@ DOCUMENTS = (
     "HANDOFF_1.8.50.md",
 )
 TEST_ARTIFACTS = (
-    "artifacts/release_1_8_50/pytest-full.log",
-    "artifacts/release_1_8_50/pyinstaller-build.log",
-    "artifacts/release_1_8_50/generate-release.log",
+    "artifacts/release_1_8_50/pytest-full-category-fix.log",
+    "artifacts/release_1_8_50/pyinstaller-build-category-fix.log",
+    "artifacts/release_1_8_50/generate-release-category-fix.log",
+    "artifacts/release_1_8_50/make-final-delivery-category-fix.log",
     "artifacts/release_1_8_50/wechat-probe.json",
 )
 

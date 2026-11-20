@@ -16,7 +16,7 @@
 
 原始输出：
 
-- `artifacts/release_1_8_50/pytest-full.log`
+- `artifacts/release_1_8_50/pytest-full-category-fix.log`
 
 ## 动销专项
 
