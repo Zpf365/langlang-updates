@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -93,6 +94,84 @@ class ScanLoginConcurrencyTests(unittest.TestCase):
         thread.assert_not_called()
         window.account_store_sync.push.assert_not_called()
         self.assertFalse(window._account_sync_running)
+
+    def test_auto_refresh_only_queries_logged_in_stores(self) -> None:
+        logged = SimpleNamespace(
+            id=1,
+            name="已登录店铺",
+            app_id="wx-logged",
+            web_status="已登录",
+        )
+        offline = SimpleNamespace(
+            id=2,
+            name="未登录店铺",
+            app_id="wx-offline",
+            web_status="未登录",
+        )
+        probes: list[str] = []
+        order_syncs: list[str] = []
+
+        class FakeDb:
+            @staticmethod
+            def list_stores():
+                return [logged, offline]
+
+            @staticmethod
+            def get_setting(_key, default=""):
+                return default
+
+            @staticmethod
+            def start_task_log(**_kwargs):
+                return 1
+
+            @staticmethod
+            def set_setting(_key, _value):
+                return None
+
+            @staticmethod
+            def update_web_status(_store_id, _status, _detail):
+                return None
+
+        done = threading.Event()
+
+        window = object.__new__(MainWindow)
+        window.auto_refresh_enabled = True
+        window._auto_refresh_running = False
+        window._auto_refresh_batch_size = 50
+        window._auto_refresh_workers = 2
+        window._auto_tick_count = 0
+        window._task_running = False
+        window._account_sync_running = False
+        window._active_page = "none"
+        window.db = FakeDb()
+        window.web_session = SimpleNamespace(
+            probe=lambda store: (
+                probes.append(store.app_id) or ("已登录", "ok")
+            )
+        )
+        window.service = SimpleNamespace(
+            sync_recent_order_updates=lambda store, *_args: (
+                order_syncs.append(store.app_id)
+            ),
+            sync_after_sales=lambda store, *_args, **_kwargs: None,
+            sync_analytics_day=lambda *_args, **_kwargs: None,
+        )
+        window.has_running_task = lambda *_args: False
+        window.winfo_exists = lambda: False
+        window.after = mock.Mock()
+        window.set_status = mock.Mock()
+        window._finish_task_log = mock.Mock()
+        window._refresh_nav_alerts = mock.Mock()
+        def post(callback, *args):
+            callback(*args)
+            done.set()
+
+        window._post = post
+        window._auto_refresh_tick()
+        self.assertTrue(done.wait(2))
+
+        self.assertEqual(probes, ["wx-logged"])
+        self.assertEqual(order_syncs, ["wx-logged"])
 
 
 if __name__ == "__main__":

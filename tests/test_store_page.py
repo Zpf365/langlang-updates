@@ -120,18 +120,24 @@ class StorePageContractTests(unittest.TestCase):
     def test_refresh_pulls_cloud_stores_before_refreshing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "stores.db")
-            db.add_store("本机店铺", "wx-local", "local-secret")
+            local_id = db.add_store(
+                "本机店铺",
+                "wx-local",
+                "local-secret",
+            )
+            db.update_web_status(local_id, "已登录", "ok")
             probed: list[str] = []
             refreshed: list[str] = []
 
             class AccountSync:
                 @staticmethod
                 def pull():
-                    db.add_store(
+                    remote_id = db.add_store(
                         "其他电脑店铺",
                         "wx-remote",
                         "remote-secret",
                     )
+                    db.update_web_status(remote_id, "已登录", "ok")
                     return {"created": 1, "updated": 0, "logins": 1}
 
             class FakeWindow:
@@ -159,7 +165,10 @@ class StorePageContractTests(unittest.TestCase):
             page.db = db
             page.window = FakeWindow()
             page.window.web_session = SimpleNamespace(
-                probe=lambda store: probed.append(store.app_id)
+                probe=lambda store: (
+                    probed.append(store.app_id)
+                    or ("已登录", "ok")
+                )
             )
             page.window.service = SimpleNamespace(
                 refresh_store_metrics=lambda store: refreshed.append(
@@ -179,6 +188,214 @@ class StorePageContractTests(unittest.TestCase):
             refreshed,
             ["wx-local", "wx-remote"],
         )
+
+    def test_manual_store_refresh_network_scans_only_logged_in_stores(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "stores.db")
+            logged_id = db.add_store(
+                "已登录店铺",
+                "wx-logged",
+                "secret-one",
+            )
+            db.update_web_status(logged_id, "已登录", "ok")
+            db.add_store(
+                "未登录店铺",
+                "wx-offline",
+                "secret-two",
+            )
+            pending_id = db.add_store(
+                "登录中店铺",
+                "wx-pending",
+                "secret-three",
+            )
+            db.update_web_status(pending_id, "登录中", "waiting")
+            probed: list[str] = []
+            refreshed: list[str] = []
+
+            class AccountSync:
+                @staticmethod
+                def pull():
+                    return {"created": 0, "updated": 0, "logins": 0}
+
+            class FakeWindow:
+                account_store_sync = AccountSync()
+
+                @staticmethod
+                def set_status(*_args, **_kwargs):
+                    return None
+
+                @staticmethod
+                def _post(callback, *args):
+                    callback(*args)
+
+                @staticmethod
+                def store_data_changed():
+                    return None
+
+                @staticmethod
+                def run_task(work, done, _error, **kwargs):
+                    done(work(None))
+                    return True
+
+            page = object.__new__(StorePage)
+            page.db = db
+            page.window = FakeWindow()
+            page.window.web_session = SimpleNamespace(
+                probe=lambda store: (
+                    probed.append(store.app_id)
+                    or ("已登录", "ok")
+                )
+            )
+            page.window.service = SimpleNamespace(
+                refresh_store_metrics=lambda store: refreshed.append(
+                    store.app_id
+                )
+            )
+            page._selected_stores = lambda: []
+            page.refresh = lambda: None
+            page.invalidate_metrics_cache = lambda: None
+            page._cancel_incremental_refresh = lambda: None
+
+            page._refresh_store_data()
+
+        assert probed == ["wx-logged"]
+        assert refreshed == ["wx-logged"]
+
+    def test_manual_refresh_keeps_selected_scope_after_cloud_pull(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "stores.db")
+            selected_id = db.add_store(
+                "选中店铺",
+                "wx-selected",
+                "secret-one",
+            )
+            db.update_web_status(selected_id, "已登录", "ok")
+            other_id = db.add_store(
+                "未选登录店铺",
+                "wx-other-logged",
+                "secret-two",
+            )
+            db.update_web_status(other_id, "已登录", "ok")
+            db.add_store(
+                "未登录店铺",
+                "wx-offline",
+                "secret-three",
+            )
+            selected = next(
+                store
+                for store in db.list_stores()
+                if store.id == selected_id
+            )
+            probed: list[str] = []
+
+            class AccountSync:
+                @staticmethod
+                def pull():
+                    return {"created": 0, "updated": 0, "logins": 0}
+
+            class FakeWindow:
+                account_store_sync = AccountSync()
+
+                @staticmethod
+                def set_status(*_args, **_kwargs):
+                    return None
+
+                @staticmethod
+                def _post(callback, *args):
+                    callback(*args)
+
+                @staticmethod
+                def store_data_changed():
+                    return None
+
+                @staticmethod
+                def run_task(work, done, _error, **kwargs):
+                    done(work(None))
+                    return True
+
+            page = object.__new__(StorePage)
+            page.db = db
+            page.window = FakeWindow()
+            page.window.web_session = SimpleNamespace(
+                probe=lambda store: (
+                    probed.append(store.app_id)
+                    or ("已登录", "ok")
+                )
+            )
+            page.window.service = SimpleNamespace(
+                refresh_store_metrics=lambda _store: {}
+            )
+            page._selected_stores = lambda: [selected]
+            page.refresh = lambda: None
+            page.invalidate_metrics_cache = lambda: None
+            page._cancel_incremental_refresh = lambda: None
+
+            page._refresh_store_data()
+
+        assert probed == ["wx-selected"]
+
+    def test_cloud_store_catalog_is_checked_once_per_session(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "stores.db")
+            store_id = db.add_store(
+                "已登录店铺",
+                "wx-logged",
+                "secret",
+            )
+            db.update_web_status(store_id, "已登录", "ok")
+            pull = mock.Mock(
+                return_value={"created": 0, "updated": 0, "logins": 0}
+            )
+
+            class AccountSync:
+                pass
+
+            AccountSync.pull = staticmethod(pull)
+
+            class FakeWindow:
+                account_store_sync = AccountSync()
+
+                @staticmethod
+                def set_status(*_args, **_kwargs):
+                    return None
+
+                @staticmethod
+                def _post(callback, *args):
+                    callback(*args)
+
+                @staticmethod
+                def store_data_changed():
+                    return None
+
+                @staticmethod
+                def run_task(work, done, _error, **kwargs):
+                    done(work(None))
+                    return True
+
+            page = object.__new__(StorePage)
+            page.db = db
+            page.window = FakeWindow()
+            page.window.web_session = SimpleNamespace(
+                probe=lambda _store: ("已登录", "ok")
+            )
+            page.window.service = SimpleNamespace(
+                refresh_store_metrics=lambda _store: {}
+            )
+            page._selected_stores = lambda: []
+            page.refresh = lambda: None
+            page.invalidate_metrics_cache = lambda: None
+            page._cancel_incremental_refresh = lambda: None
+
+            page._refresh_store_data()
+            page._refresh_store_data()
+
+        pull.assert_called_once_with()
 
     def test_empty_store_view_reloads_database_from_disk(self) -> None:
         expected = [
@@ -555,9 +772,21 @@ class StorePageContractTests(unittest.TestCase):
 
     def test_store_metric_refresh_runs_stores_concurrently(self) -> None:
         stores = [
-            SimpleNamespace(id=1, name="店铺一"),
-            SimpleNamespace(id=2, name="店铺二"),
-            SimpleNamespace(id=3, name="店铺三"),
+            SimpleNamespace(
+                id=1,
+                name="店铺一",
+                web_status="已登录",
+            ),
+            SimpleNamespace(
+                id=2,
+                name="店铺二",
+                web_status="已登录",
+            ),
+            SimpleNamespace(
+                id=3,
+                name="店铺三",
+                web_status="已登录",
+            ),
         ]
         state = {
             "active": 0,
@@ -615,6 +844,7 @@ class StorePageContractTests(unittest.TestCase):
                 return True
 
         page = object.__new__(StorePage)
+        page.db = SimpleNamespace(list_stores=lambda: stores)
         page.window = FakeWindow()
         page._refresh_store_data(stores)
         self.assertGreaterEqual(state["max_active"], 2)

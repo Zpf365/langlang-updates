@@ -55,8 +55,18 @@ def test_explicit_violation_filter_keeps_actionable_titles() -> None:
 def _daily_window() -> tuple[MainWindow, SimpleNamespace]:
     page = object.__new__(MainWindow)
     stores = [
-        SimpleNamespace(id=1, name="店铺一", app_id="wx-one"),
-        SimpleNamespace(id=2, name="店铺二", app_id="wx-two"),
+        SimpleNamespace(
+            id=1,
+            name="店铺一",
+            app_id="wx-one",
+            web_status="已登录",
+        ),
+        SimpleNamespace(
+            id=2,
+            name="店铺二",
+            app_id="wx-two",
+            web_status="已登录",
+        ),
     ]
     settings: dict[str, str] = {}
     synced: list[int] = []
@@ -111,7 +121,7 @@ def _daily_window() -> tuple[MainWindow, SimpleNamespace]:
     )
 
 
-def test_daily_sync_waits_until_idle_and_runs_all_stores() -> None:
+def test_daily_sync_waits_until_idle_and_runs_all_logged_in_stores() -> None:
     page, state = _daily_window()
     page._task_running = True
     page._violation_daily_tick()

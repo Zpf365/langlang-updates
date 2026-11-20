@@ -30,6 +30,7 @@ from ..db import Database
 from ..diagnostics import DiagnosticManager
 from ..dongxiao.application.runtime import DongxiaoRuntime
 from ..service import SyncService
+from ..store_scope import logged_in_stores
 from ..tester_channel import load_tester_channel
 from ..updater import (
     DEFAULT_UPDATE_SOURCE,
@@ -1920,7 +1921,7 @@ class MainWindow(tk.Tk):
             self._auto_refresh_running = True
             self._auto_tick_count += 1
             tick = self._auto_tick_count
-            stores = self.db.list_stores()
+            stores = logged_in_stores(self.db.list_stores())
             if stores:
                 try:
                     cursor = int(
@@ -2046,7 +2047,7 @@ class MainWindow(tk.Tk):
             return
         if self._account_sync_running or self._auto_refresh_running:
             return
-        stores = self.db.list_stores()
+        stores = logged_in_stores(self.db.list_stores())
         if not stores:
             return
         today = date.today().isoformat()

@@ -17,6 +17,7 @@ from ..account_store_sync import (
 )
 from ..db import Database
 from ..models import Store
+from ..store_scope import logged_in_stores
 from .dialogs import CookieImportDialog, StoreDialog
 from .theme import MUTED, PANEL, TEXT, button
 
@@ -1257,38 +1258,76 @@ class StorePage(ttk.Frame):
     ) -> None:
         if not self._has_permission("stores_view"):
             return
-        stores = stores or self._selected_stores() or self.db.list_stores()
+        selected = (
+            list(stores)
+            if stores is not None
+            else self._selected_stores()
+        )
         account_sync = getattr(self.window, "account_store_sync", None)
-        if not stores and account_sync is None:
+        if not selected and account_sync is None and not self.db.list_stores():
             messagebox.showinfo("没有店铺", "请先添加店铺。", parent=self)
             return
         self.window.set_status(
-            "正在联网同步账户店铺并刷新数据…",
+            "正在检查已登录店铺并刷新数据…",
             busy=True,
         )
 
-        def work(progress) -> tuple[list[str], dict[str, int], int]:
+        def work(progress) -> tuple[list[str], dict[str, int], int, int, int]:
             errors: list[str] = []
             sync_result = {"created": 0, "updated": 0, "logins": 0}
-            if account_sync is not None:
+            catalog_checked = bool(
+                getattr(
+                    self.window,
+                    "_store_catalog_checked_in_session",
+                    False,
+                )
+            )
+            if account_sync is not None and not catalog_checked:
                 try:
                     sync_result = account_sync.pull()
                 except Exception as exc:
                     errors.append(f"云端店铺同步失败：{exc}")
+                else:
+                    self.window._store_catalog_checked_in_session = True
                 latest_stores = self.db.list_stores()
             else:
-                latest_stores = stores
+                latest_stores = self.db.list_stores()
             if not latest_stores:
-                return errors, sync_result, 0
+                return errors, sync_result, 0, 0, 0
+            if selected:
+                selected_ids = {
+                    int(store.id) for store in selected
+                }
+                selected_app_ids = {
+                    str(getattr(store, "app_id", "") or "")
+                    for store in selected
+                } - {""}
+                candidates = [
+                    store
+                    for store in latest_stores
+                    if (
+                        store.id in selected_ids
+                        or str(
+                            getattr(store, "app_id", "") or ""
+                        ) in selected_app_ids
+                    )
+                ]
+            else:
+                candidates = latest_stores
+            eligible = logged_in_stores(candidates)
+            skipped = max(0, len(candidates) - len(eligible))
 
             def refresh_one(store: Store) -> tuple[str, list[str]]:
                 store_errors: list[str] = []
                 try:
-                    self.window.web_session.probe(store)
+                    status, _detail = self.window.web_session.probe(store)
                 except Exception as exc:
                     store_errors.append(
                         f"{store.name}: 登录状态检测失败：{exc}"
                     )
+                    return store.name, store_errors
+                if status != "已登录":
+                    return store.name, store_errors
                 try:
                     self.window.service.refresh_store_metrics(store)
                 except Exception as exc:
@@ -1305,16 +1344,16 @@ class StorePage(ttk.Frame):
             except ValueError:
                 configured = 6
             workers = min(8, max(1, configured, 1))
-            workers = min(workers, len(latest_stores))
+            workers = max(1, min(workers, len(eligible)))
             completed = 0
-            total = len(latest_stores)
+            total = len(eligible)
             with ThreadPoolExecutor(
                 max_workers=workers,
                 thread_name_prefix="store-refresh",
             ) as executor:
                 futures = {
                     executor.submit(refresh_one, store): store
-                    for store in latest_stores
+                    for store in eligible
                 }
                 for future in as_completed(futures):
                     store = futures[future]
@@ -1333,18 +1372,35 @@ class StorePage(ttk.Frame):
                             completed,
                             total,
                         )
-            return errors, sync_result, total
+            return (
+                errors,
+                sync_result,
+                total,
+                skipped,
+                len(latest_stores),
+            )
 
-        def done(result: tuple[list[str], dict[str, int], int]) -> None:
-            errors, sync_result, refreshed_total = result
+        def done(
+            result: tuple[list[str], dict[str, int], int, int, int],
+        ) -> None:
+            (
+                errors,
+                sync_result,
+                refreshed_total,
+                skipped_total,
+                registered_total,
+            ) = result
             failed_names = {
                 error.split(":", 1)[0]
                 for error in errors
             }
             self.window.set_status(
-                "账户店铺已联网同步并刷新："
+                "账户店铺检查完成："
                 f"新增 {sync_result.get('created', 0)} 家，"
                 f"恢复登录 {sync_result.get('logins', 0)} 家，"
+                f"已登记 {registered_total} 家，"
+                f"仅刷新已登录 {refreshed_total} 家，"
+                f"跳过非登录状态 {skipped_total} 家，"
                 f"刷新成功 "
                 f"{max(0, refreshed_total - len(failed_names))} 家"
                 + (
