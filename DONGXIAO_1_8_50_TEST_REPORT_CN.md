@@ -11,7 +11,7 @@
 ## 全量测试
 
 ```text
-670 passed, 6 skipped, 1 warning, 18 subtests passed
+672 passed, 7 skipped, 1 warning, 18 subtests passed
 ```
 
 原始输出：
@@ -42,10 +42,19 @@
 
 ## 跳过项
 
-- 1 项 Tcl 独立进程初始化：`invalid command name "tcl_findLibrary"`。
+- 2 项 Tcl/Tk 独立进程初始化路径缺失。
 - 5 项发行安全基线不包含测试凭据。
 
 本次新增功能的专项测试没有被跳过。
+
+上传解析专项：
+
+```text
+60 passed, 1 skipped, 6 subtests passed
+```
+
+新增覆盖淘宝缺类目自动匹配、官方类目树路径、已有 `cats_v2`
+直接通过及原始 `cats/category_path` 失败复现。
 
 ## 警告
 

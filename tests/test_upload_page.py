@@ -1194,6 +1194,123 @@ class UploadPageContractTests(unittest.TestCase):
         )
         self.assertEqual(result["skus"][0]["stock_num"], 30)
 
+    def test_taobao_missing_category_requests_automatic_official_match(
+        self,
+    ) -> None:
+        payload = {
+            "productId": "TAOBAO-SHOE-CATEGORY",
+            "productName": "秋冬加绒保暖棉鞋女鞋",
+            "price": "39.90",
+            "itemImgs": ["https://example.test/shoe.jpg"],
+            "skus": [
+                {"skuId": "S1", "price": "3990", "quantity": 21}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "taobao-shoe-category.txt"
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            rows = UploadPage._parse_package(None, path)
+        page = object.__new__(UploadPage)
+
+        result = page._upload_payload(
+            rows[0],
+            {"stock": 30, "price_multiplier": 1, "price_offset": 0},
+        )
+
+        self.assertTrue(result["_auto_category_required"])
+        self.assertEqual(result["title"], "秋冬加绒保暖棉鞋女鞋")
+
+    def test_existing_cats_v2_satisfies_category_requirement(self) -> None:
+        page = object.__new__(UploadPage)
+
+        result = page._upload_payload(
+            {
+                "title": "已有微信类目商品",
+                "price": 3990,
+                "stock": 10,
+                "payload": {
+                    "title": "已有微信类目商品",
+                    "head_imgs": ["https://example.test/item.jpg"],
+                    "cats_v2": [
+                        {"cat_id": "10000173"},
+                        {"cat_id": "10000175"},
+                        {"cat_id": "10000673"},
+                        {"cat_id": "547711"},
+                    ],
+                    "skus": [
+                        {"sale_price": 3990, "stock_num": 10}
+                    ],
+                },
+            },
+            {"stock": 10, "price_multiplier": 1, "price_offset": 0},
+        )
+
+        self.assertNotIn("_auto_category_required", result)
+        self.assertEqual(
+            result["cats_v2"][-1]["cat_id"],
+            "547711",
+        )
+
+    def test_taobao_missing_category_matches_official_category_tree(
+        self,
+    ) -> None:
+        page = object.__new__(UploadPage)
+        page.db = object()
+        page._category_catalog_cache = {}
+        catalog = [
+            {
+                "category_id": "547711",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": [
+                    "10000173",
+                    "10000175",
+                    "10000673",
+                    "547711",
+                ],
+            }
+        ]
+        store = SimpleNamespace(id=7, name="测试店铺")
+        payload = page._upload_payload(
+            {
+                "title": "秋冬加绒保暖棉鞋女鞋",
+                "price": 3990,
+                "stock": 21,
+                "payload": {
+                    "title": "秋冬加绒保暖棉鞋女鞋",
+                    "head_imgs": ["https://example.test/shoe.jpg"],
+                    "skus": [
+                        {"sale_price": 3990, "stock_num": 21}
+                    ],
+                },
+            },
+            {"stock": 21, "price_multiplier": 1, "price_offset": 0},
+        )
+        payload.pop("_auto_category_required", None)
+        with patch(
+            "weimi_manager.ui.upload_page.ShopPrivateClient",
+            return_value=SimpleNamespace(
+                category_catalog=lambda: catalog
+            ),
+        ):
+            result = page._auto_match_category(
+                store,
+                payload,
+                {},
+            )
+
+        self.assertEqual(
+            result["cats_v2"][-1]["cat_id"],
+            "547711",
+        )
+        self.assertEqual(
+            result["category_path"],
+            "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+        )
+
     def test_explicit_all_zero_sku_stock_remains_known_zero(self) -> None:
         payload = {
             "productId": "TAOBAO-ZERO",

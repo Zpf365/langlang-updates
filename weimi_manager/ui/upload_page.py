@@ -6212,6 +6212,7 @@ class UploadPage(ttk.Frame):
 
         if (
             not payload.get("cats")
+            and not payload.get("cats_v2")
             and not payload.get("category_path")
             and str(template.get("fallback_category") or "").strip()
         ):
@@ -6276,16 +6277,9 @@ class UploadPage(ttk.Frame):
             payload.pop("detail_images_after_skip", None)
         required = ("head_imgs", "skus")
         missing = [key for key in required if not payload.get(key)]
-        if (
-            not payload.get("cats")
-            and not payload.get("category_path")
-            and payload.get("platform") != "1688"
-        ):
-            missing.append("cats/category_path")
-        if (
-            not payload.get("cats")
-            and not payload.get("category_path")
-            and payload.get("platform") == "1688"
+        if not any(
+            payload.get(key)
+            for key in ("cats", "cats_v2", "category_path")
         ):
             payload["_auto_category_required"] = True
         if missing:
