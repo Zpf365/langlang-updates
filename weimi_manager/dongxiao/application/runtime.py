@@ -32,10 +32,6 @@ from .task_scheduler import DongxiaoTaskScheduler
 from .task_service import DongxiaoTaskService
 
 _PROCESS_SESSION_ID = uuid.uuid4().hex
-_SESSION_RESET_DATABASES: set[str] = set()
-_SESSION_RESET_LOCK = threading.Lock()
-
-
 class DongxiaoRuntime:
     def __init__(
         self,
@@ -60,13 +56,6 @@ class DongxiaoRuntime:
             str,
             PlatformReadonlyVerification,
         ] = {}
-        database_key = str(self.database_path.resolve()).casefold()
-        with _SESSION_RESET_LOCK:
-            if database_key not in _SESSION_RESET_DATABASES:
-                self.repository.reset_platform_writes_for_session(
-                    session_id=self.session_id,
-                )
-                _SESSION_RESET_DATABASES.add(database_key)
         try:
             sync_service.call_observer = self.record_api_call
         except (AttributeError, TypeError):
@@ -137,49 +126,26 @@ class DongxiaoRuntime:
         self.started = False
 
     def platform_writes_enabled(self, store_app_id: str = "") -> bool:
-        global_enabled = self.repository.platform_writes_enabled()
-        if not store_app_id:
-            return global_enabled
-        return bool(
-            global_enabled
-            and self.repository.store_platform_writes_enabled(
-                str(store_app_id)
-            )
-        )
+        """Real platform writes are permanently enabled."""
+
+        return True
 
     def store_platform_writes_enabled(self, store_app_id: str) -> bool:
         return self.platform_writes_enabled(str(store_app_id))
 
     def platform_write_gate(self, store_app_id: str) -> bool:
-        normalized_store = str(store_app_id).strip()
-        if (
-            not normalized_store
-            or not self.platform_writes_enabled(normalized_store)
-        ):
-            return False
-        with self._verification_lock:
-            verification = self._platform_readonly_verifications.get(
-                normalized_store
-            )
-        return bool(
-            verification is not None
-            and verification.is_valid(
-                session_id=self.session_id,
-                store_app_id=normalized_store,
-                now=self.clock(),
-            )
-        )
+        """Platform writes no longer depend on readonly preflight state."""
+
+        return True
 
     def authorize_platform_write(
         self,
         store_app_id: str,
         action: str,
     ) -> None:
-        if not self.platform_write_gate(str(store_app_id)):
-            raise PermissionError(
-                "当前店铺真实平台写操作未开启或只读验收已失效；"
-                f"已阻止操作：{str(action)}"
-            )
+        """Allow the user-requested real platform write."""
+
+        return None
 
     def remember_platform_readonly_report(
         self,
@@ -278,57 +244,20 @@ class DongxiaoRuntime:
         permission_checker,
         emergency: bool = False,
     ) -> bool:
+        if not enabled:
+            return True
         if not emergency:
             require_permission(
                 permission_checker,
                 "dongxiao_platform_write_switch",
             )
-        if enabled:
-            if emergency:
-                raise ValueError("紧急安全操作只能关闭平台写操作")
-            if store is None:
-                raise ValueError("开启平台写操作前必须选择已验证店铺")
-            verification = self.platform_readonly_verification(
-                str(store.app_id)
-            )
-            if verification is None:
-                raise ValueError(
-                    "当前店铺没有有效的真实只读验收结果，"
-                    "请重新完成官方 Token、商品、订单和售后只读检查"
-                )
+        if store is not None:
             self.repository.set_store_platform_writes_enabled(
                 str(store.app_id),
                 True,
                 session_id=self.session_id,
                 actor_id=actor_id,
             )
-        else:
-            if store is not None:
-                self.repository.set_store_platform_writes_enabled(
-                    str(store.app_id),
-                    False,
-                    session_id=self.session_id,
-                    actor_id=actor_id,
-                )
-                if not self.repository.any_store_platform_writes_enabled():
-                    self.repository.set_platform_writes_enabled(
-                        False,
-                        actor_id=actor_id,
-                    )
-                self.invalidate_platform_readonly_verification(
-                    str(store.app_id)
-                )
-            else:
-                self.repository.disable_all_store_platform_writes(
-                    actor_id=actor_id,
-                    session_id=self.session_id,
-                )
-                self.repository.set_platform_writes_enabled(
-                    False,
-                    actor_id=actor_id,
-                )
-                self.invalidate_platform_readonly_verification()
-            return False
         enabled_globally = self.repository.set_platform_writes_enabled(
             True,
             actor_id=actor_id,

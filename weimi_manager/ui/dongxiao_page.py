@@ -351,7 +351,7 @@ class DongxiaoPage(BasePage):
         self.audit_status_var = tk.StringVar(value="审计日志尚未读取")
         self.preflight_status_var = tk.StringVar(value="实盘检查尚未运行")
         self.platform_write_status_var = tk.StringVar(
-            value="真实平台写操作：检查中"
+            value="真实平台写操作：永久开启"
         )
         self.overview_stats_vars = {
             "stores": tk.StringVar(value="—"),
@@ -483,11 +483,11 @@ class DongxiaoPage(BasePage):
         self.platform_write_button = tk.Button(
             navigation,
             textvariable=self.platform_write_status_var,
-            command=self._disable_platform_writes_now,
-            bg="#FBE9E7",
-            fg="#A33A2B",
-            activebackground="#F5D4CF",
-            activeforeground="#7C271C",
+            command=lambda: None,
+            bg="#E8F5E9",
+            fg="#166534",
+            activebackground="#DCFCE7",
+            activeforeground="#14532D",
             relief="flat",
             bd=0,
             anchor="w",
@@ -495,7 +495,7 @@ class DongxiaoPage(BasePage):
             wraplength=145,
             padx=16,
             pady=9,
-            cursor="hand2",
+            cursor="arrow",
             font=("Microsoft YaHei UI", 8, "bold"),
         )
         self.platform_write_button.pack(side="bottom", fill="x")
@@ -503,7 +503,7 @@ class DongxiaoPage(BasePage):
             navigation,
             text=(
                 "买卖双方真实数据严格隔离。\n"
-                "真实平台写操作默认关闭。"
+                "真实平台写操作永久开启。"
             ),
             bg=PANEL,
             fg=MUTED,
@@ -4218,23 +4218,6 @@ class DongxiaoPage(BasePage):
 
         actions = ttk.Frame(view, style="Panel.TFrame")
         actions.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-        self.real_ops_enable_button = button(
-            actions,
-            "开启当前店铺真实写操作",
-            self._enable_platform_writes,
-            "Primary",
-        )
-        self.real_ops_enable_button.pack(side="left", padx=(0, 6))
-        button(
-            actions,
-            "关闭当前店铺真实写操作",
-            self._disable_current_store_writes,
-        ).pack(side="left", padx=(0, 6))
-        button(
-            actions,
-            "紧急关闭全部",
-            self._disable_platform_writes_now,
-        ).pack(side="left", padx=(0, 12))
         button(
             actions,
             "进入商品管理",
@@ -4426,18 +4409,11 @@ class DongxiaoPage(BasePage):
             self._save_preflight_report,
         )
         self.preflight_report_button.pack(side="left", padx=(0, 6))
-        self.enable_platform_write_button = button(
-            actions,
-            "开启当前店铺真实写操作",
-            self._enable_platform_writes,
-        )
-        self.enable_platform_write_button.pack(side="left")
-
         ttk.Label(
             view,
             text=(
                 "真实只读检查只会在本次点击、二次确认并具备权限后执行；"
-                "不会同意售后、拒绝售后、退款或修改平台数据。"
+                "它仅用于诊断，不再阻止真实平台写操作。"
             ),
             style="Subtitle.TLabel",
             wraplength=900,
@@ -6849,196 +6825,10 @@ class DongxiaoPage(BasePage):
         )
         self.window.set_status("动销实盘前验收报告已保存", busy=False)
 
-    def _disable_platform_writes_now(self) -> None:
-        if not getattr(self, "preflight_service", None):
-            return
-        self.platform_write_status_var.set("真实平台写操作：正在关闭")
-        runtime = self.runtime
-        if runtime is None:
-            ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
-            runtime = ensure() if callable(ensure) else None
-        if runtime is None:
-            self.platform_write_status_var.set("真实平台写操作：关闭失败")
-            messagebox.showerror(
-                "真实平台写操作",
-                "动销 Runtime 未初始化，无法更新总开关。",
-                parent=self,
-            )
-            return
-        self.window.run_task(
-            lambda _progress: runtime.set_platform_writes_enabled(
-                False,
-                actor_id=self._actor_id(),
-                permission_checker=self._permission_checker,
-                emergency=True,
-            ),
-            lambda _result: self._platform_gate_completed(False),
-            self._platform_gate_failed,
-            log_title="紧急关闭动销真实平台写操作",
-            task_scope="dongxiao:platform-write-disable",
-        )
-
-    def _disable_current_store_writes(self) -> None:
-        store = self._current_store()
-        if store is None:
-            messagebox.showwarning(
-                "真实平台写操作",
-                "请先选择店铺。",
-                parent=self,
-            )
-            return
-        runtime = self.runtime
-        if runtime is None:
-            ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
-            runtime = ensure() if callable(ensure) else None
-        if runtime is None:
-            messagebox.showerror(
-                "真实平台写操作",
-                "动销 Runtime 未初始化。",
-                parent=self,
-            )
-            return
-        self.window.run_task(
-            lambda _progress: runtime.set_platform_writes_enabled(
-                False,
-                store=store,
-                actor_id=self._actor_id(),
-                permission_checker=self._permission_checker,
-            ),
-            lambda _result: self._platform_gate_completed(False),
-            self._platform_gate_failed,
-            log_title="关闭当前店铺真实平台写操作",
-            task_scope=f"dongxiao:store-write-disable:{store.id}",
-            store_app_id=str(store.app_id),
-        )
-
-    def _enable_platform_writes(self) -> None:
-        store = self._current_store()
-        if store is None:
-            messagebox.showwarning(
-                "真实平台写操作",
-                "请先选择并完成当前店铺的真实只读验收。",
-                parent=self,
-            )
-            return
-        if not self._permission_checker(
-            "dongxiao_platform_write_switch"
-        ):
-            messagebox.showwarning(
-                "平台写操作",
-                "当前账号没有修改真实平台写操作开关的权限。",
-                parent=self,
-            )
-            return
-        first = messagebox.askyesno(
-                "开启真实平台写操作",
-            (
-                "开启后只允许创建“已经完成人工审批”的平台写任务，"
-                "不会自动同意、拒绝或退款。\n"
-                "当前店铺必须在最近 10 分钟内完成官方 Token、"
-                "商品、订单和售后只读验收。\n\n"
-                "是否进入准备状态？"
-            ),
-            parent=self,
-        )
-        if not first:
-            return
-        second = messagebox.askyesno(
-            "二次确认",
-            (
-                "确认开启当前会话的平台写操作？"
-                "店铺切换或验收过期后会立即阻止写任务。"
-            ),
-            parent=self,
-        )
-        if not second:
-            return
-        runtime = self.runtime
-        if runtime is None:
-            ensure = getattr(self.window, "ensure_dongxiao_runtime", None)
-            runtime = ensure() if callable(ensure) else None
-        if runtime is None:
-            messagebox.showerror(
-                "真实平台写操作",
-                "动销 Runtime 未初始化，禁止开启平台写操作。",
-                parent=self,
-            )
-            return
-        self.window.run_task(
-            lambda _progress: runtime.set_platform_writes_enabled(
-                True,
-                store=store,
-                actor_id=self._actor_id(),
-                permission_checker=self._permission_checker,
-            ),
-            lambda _result: self._platform_gate_completed(True),
-            self._platform_gate_failed,
-            log_title="开启动销平台写操作",
-            task_scope="dongxiao:platform-write-enable",
-        )
-
-    def _platform_gate_completed(self, enabled: bool) -> None:
-        self.platform_write_status_var.set(
-            "真实平台写操作：已开启（需逐单人工确认）"
-            if enabled
-            else "真实平台写操作：已关闭"
-        )
-        self.window.set_status(
-            "动销真实平台写操作已开启"
-            if enabled
-            else "已紧急关闭所有店铺的真实平台写操作",
-            busy=False,
-        )
-
-    def _platform_gate_failed(self, error: str) -> None:
-        self.platform_write_status_var.set("真实平台写操作：状态更新失败")
-        messagebox.showerror(
-            "真实平台写操作",
-            error,
-            parent=self,
-        )
-
     def _update_platform_write_status(self) -> None:
-        runtime = self.runtime
-        if runtime is None:
-            self.platform_write_status_var.set(
-                "真实平台写操作：已关闭"
-            )
-            return
-        try:
-            store = self._current_store()
-            emergency_enabled = runtime.platform_writes_enabled()
-            enabled = (
-                runtime.store_platform_writes_enabled(str(store.app_id))
-                if store is not None
-                else emergency_enabled
-            )
-            verification = (
-                runtime.platform_readonly_verification(str(store.app_id))
-                if store is not None and enabled
-                else None
-            )
-        except Exception:
-            self.platform_write_status_var.set(
-                "真实平台写操作：状态读取失败"
-            )
-            return
-        if enabled and verification is not None:
-            self.platform_write_status_var.set(
-                "真实平台写操作：已开启（当前店铺验收有效）"
-            )
-        elif enabled:
-            self.platform_write_status_var.set(
-                "真实平台写操作：已开启但当前店铺验收失效，任务将被阻止"
-            )
-        elif emergency_enabled and store is None:
-            self.platform_write_status_var.set(
-                "真实平台写操作：其他店铺已开启；选择店铺查看"
-            )
-        else:
-            self.platform_write_status_var.set(
-                "真实平台写操作：已关闭"
-            )
+        self.platform_write_status_var.set(
+            "真实平台写操作：永久开启"
+        )
 
     def _load_api_calls(self) -> None:
         store = self._current_store()

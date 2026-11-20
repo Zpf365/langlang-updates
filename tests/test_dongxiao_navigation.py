@@ -125,6 +125,12 @@ def test_formal_sales_related_route_opens_dongxiao_center(
         assert page.official_product_button.cget("text") == "打开官方商品链接"
         assert page.buyer_task_events_button.cget("text") == "任务事件日志"
         assert page.buyer_revalidate_button.cget("text") == "重新核验价格库存"
+        assert (
+            page.platform_write_status_var.get()
+            == "真实平台写操作：永久开启"
+        )
+        assert not hasattr(page, "real_ops_enable_button")
+        assert not hasattr(page, "enable_platform_write_button")
         assert page.buyer_run_tree.winfo_exists()
         assert "order" in page.buyer_run_tree["columns"]
         assert "order_status" in page.buyer_run_tree["columns"]

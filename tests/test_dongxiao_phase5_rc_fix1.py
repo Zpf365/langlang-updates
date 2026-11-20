@@ -497,7 +497,7 @@ def test_preflight_detects_network_and_official_error_codes(
     runtime.stop()
 
 
-def test_new_process_forces_platform_writes_off_and_audits(
+def test_new_process_does_not_disable_platform_writes(
     tmp_path: Path,
 ) -> None:
     db, _store, _backup = _environment(tmp_path)
@@ -520,11 +520,24 @@ def test_new_process_forces_platform_writes_off_and_audits(
     )
 
     assert result.returncode == 0, result.stderr
-    assert repository.platform_writes_enabled() is False
+    assert repository.platform_writes_enabled() is True
     actions = [
         row["action"] for row in repository.list_audit_events()
     ]
-    assert "platform_write_startup_reset" in actions
+    assert "platform_write_startup_reset" not in actions
+
+
+def test_real_product_write_does_not_require_readonly_verification(
+    tmp_path: Path,
+) -> None:
+    db, store, _backup = _environment(tmp_path)
+    runtime = DongxiaoRuntime(db.path, _SyncService())
+
+    assert runtime.platform_writes_enabled() is True
+    assert runtime.store_platform_writes_enabled(store.app_id) is True
+    assert runtime.platform_write_gate(store.app_id) is True
+    runtime.authorize_platform_write(store.app_id, "product_write")
+    runtime.stop()
 
 
 def test_repeated_runtime_in_same_process_does_not_reset_active_session(
@@ -543,31 +556,16 @@ def test_repeated_runtime_in_same_process_does_not_reset_active_session(
     second.stop()
 
 
-def test_enable_requires_current_store_verification_and_expires_after_ten_minutes(
+def test_enable_does_not_require_readonly_verification_or_expire(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 11, 19, 1, 0, tzinfo=UTC)
     db, store, _backup = _environment(tmp_path)
-    runtime, preflight = _preflight(
+    runtime, _preflight_service = _preflight(
         db,
         _SyncService(),
         clock=lambda: now,
     )
-    report = preflight.run_platform_readonly(
-        store,
-        actor_id="tester",
-        permission_checker=lambda _permission: True,
-        authorization_text=PLATFORM_READ_AUTHORIZATION,
-    )
-    assert report.release_ready is True
-
-    with pytest.raises(PermissionError):
-        runtime.set_platform_writes_enabled(
-            True,
-            store=store,
-            actor_id="denied",
-            permission_checker=lambda _permission: False,
-        )
     assert runtime.set_platform_writes_enabled(
         True,
         store=store,
@@ -575,10 +573,6 @@ def test_enable_requires_current_store_verification_and_expires_after_ten_minute
         permission_checker=lambda _permission: True,
     )
     assert runtime.platform_write_gate(store.app_id) is True
-    assert (
-        preflight._write_guard_check(store.app_id).state
-        is PreflightState.PASSED
-    )
     other_store_id = db.add_store(
         "Phase5 Fix1 其他店铺",
         "wx-phase5-fix1-other",
@@ -586,33 +580,12 @@ def test_enable_requires_current_store_verification_and_expires_after_ten_minute
     )
     other_store = db.get_store(other_store_id)
     assert other_store is not None
-    assert runtime.platform_write_gate(other_store.app_id) is False
+    assert runtime.platform_write_gate(other_store.app_id) is True
     runtime.invalidate_platform_readonly_verification()
-    assert runtime.platform_write_gate(store.app_id) is False
-
-    runtime.set_platform_writes_enabled(
-        False,
-        actor_id="owner",
-        permission_checker=lambda _permission: False,
-        emergency=True,
-    )
-    report = preflight.run_platform_readonly(
-        store,
-        actor_id="tester",
-        permission_checker=lambda _permission: True,
-        authorization_text=PLATFORM_READ_AUTHORIZATION,
-    )
-    assert report.release_ready is True
-    runtime.set_platform_writes_enabled(
-        True,
-        store=store,
-        actor_id="owner",
-        permission_checker=lambda _permission: True,
-    )
     assert runtime.platform_write_gate(store.app_id) is True
     now = now + timedelta(seconds=601)
     runtime.clock = lambda: now
-    assert runtime.platform_write_gate(store.app_id) is False
+    assert runtime.platform_write_gate(store.app_id) is True
     runtime.stop()
 
 
@@ -639,7 +612,7 @@ def _passing_report(store, now: datetime) -> PreflightReport:
     )
 
 
-def test_store_write_switches_are_independent_and_emergency_close_clears_all(
+def test_store_write_permission_is_permanently_enabled(
     tmp_path: Path,
 ) -> None:
     now = datetime(2026, 11, 19, 2, 0, tzinfo=UTC)
@@ -656,25 +629,6 @@ def test_store_write_switches_are_independent_and_emergency_close_clears_all(
         _SyncService(),
         clock=lambda: now,
     )
-    runtime.remember_platform_readonly_report(
-        _passing_report(first_store, now)
-    )
-    runtime.set_platform_writes_enabled(
-        True,
-        store=first_store,
-        actor_id="owner",
-        permission_checker=lambda _permission: True,
-    )
-    runtime.remember_platform_readonly_report(
-        _passing_report(second_store, now)
-    )
-    runtime.set_platform_writes_enabled(
-        True,
-        store=second_store,
-        actor_id="owner",
-        permission_checker=lambda _permission: True,
-    )
-
     assert runtime.store_platform_writes_enabled(first_store.app_id) is True
     assert runtime.store_platform_writes_enabled(second_store.app_id) is True
     runtime.set_platform_writes_enabled(
@@ -683,19 +637,19 @@ def test_store_write_switches_are_independent_and_emergency_close_clears_all(
         actor_id="owner",
         permission_checker=lambda _permission: True,
     )
-    assert runtime.store_platform_writes_enabled(first_store.app_id) is False
+    assert runtime.store_platform_writes_enabled(first_store.app_id) is True
     assert runtime.store_platform_writes_enabled(second_store.app_id) is True
     runtime.set_platform_writes_enabled(
         False,
         actor_id="owner",
         permission_checker=lambda _permission: True,
     )
-    assert runtime.store_platform_writes_enabled(first_store.app_id) is False
-    assert runtime.store_platform_writes_enabled(second_store.app_id) is False
+    assert runtime.store_platform_writes_enabled(first_store.app_id) is True
+    assert runtime.store_platform_writes_enabled(second_store.app_id) is True
     runtime.stop()
 
 
-def test_new_process_resets_all_per_store_write_switches(
+def test_new_process_keeps_real_write_switches_enabled(
     tmp_path: Path,
 ) -> None:
     db, store, _backup = _environment(tmp_path)
@@ -725,8 +679,8 @@ def test_new_process_resets_all_per_store_write_switches(
     )
 
     assert result.returncode == 0, result.stderr
-    assert repository.store_platform_writes_enabled(store.app_id) is False
-    assert repository.platform_writes_enabled() is False
+    assert repository.store_platform_writes_enabled(store.app_id) is True
+    assert repository.platform_writes_enabled() is True
 
 
 def test_official_client_and_sync_service_block_writes_before_network(

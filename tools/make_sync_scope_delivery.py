@@ -24,15 +24,21 @@ from weimi_manager.dongxiao.infrastructure.migrations import _migration_v10_sql
 VERSION = __version__
 RELEASE_TOKEN = VERSION.replace(".", "_")
 DELIVERY_ROOT = ROOT / "deliveries" / VERSION
-OUTPUT = DELIVERY_ROOT / f"LangLang_{VERSION}_SyncScope_Fix.zip"
+OUTPUT = DELIVERY_ROOT / f"LangLang_{VERSION}_Delivery.zip"
 WINDOWS_PROGRAM = ROOT / "release" / f"LangLang_{VERSION}_Windows_x64"
 SOURCE_ZIP = ROOT / "release" / f"LangLang_{VERSION}_Source.zip"
 ARTIFACTS = ROOT / "artifacts" / f"release_{RELEASE_TOKEN}"
+REPORT_NAMES = {
+    "1.8.53": "DONGXIAO_1_8_53_SYNC_SCOPE_CN.md",
+    "1.8.54": "DONGXIAO_1_8_54_REAL_WRITE_CN.md",
+}
+if VERSION not in REPORT_NAMES:
+    raise RuntimeError(f"Unsupported delivery version: {VERSION}")
 DOCUMENTS = (
-    "RELEASE_NOTES_1.8.53.md",
-    "DONGXIAO_1_8_53_SYNC_SCOPE_CN.md",
-    "DONGXIAO_1_8_53_TEST_REPORT_CN.md",
-    "DONGXIAO_1_8_53_DATABASE_MIGRATION_CN.md",
+    f"RELEASE_NOTES_{VERSION}.md",
+    REPORT_NAMES[VERSION],
+    f"DONGXIAO_{RELEASE_TOKEN}_TEST_REPORT_CN.md",
+    f"DONGXIAO_{RELEASE_TOKEN}_DATABASE_MIGRATION_CN.md",
     "FEATURE_REGRESSION_CHECKLIST_CN.md",
 )
 ARTIFACT_FILES = (
@@ -87,7 +93,7 @@ def main() -> int:
         prefix=f"langlang-{VERSION}-delivery-",
         dir=ROOT / "artifacts",
     ) as temporary:
-        stage = Path(temporary) / f"LangLang_{VERSION}_SyncScope_Fix"
+        stage = Path(temporary) / f"LangLang_{VERSION}_Delivery"
         stage.mkdir()
         with zipfile.ZipFile(SOURCE_ZIP) as archive:
             archive.extractall(stage / "01_完整源码")
@@ -120,13 +126,18 @@ def main() -> int:
             git_info(),
             encoding="utf-8",
         )
+        delivery_focus = (
+            "真实平台写操作恢复"
+            if VERSION == "1.8.54"
+            else "店铺刷新范围修复"
+        )
         (stage / "README_交付说明_CN.md").write_text(
-            f"""# 澜琅 {VERSION} 店铺刷新范围修复
+            f"""# 澜琅 {VERSION} {delivery_focus}
 
 启动：双击 `02_Windows程序/LangLang/LangLang.exe`。
 
-本版本仍显示全部已登记店铺，但联网刷新只处理“已登录”店铺。
-未登录店铺不会进入登录检测、经营数据、自动轮询或每日后台同步队列。
+真实平台写操作永久开启，不再依赖只读验收或启动重置。
+保留金额核验、逐单人工确认、UNKNOWN 防重放和审计日志。
 
 本包不包含真实数据库或凭据，未部署远程发布，不覆盖已有交付包。
 """,

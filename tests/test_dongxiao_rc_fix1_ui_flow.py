@@ -62,7 +62,11 @@ def test_source_tk_flow_switches_all_dongxiao_pages_and_restarts(
         reopened = second.sales_related_page
         assert isinstance(reopened, DongxiaoPage)
         assert reopened.runtime is not None
-        assert reopened.runtime.platform_writes_enabled() is False
+        assert reopened.runtime.platform_writes_enabled() is True
+        assert (
+            reopened.platform_write_status_var.get()
+            == "真实平台写操作：永久开启"
+        )
     finally:
         if second.dongxiao_runtime is not None:
             second.dongxiao_runtime.stop()

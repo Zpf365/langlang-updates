@@ -1,5 +1,5 @@
 """Weimi Manager desktop application."""
 
-__version__ = "1.8.53"
-__display_version__ = "重构1.8.53"
+__version__ = "1.8.54"
+__display_version__ = "重构1.8.54"
 
