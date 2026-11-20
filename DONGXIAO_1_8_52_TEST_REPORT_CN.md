@@ -111,3 +111,23 @@ compileall OK
 - 真实退款或售后同意/拒绝。
 
 这些步骤必须由用户本人在官方客户端完成，不标记为自动测试通过。
+
+## Windows 候选 EXE
+
+- 构建来源提交：`c9605e61b2963fc093c290474917f4951c1fbec4`。
+- 构建目录：`dist\LangLang`。
+- 发行目录：`release\LangLang_1.8.52_Windows_x64`。
+- EXE：`release\LangLang_1.8.52_Windows_x64\LangLang.exe`。
+- 登录窗口实际标题：`澜琅 · 登录 重构1.8.52`。
+- 从 `dist` 启动、正常关闭通过。
+- 从 `release` 最终发行目录启动、正常关闭通过。
+- 两次关闭后对应窗口数量均为 0。
+
+PyInstaller 构建日志中的两个提示不影响本版本运行：
+
+- `onnxruntime.quantization` 缺少可选 `onnx` 包；RapidOCR 推理主路径不依赖它。
+- `nvcuda.dll` 不存在；本项目使用 CPU OCR，不使用 CUDA 运行时。
+
+登录、扫码和真实账号交易没有在 EXE 中自动执行，因为 Windows 自动化规范
+禁止代替用户操作认证界面。登录后的主工作台和动销买家账号页已通过隔离
+`MainWindow` UI 验收。
