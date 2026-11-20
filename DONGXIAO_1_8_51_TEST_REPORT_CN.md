@@ -10,12 +10,12 @@
 ## 全量回归
 
 ```text
-683 passed, 6 skipped, 1 warning, 18 subtests passed
+682 passed, 7 skipped, 1 warning, 18 subtests passed
 ```
 
 原始日志：
 
-- `artifacts/release_1_8_51/pytest-full.log`
+- `artifacts/release_1_8_51/pytest-full-final.log`
 
 ## 重点专项
 
@@ -37,7 +37,7 @@
 
 ## 跳过项
 
-- 1 项为当前测试进程的 Tcl/Tk 初始化路径缺失。
+- 2 项为当前测试进程的 Tcl/Tk 初始化路径缺失。
 - 5 项为发行安全基线不包含测试凭据。
 
 新增功能专项测试没有被跳过。

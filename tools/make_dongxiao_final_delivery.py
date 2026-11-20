@@ -47,7 +47,7 @@ DOCUMENTS = (
     f"HANDOFF_{VERSION}.md",
 )
 TEST_ARTIFACTS = (
-    f"artifacts/release_{VERSION.replace('.', '_')}/pytest-full.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/pytest-full-final.log",
     f"artifacts/release_{VERSION.replace('.', '_')}/pyinstaller-build.log",
     f"artifacts/release_{VERSION.replace('.', '_')}/generate-release.log",
     f"artifacts/release_{VERSION.replace('.', '_')}/make-final-delivery.log",
