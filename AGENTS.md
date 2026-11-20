@@ -25,6 +25,9 @@ These rules are mandatory for every future code change.
    processes, back up `D:\WG\LangLang`, deploy the latest build there, and
    launch it. If the build fails, keep the existing deployment intact and
    report the failure instead of claiming the change is complete.
+   `D:\WG\LangLang` is the user's personal installation, so it must be
+   updated after every accepted source change even when no GitHub Release is
+   published.
 10. Never publish a GitHub Release, push release assets, or change the hosted
     automatic-update manifest unless the user explicitly asks to publish a
     new version. Updating `D:\WG\LangLang` after a requested change is
