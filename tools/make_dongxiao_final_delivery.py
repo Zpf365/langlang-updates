@@ -32,26 +32,37 @@ SOURCE_ZIP = ROOT / "release" / f"LangLang_{VERSION}_Source.zip"
 BASELINE_SOURCE = (
     ROOT
     / "artifacts"
-    / "v1_8_51_baseline"
-    / "LangLang_1.8.50_HEAD_18aa0d1.zip"
+    / "v1_8_52_baseline"
+    / "LangLang_1.8.51_HEAD_403d705.zip"
 )
 DOCUMENTS = (
-    "DONGXIAO_1_8_51_REPORT_CN.md",
-    "DONGXIAO_1_8_51_TEST_REPORT_CN.md",
-    "DONGXIAO_1_8_51_WECHAT_COMPATIBILITY_CN.md",
-    "DONGXIAO_1_8_51_DATABASE_MIGRATION_CN.md",
-    "DONGXIAO_1_8_51_USAGE_CN.md",
-    "DONGXIAO_1_8_51_UNRESOLVED_CN.md",
+    "DONGXIAO_1_8_52_REPORT_CN.md",
+    "DONGXIAO_1_8_52_TEST_REPORT_CN.md",
+    "DONGXIAO_1_8_52_WECHAT_COMPATIBILITY_CN.md",
+    "DONGXIAO_1_8_52_DATABASE_MIGRATION_CN.md",
+    "DONGXIAO_1_8_52_USAGE_CN.md",
+    "DONGXIAO_1_8_52_UNRESOLVED_CN.md",
     "FEATURE_REGRESSION_CHECKLIST_CN.md",
     f"RELEASE_NOTES_{VERSION}.md",
     f"HANDOFF_{VERSION}.md",
 )
 TEST_ARTIFACTS = (
     f"artifacts/release_{VERSION.replace('.', '_')}/pytest-full-final.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/pytest-auth-skip-diagnostic.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/pytest-skip-diagnostic.log",
     f"artifacts/release_{VERSION.replace('.', '_')}/pyinstaller-build.log",
     f"artifacts/release_{VERSION.replace('.', '_')}/generate-release.log",
     f"artifacts/release_{VERSION.replace('.', '_')}/make-final-delivery.log",
     f"artifacts/release_{VERSION.replace('.', '_')}/wechat-probe.json",
+    f"artifacts/release_{VERSION.replace('.', '_')}/account-wizard-acceptance.log",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/account-wizard-acceptance.json",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/real-wechat-probe.json",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/wizard-real-client.png",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/wizard-account-a-bound.png",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/wizard-account-b-bound.png",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/wizard-step-a.png",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/wizard-step-b.png",
+    f"artifacts/release_{VERSION.replace('.', '_')}/ui-acceptance/wizard-after-restart.png",
 )
 
 
@@ -100,12 +111,12 @@ def write_readme(stage: Path) -> None:
 
 ## 目录
 
-- `00_基线备份/`：开工时 1.8.50 源码快照，不包含真实凭据。
+- `00_基线备份/`：开工时 1.8.51 源码快照，不包含真实凭据。
 - `01_完整源码/`：{VERSION} 完整源码。
 - `02_Windows程序/LangLang/`：完整 Windows onedir 运行目录。
 - `03_文档/`：开发、测试、兼容性、迁移和使用手册。
 - `04_测试与日志/`：全量测试、构建和实际 Windows 微信探测日志。
-- `05_数据库迁移/`：v9 迁移 SQL 和迁移说明。
+- `05_数据库迁移/`：v10 迁移 SQL 和迁移说明。
 - `06_Git信息/`：分支、提交、状态和历史。
 
 ## 启动
@@ -135,7 +146,7 @@ def main() -> int:
     if OUTPUT.exists():
         raise FileExistsError(OUTPUT)
     with tempfile.TemporaryDirectory(
-        prefix="langlang-1.8.50-delivery-",
+        prefix=f"langlang-{VERSION}-delivery-",
         dir=ROOT / "artifacts",
     ) as temporary:
         stage = Path(temporary) / f"LangLang_{VERSION}_Dongxiao_Final"

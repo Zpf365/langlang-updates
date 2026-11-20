@@ -113,6 +113,7 @@ def test_formal_sales_related_route_opens_dongxiao_center(
         assert "remark" in page.buyer_account_tree["columns"]
         assert "switch_state" in page.buyer_account_tree["columns"]
         assert "session" in page.buyer_account_tree["columns"]
+        assert page.add_buyer_account_button.cget("text") == "添加微信账号"
         assert page.wechat_client_check_button.cget("text") == "检查微信客户端"
         assert page.buyer_profile_edit_button.cget("text") == "编辑买家资料"
         assert page.buyer_identity_confirm_button.cget("text") == "人工确认身份"

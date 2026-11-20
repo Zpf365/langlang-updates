@@ -249,6 +249,123 @@ class DongxiaoBuyerFlowService:
         )
         return saved
 
+    def register_current_official_account(
+        self,
+        *,
+        display_name: str,
+        wechat_nickname: str,
+        identity_label: str,
+        remark: str = "",
+        permission_checker,
+        actor_id: str,
+    ) -> tuple[BuyerAccount, bool]:
+        require_permission(
+            permission_checker,
+            "dongxiao_buyer_account_manage",
+        )
+        clean_display = _profile_text(
+            display_name,
+            field="买家显示名",
+            limit=100,
+        )
+        nickname = _profile_text(
+            wechat_nickname,
+            field="微信昵称",
+            limit=100,
+        )
+        label = _profile_text(
+            identity_label,
+            field="身份标识",
+            limit=200,
+        )
+        clean_remark = _profile_text(
+            remark,
+            field="账号备注",
+            limit=500,
+        )
+        if not clean_display or not nickname or not label:
+            raise ValueError("显示名、微信昵称和身份标识必须填写")
+        probe = self._require_running_client()
+        session = self._client_session(probe)
+        existing = next(
+            (
+                account
+                for account in self.repository.list_accounts()
+                if account.confirmed_client_session == session
+            ),
+            None,
+        )
+        if existing is not None:
+            account = self.repository.update_account(
+                existing.buyer_account_id,
+                display_name=clean_display,
+                wechat_nickname=nickname,
+                identity_label=label,
+                remark=clean_remark,
+                switch_state=BuyerSwitchState.CONFIRMED,
+                confirmed_client_session=session,
+                last_client_check_at=probe.checked_at,
+                identity_status=BuyerIdentityStatus.USER_ASSERTED,
+                status=BuyerAccountStatus.ACTIVE,
+                last_verified_at=datetime.now(UTC),
+                status_reason=(
+                    "当前微信会话已关联已有买家账号；"
+                    "身份来源为用户人工确认。"
+                ),
+            )
+            created = False
+        else:
+            login_result = self.create_official_account(
+                display_name=clean_display,
+                wechat_nickname=nickname,
+                identity_label=label,
+                remark=clean_remark,
+                permission_checker=permission_checker,
+                actor_id=actor_id,
+            )
+            account = login_result.account
+            account = self.confirm_wechat_identity(
+                account.buyer_account_id,
+                wechat_nickname=nickname,
+                identity_label=label,
+                permission_checker=permission_checker,
+                actor_id=actor_id,
+            )
+            created = True
+        current = self.repository.current_account()
+        if current is None:
+            account = self.repository.set_current_account(
+                account.buyer_account_id,
+                actor_id=actor_id,
+                reason="添加微信账号向导设为当前买家",
+            )
+        elif current.buyer_account_id != account.buyer_account_id:
+            self.begin_account_switch(
+                account.buyer_account_id,
+                permission_checker=permission_checker,
+                actor_id=actor_id,
+            )
+            account = self.complete_account_switch(
+                account.buyer_account_id,
+                wechat_nickname=nickname,
+                identity_label=label,
+                permission_checker=permission_checker,
+                actor_id=actor_id,
+            )
+        self._audit(
+            actor_id=actor_id,
+            action="buyer_wizard_completed",
+            entity_type="buyer_account",
+            entity_id=account.buyer_account_id,
+            result="success",
+            detail={
+                "created": created,
+                "client_session": session,
+                "identity_source": "user_confirmed_windows_wechat",
+            },
+        )
+        return account, created
+
     def set_current_account(
         self,
         buyer_account_id: str,

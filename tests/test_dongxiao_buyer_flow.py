@@ -611,6 +611,44 @@ def test_cancelled_account_switch_never_marks_target_as_logged_in(
     assert repository.current_account().buyer_account_id == first.buyer_account_id
 
 
+def test_register_current_official_account_binds_probe_session(
+    tmp_path: Path,
+) -> None:
+    original_session = ReadyWechatClient.session_id
+    ReadyWechatClient.session_id = "wizard-session-a"
+    try:
+        _db, _store, _catalog_repo, repository, service = _service(tmp_path)
+
+        account, created = service.register_current_official_account(
+            display_name="UI 测试买家",
+            wechat_nickname="UI 测试微信",
+            identity_label="本地人工核对",
+            remark="隔离测试账号",
+            permission_checker=lambda _permission: True,
+            actor_id="tester",
+        )
+
+        assert created is True
+        assert account.is_current is True
+        assert account.confirmed_client_session == "wizard-session-a"
+        assert account.switch_state.value == "confirmed"
+        assert repository.current_account().buyer_account_id == account.buyer_account_id
+
+        same, created_again = service.register_current_official_account(
+            display_name="UI 测试买家更新名",
+            wechat_nickname="UI 测试微信",
+            identity_label="本地人工核对",
+            remark="同一会话复用",
+            permission_checker=lambda _permission: True,
+            actor_id="tester",
+        )
+        assert created_again is False
+        assert same.buyer_account_id == account.buyer_account_id
+        assert same.display_name == "UI 测试买家更新名"
+    finally:
+        ReadyWechatClient.session_id = original_session
+
+
 def test_unconfirmed_manual_identity_cannot_start_business_task(
     tmp_path: Path,
 ) -> None:

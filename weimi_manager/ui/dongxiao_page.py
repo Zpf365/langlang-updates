@@ -64,6 +64,7 @@ from ..dongxiao.infrastructure.platform import (
     OfficialDongxiaoPlatformAdapter,
 )
 from ..dongxiao.infrastructure.repository import DongxiaoRepository
+from .buyer_account_wizard import BuyerAccountWizard, wechat_state_label
 from .pages import BasePage
 from .theme import BLUE, BORDER, MUTED, PANEL, SOFT_TEAL, TEXT, button
 
@@ -284,6 +285,7 @@ class DongxiaoPage(BasePage):
         self._last_pairing_identity_id = ""
         self._last_assistant_task_id = ""
         self._pending_switch_target_id = ""
+        self._account_wizard: BuyerAccountWizard | None = None
         self.official_catalog_service = ProductCatalogService(
             self.repository,
             build_catalog_adapter(
@@ -1056,12 +1058,13 @@ class DongxiaoPage(BasePage):
         ).grid(row=5, column=0, sticky="w", pady=(14, 4))
         buyer_toolbar = ttk.Frame(view, style="Panel.TFrame")
         buyer_toolbar.grid(row=6, column=0, sticky="ew", pady=(0, 6))
-        button(
+        self.add_buyer_account_button = button(
             buyer_toolbar,
-            "添加真实买家账号",
+            "添加微信账号",
             self._add_official_buyer_account,
             "Primary",
-        ).pack(side="left")
+        )
+        self.add_buyer_account_button.pack(side="left")
         button(
             buyer_toolbar,
             "添加 Mock 测试账号",
@@ -1475,63 +1478,28 @@ class DongxiaoPage(BasePage):
             )
 
     def _add_official_buyer_account(self) -> None:
-        display_name = simpledialog.askstring(
-            "添加真实买家账号",
-            "请输入用于识别的买家显示名。\n"
-            "不要输入密码、Cookie、Token 或验证码：",
-            parent=self,
-        )
-        if not display_name:
+        if (
+            self._account_wizard is not None
+            and self._account_wizard.winfo_exists()
+        ):
+            self._account_wizard.lift()
+            self._account_wizard.focus_force()
             return
-        wechat_nickname = simpledialog.askstring(
-            "添加真实买家账号",
-            "微信昵称（可留空，之后人工确认）：",
-            parent=self,
-        ) or ""
-        identity_label = simpledialog.askstring(
-            "添加真实买家账号",
-            "用户确认的身份标识（可留空；不要填手机号或凭据）：",
-            parent=self,
-        ) or ""
-        remark = simpledialog.askstring(
-            "添加真实买家账号",
-            "账号备注（可留空）：",
-            parent=self,
-        ) or ""
-
-        def work(_progress):
-            return self.buyer_flow_service.create_official_account(
-                display_name=display_name,
-                wechat_nickname=wechat_nickname,
-                identity_label=identity_label,
-                remark=remark,
-                permission_checker=self._permission_checker,
-                actor_id=self._actor_id(),
-            )
-
-        def done(result) -> None:
-            self._load_buyer_accounts()
-            messagebox.showinfo(
-                "官方买家授权能力",
-                (
-                    f"账号“{result.account.display_name}”已保存为待授权记录。\n\n"
-                    f"{result.instructions or result.capability.reason}\n\n"
-                    "在官方能力未确认前，该账号不会产生真实登录或购买成功。"
-                ),
-                parent=self,
-            )
-
-        self.window.run_task(
-            work,
-            done,
-            lambda error: messagebox.showerror(
-                "添加买家账号失败",
-                error,
-                parent=self,
-            ),
-            log_title="添加官方买家账号",
-            task_scope="dongxiao:buyer-account-add",
+        self._account_wizard = BuyerAccountWizard(
+            self,
+            self.buyer_flow_service,
+            on_completed=self._buyer_wizard_completed,
         )
+
+    def _buyer_wizard_completed(self, account) -> None:
+        self.buyer_account_status_var.set(
+            f"已添加并绑定当前微信账号：{account.display_name}"
+        )
+        self.wechat_client_status_var.set(
+            f"微信会话：{account.confirmed_client_session[-28:]}；"
+            "身份来源：用户人工确认"
+        )
+        self._load_buyer_accounts()
 
     def _add_mock_buyer_account(self) -> None:
         display_name = simpledialog.askstring(
@@ -1653,17 +1621,26 @@ class DongxiaoPage(BasePage):
         )
 
     def _open_official_wechat_client(self) -> None:
-        try:
-            self.buyer_flow_service.open_official_wechat_client()
-        except Exception as exc:
+        def done(_result) -> None:
+            self.buyer_account_status_var.set(
+                "已请求打开官方微信客户端；登录、扫码和验证码均由用户本人完成。"
+            )
+
+        def failed(error) -> None:
             messagebox.showinfo(
                 "打开官方微信",
-                f"{exc}\n\n请用户本人手动打开官方微信客户端。",
+                f"{error}\n\n请用户本人手动打开官方微信客户端。",
                 parent=self,
             )
-            return
-        self.buyer_account_status_var.set(
-            "已请求打开官方微信客户端；登录、扫码和验证码均由用户本人完成。"
+
+        self.window.run_task(
+            lambda _progress: (
+                self.buyer_flow_service.open_official_wechat_client()
+            ),
+            done,
+            failed,
+            log_title="打开 Windows 官方微信客户端",
+            task_scope="dongxiao:wechat-client-open",
         )
 
     def _inspect_wechat_client(self) -> None:
@@ -1680,7 +1657,7 @@ class DongxiaoPage(BasePage):
 
         def done(probe) -> None:
             self.wechat_client_status_var.set(
-                f"微信客户端：{probe.state.value}；"
+                f"微信客户端：{wechat_state_label(probe.state)}；"
                 f"版本：{probe.client_version or '未读取'}；"
                 f"窗口：{probe.window_title or '未发现'}；"
                 f"{probe.instructions}"
@@ -1688,12 +1665,13 @@ class DongxiaoPage(BasePage):
             messagebox.showinfo(
                 "Windows 微信客户端",
                 (
-                    f"状态：{probe.state.value}\n"
+                    f"状态：{wechat_state_label(probe.state)}\n"
                     f"已安装：{'是' if probe.installed else '否'}\n"
                     f"运行中：{'是' if probe.running else '否'}\n"
                     f"客户端版本：{probe.client_version or '未读取'}\n"
                     f"运行会话：{probe.session_id or '未读取'}\n"
-                    f"可见身份：{probe.visible_identity or '未可靠识别'}\n\n"
+                    f"可见身份：{probe.visible_identity or '未可靠识别'}\n"
+                    f"技术状态：{probe.state.value}\n\n"
                     f"{probe.instructions}"
                     + (
                         f"\n\n已保存异常截图：{probe.screenshot_path}"
