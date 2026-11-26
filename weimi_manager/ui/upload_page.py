@@ -13,8 +13,8 @@ from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import TYPE_CHECKING, Any, Callable
@@ -28,6 +28,11 @@ from ..source_1688 import (
     normalized_1688_row,
     parse_1688_links,
     rank_category_candidates,
+)
+from ..upload_violations import (
+    apply_template_title_rules,
+    build_upload_violation_titles,
+    find_upload_violation_title,
 )
 from ..wechat_api import WechatApiError
 from .product_link_dialog import auto_match_skus
@@ -43,6 +48,30 @@ def _json_rows(value: str, default: Any) -> Any:
     except (TypeError, ValueError):
         return default
     return parsed if isinstance(parsed, type(default)) else default
+
+
+def _json_sequence(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _price_cents(value: Any) -> int:
@@ -370,20 +399,13 @@ def _definitive_upload_failure_message(exc: Exception) -> str:
 
 
 def _required_category_ids(payload: dict[str, Any]) -> list[str]:
-    explicit_apply_ids = payload.get("category_apply_ids")
-    if isinstance(explicit_apply_ids, list):
-        explicit = [
-            str(value).strip()
-            for value in explicit_apply_ids
-            if str(value).strip()
-        ]
-        if explicit:
-            return explicit
-    category_ids: list[str] = []
-    seen: set[str] = set()
-    for key in ("cats", "cats_v2"):
+    path_ids: list[str] = []
+    for key in ("cats_v2", "cats"):
         values = payload.get(key)
-        for value in values if isinstance(values, list) else []:
+        if not isinstance(values, list) or not values:
+            continue
+        current_path: list[str] = []
+        for value in values:
             if isinstance(value, dict):
                 category_id = str(
                     value.get("cat_id")
@@ -393,14 +415,145 @@ def _required_category_ids(payload: dict[str, Any]) -> list[str]:
                 ).strip()
             else:
                 category_id = str(value or "").strip()
-            if category_id and category_id not in seen:
-                seen.add(category_id)
-                category_ids.append(category_id)
-    if not category_ids and payload.get("category_path"):
+            if category_id:
+                current_path.append(category_id)
+        if current_path:
+            path_ids = current_path
+            break
+    explicit_apply_ids = payload.get("category_apply_ids")
+    if isinstance(explicit_apply_ids, list):
+        parent_ids = set(path_ids[:-1])
+        explicit = list(dict.fromkeys(
+            category_id
+            for value in explicit_apply_ids
+            if (category_id := str(value).strip())
+            and category_id not in parent_ids
+        ))
+        if explicit:
+            return explicit
+    if path_ids:
+        return [path_ids[-1]]
+    if payload.get("category_path"):
         category_id = str(payload.get("cat_id") or "").strip()
         if category_id:
-            category_ids.append(category_id)
-    return category_ids
+            return [category_id]
+    return []
+
+
+def _fallback_category_ids(value: Any) -> list[str]:
+    """Parse a validated fallback selector without treating text as an ID."""
+    if isinstance(value, dict):
+        raw_values = (
+            value.get("id_path")
+            or value.get("category_path_ids")
+            or [
+                value.get("cat_id")
+                or value.get("catId")
+                or value.get("categoryId")
+            ]
+        )
+    elif isinstance(value, list):
+        raw_values = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return _fallback_category_ids(parsed)
+        raw_values = [
+            part
+            for part in re.split(r"[\s/,>，、]+", text)
+            if part.strip()
+        ]
+    if not isinstance(raw_values, list):
+        raw_values = [raw_values]
+    category_ids: list[str] = []
+    for item in raw_values:
+        if isinstance(item, dict):
+            item = (
+                item.get("cat_id")
+                or item.get("catId")
+                or item.get("categoryId")
+                or ""
+            )
+        category_id = str(item or "").strip()
+        if not category_id:
+            continue
+        if not category_id.isdigit():
+            raise ValueError(
+                "兜底类目必须是 cat_id、ID 路径或 JSON；"
+                f"无法识别“{category_id}”"
+            )
+        category_ids.append(category_id)
+    return list(dict.fromkeys(category_ids))
+
+
+CATEGORY_GENERIC_TERMS = {
+    "女鞋",
+    "男鞋",
+    "鞋",
+    "鞋子",
+    "鞋靴",
+    "女装",
+    "男装",
+    "女士",
+    "男士",
+    "儿童",
+    "女款",
+    "男款",
+    "服装",
+    "服饰",
+    "时尚",
+    "运动",
+    "商品",
+    "其他",
+}
+
+
+def _category_semantic_match(
+    source_text: str,
+    candidate: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Require a leaf-specific term, not only a generic parent category."""
+    source = re.sub(r"\s+", "", str(source_text or "")).casefold()
+    path = str(candidate.get("path") or "")
+    leaf_name = str(candidate.get("name") or "")
+    leaf_text = path.rsplit("/", 1)[-1].strip() or leaf_name
+    tokens: set[str] = set()
+    for run in re.findall(
+        r"[A-Za-z0-9\u4e00-\u9fff]{2,}",
+        f"{leaf_name} {leaf_text}",
+    ):
+        compact = run.casefold()
+        tokens.add(compact)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", compact):
+            for length in range(2, min(6, len(compact)) + 1):
+                for index in range(0, len(compact) - length + 1):
+                    token = compact[index : index + length]
+                    if len(token) >= 2:
+                        tokens.add(token)
+    hits = sorted(
+        (
+            token
+            for token in tokens
+            if token not in CATEGORY_GENERIC_TERMS
+            and token in source
+        ),
+        key=lambda token: (len(token), token),
+        reverse=True,
+    )
+    full_match = bool(
+        source
+        and (
+            leaf_text.casefold().replace(" ", "") in source
+            or leaf_name.casefold().replace(" ", "") in source
+        )
+    )
+    return bool(full_match or hits), hits
 
 
 def _is_category_permission_error(exc: Exception) -> bool:
@@ -413,25 +566,402 @@ def _is_category_permission_error(exc: Exception) -> bool:
     )
 
 
+def _is_category_deposit_failure_item(item: dict[str, Any]) -> bool:
+    codes = {
+        str(item.get(key) or "").strip()
+        for key in (
+            "error_code",
+            "errcode",
+            "code",
+            "category_error_code",
+        )
+    }
+    if "6600133" in codes:
+        return True
+    message = " ".join(
+        str(item.get(key) or "")
+        for key in ("message", "error_message", "category_error")
+    ).casefold()
+    return "6600133" in message or any(
+        marker in message
+        for marker in (
+            "已上架100个商品",
+            "已上架 100 个商品",
+            "缴纳足额保证金",
+            "需补缴",
+        )
+    )
+
+
+def _is_category_deposit_failure_error(exc: Exception) -> bool:
+    if isinstance(exc, WechatApiError) and exc.code == 6600133:
+        return True
+    return _is_category_deposit_failure_item(
+        {"message": str(exc)}
+    )
+
+
+def _is_category_failure_item(item: dict[str, Any]) -> bool:
+    codes = {
+        str(item.get(key) or "").strip()
+        for key in (
+            "error_code",
+            "errcode",
+            "code",
+            "category_error_code",
+        )
+    }
+    if "6600145" in codes:
+        return True
+    if _is_category_deposit_failure_item(item):
+        return True
+    message = " ".join(
+        str(item.get(key) or "")
+        for key in ("message", "error_message", "category_error")
+    ).casefold()
+    return "6600145" in message or (
+        "类目" in message
+        and any(word in message for word in ("权限", "开通", "未授权"))
+    )
+
+
+def _recoverable_category_failure_item(item: dict[str, Any]) -> bool:
+    if str(item.get("status") or "") != "failed":
+        return False
+    if str(item.get("product_id") or "").strip():
+        return False
+    if not _is_category_failure_item(item):
+        return False
+    payload = item.get("payload")
+    if not isinstance(payload, dict) or not payload:
+        return False
+    head_images = payload.get("head_imgs")
+    skus = payload.get("skus")
+    return (
+        isinstance(head_images, list)
+        and any(str(value).strip() for value in head_images)
+        and isinstance(skus, list)
+        and bool(skus)
+    )
+
+
+def _category_apply_hard_rejection(exc: Exception) -> bool:
+    message = str(exc).casefold()
+    if any(
+        marker in message
+        for marker in (
+            "http 401",
+            "http 403",
+            "扫码",
+            "登录已失效",
+        )
+    ):
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "无权限",
+            "禁止",
+            "不可申请",
+            "驳回",
+            "拒绝申请",
+            "资质",
+            "保证金",
+            "不支持",
+            "参数",
+        )
+    )
+
+
+def _category_checks(
+    client: Any,
+    category_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    checker = getattr(client, "category_application_checks", None)
+    if callable(checker):
+        return checker(category_ids)
+    statuses = client.category_relation_statuses(category_ids)
+    labels = {
+        "已生效": "effective",
+        "审核中": "pending",
+        "待审核": "pending",
+        "已拒绝": "rejected",
+        "不可申请": "unavailable",
+        "缺资质": "qualification_required",
+        "保证金不足": "deposit_required",
+        "未查到": "not_applied",
+    }
+    return {
+        category_id: {
+            "state": labels.get(
+                statuses.get(category_id, ""),
+                "not_applied",
+            ),
+            "label": statuses.get(category_id, "未查到"),
+            "reason": "",
+            "eligible": labels.get(
+                statuses.get(category_id, ""),
+                "not_applied",
+            ) == "not_applied",
+        }
+        for category_id in category_ids
+    }
+
+
+def _category_status_labels(checks: dict[str, dict[str, Any]]) -> dict[str, str]:
+    return {
+        category_id: str(check.get("label") or check.get("state") or "状态未知")
+        for category_id, check in checks.items()
+    }
+
+
+def _category_checks_all(
+    checks: dict[str, dict[str, Any]],
+    category_ids: list[str],
+    state: str,
+    *,
+    eligible: bool = False,
+) -> bool:
+    if not category_ids or any(
+        category_id not in checks for category_id in category_ids
+    ):
+        return False
+    return all(
+        str(checks[category_id].get("state") or "") == state
+        and (
+            not eligible
+            or bool(checks[category_id].get("eligible"))
+        )
+        for category_id in category_ids
+    )
+
+
+def _category_review_expired(
+    application: dict[str, Any],
+) -> tuple[bool, float]:
+    try:
+        hours = max(
+            1.0,
+            float(
+                os.environ.get(
+                    "WEIMI_CATEGORY_REVIEW_MAX_HOURS",
+                    "168",
+                )
+            ),
+        )
+    except ValueError:
+        hours = 168.0
+    raw_started = str(
+        application.get("category_application_at") or ""
+    ).strip()
+    if not raw_started:
+        return False, hours
+    try:
+        started = datetime.fromisoformat(raw_started)
+    except ValueError:
+        return False, hours
+    return (
+        datetime.now() - started >= timedelta(hours=hours),
+        hours,
+    )
+
+
+def _category_hard_failure(
+    checks: dict[str, dict[str, Any]],
+) -> str:
+    hard_states = {
+        "rejected",
+        "unavailable",
+        "qualification_required",
+    }
+    failures = []
+    for category_id, check in checks.items():
+        if str(check.get("state") or "") not in hard_states:
+            continue
+        reason = str(check.get("reason") or check.get("label") or "")
+        failures.append(f"{category_id}（{reason or '不可申请'}）")
+    return "；".join(failures)
+
+
+def _category_hard_state(
+    checks: dict[str, dict[str, Any]],
+) -> str:
+    for state in (
+        "rejected",
+        "qualification_required",
+        "unavailable",
+    ):
+        if any(
+            str(check.get("state") or "") == state
+            for check in checks.values()
+        ):
+            return state
+    return ""
+
+
+def _category_pending_state(
+    checks: dict[str, dict[str, Any]],
+) -> str:
+    states = {
+        str(check.get("state") or "")
+        for check in checks.values()
+    }
+    if "deposit_required" in states:
+        return "deposit_required"
+    if "pending" in states:
+        return "pending"
+    if states == {"not_applied"}:
+        return "not_applied"
+    return "unknown"
+
+
+def _category_deposit_snapshot(
+    checks: dict[str, dict[str, Any]],
+    online_count: int | None = None,
+) -> dict[str, Any]:
+    check = next(iter(checks.values()), {})
+    return {
+        "required_deposit": check.get("required_deposit"),
+        "amount_to_pay": check.get("amount_to_pay"),
+        "operation_required_deposit": check.get(
+            "operation_required_deposit"
+        ),
+        "deposit_balance": check.get("deposit_balance"),
+        "real_deposit_balance": check.get(
+            "real_deposit_balance"
+        ),
+        "deposit_shortfall": check.get("deposit_shortfall"),
+        "deposit_free_trial": bool(
+            check.get("deposit_free_trial")
+        ),
+        "business_type": str(check.get("business_type") or ""),
+        "online_count": online_count,
+    }
+
+
+def _deposit_retry_allowed(
+    application: dict[str, Any],
+    checks: dict[str, dict[str, Any]],
+    online_count: int | None,
+) -> bool:
+    previous = application.get("category_deposit_snapshot")
+    if not isinstance(previous, dict):
+        previous = {}
+    current = _category_deposit_snapshot(checks, online_count)
+
+    previous_online = _stock_int(previous.get("online_count"))
+    if (
+        previous_online is not None
+        and previous_online >= 100
+        and online_count is not None
+        and online_count < 100
+    ):
+        return True
+
+    previous_balance = _stock_int(previous.get("deposit_balance"))
+    current_balance = _stock_int(current.get("deposit_balance"))
+    if (
+        previous_balance is not None
+        and current_balance is not None
+        and current_balance > previous_balance
+    ):
+        return True
+
+    previous_required = _stock_int(
+        previous.get("operation_required_deposit")
+    )
+    current_required = _stock_int(
+        current.get("operation_required_deposit")
+    )
+    if (
+        previous_required is not None
+        and current_required is not None
+        and current_required < previous_required
+    ):
+        return True
+
+    previous_shortfall = _stock_int(
+        previous.get("deposit_shortfall")
+    )
+    current_shortfall = _stock_int(
+        current.get("deposit_shortfall")
+    )
+    if (
+        previous_shortfall is not None
+        and current_shortfall is not None
+        and current_shortfall < previous_shortfall
+    ):
+        return True
+
+    # Legacy tasks have no trustworthy snapshot. Let the platform decide
+    # exactly once; the resulting response is persisted and prevents the
+    # same rejected application from spinning forever.
+    return not previous
+
+
+def _deposit_wait_expired(
+    application: dict[str, Any],
+) -> bool:
+    try:
+        hours = max(
+            24.0,
+            float(
+                os.environ.get(
+                    "WEIMI_CATEGORY_DEPOSIT_MAX_HOURS",
+                    "168",
+                )
+            ),
+        )
+    except ValueError:
+        hours = 168.0
+    raw_started = str(
+        application.get("category_application_at")
+        or application.get("category_last_checked_at")
+        or ""
+    ).strip()
+    if not raw_started:
+        return False
+    try:
+        started = datetime.fromisoformat(raw_started)
+    except ValueError:
+        return False
+    return datetime.now() - started >= timedelta(hours=hours)
+
+
 def _retry_upload_after_category_open(
     payload: dict[str, Any],
     upload: Callable[[], dict[str, Any]],
     category_client: Any | Callable[[], Any],
     progress: Callable[[str], None] | None = None,
     category_ids: list[str] | None = None,
+    application: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    try:
-        return upload()
-    except Exception as exc:
-        if not _is_category_permission_error(exc):
-            raise
+    application = application if application is not None else {}
+    saved_ids = application.get("category_ids")
+    saved_application = (
+        str(application.get("status") or "") == "waiting_category"
+        or str(application.get("category_state") or "") in {
+            "waiting",
+            "pending",
+            "deposit_required",
+            "unknown",
+        }
+    ) and (
+        isinstance(saved_ids, list)
+        and bool(saved_ids)
+    )
+    if saved_application:
+        category_ids = [
+            str(value)
+            for value in saved_ids
+            if str(value).strip()
+        ]
+    else:
         category_ids = category_ids or _required_category_ids(payload)
-        if not category_ids:
-            raise
-        if progress is not None:
-            progress("正在检查并申请目标类目")
+
+    def resolve_client() -> Any:
         try:
-            client = (
+            return (
                 category_client()
                 if callable(category_client)
                 else category_client
@@ -440,47 +970,342 @@ def _retry_upload_after_category_open(
             raise CategoryAutoOpenError(
                 "无法连接店铺网页后台：" + str(exc)
             ) from exc
-        statuses: dict[str, str] = {}
+
+    def online_count_snapshot(client: Any) -> int | None:
+        checker = getattr(client, "online_product_count", None)
+        if not callable(checker):
+            application["online_product_snapshot"] = {
+                "count": None,
+                "source": "客户端未提供实时出售中商品数",
+            }
+            return None
         try:
-            statuses = client.category_relation_statuses(
-                category_ids
+            snapshot = checker()
+        except Exception as exc:
+            application["online_product_snapshot"] = {
+                "count": None,
+                "source": "实时出售中商品数读取失败",
+                "error": str(exc)[:500],
+            }
+            return None
+        if isinstance(snapshot, dict):
+            count = snapshot.get("count")
+            try:
+                count = int(count)
+            except (TypeError, ValueError):
+                count = None
+            application["online_product_snapshot"] = {
+                **snapshot,
+                "count": count,
+            }
+            return count
+        try:
+            count = int(snapshot)
+        except (TypeError, ValueError):
+            count = None
+        application["online_product_snapshot"] = {
+            "count": count,
+            "source": "客户端实时出售中商品数",
+        }
+        return count
+
+    def can_apply(check: dict[str, Any]) -> bool:
+        state = str(check.get("state") or "")
+        if state == "deposit_required":
+            return True
+        return state == "not_applied" and bool(check.get("eligible"))
+
+    def retry_after_effective(client: Any) -> dict[str, Any]:
+        if progress is not None:
+            progress("类目已生效，正在自动重新上货")
+        try:
+            return upload()
+        except Exception as retry_exc:
+            if _is_category_deposit_failure_error(retry_exc):
+                checks = _category_checks(client, category_ids)
+                online_count = online_count_snapshot(client)
+                raise CategoryApprovalPending(
+                    category_ids,
+                    _category_status_labels(checks),
+                    checks=checks,
+                    submitted=False,
+                    attempts=max(
+                        1,
+                        int(
+                            application.get(
+                                "category_check_attempts"
+                            )
+                            or 0
+                        ),
+                    ),
+                    error=str(retry_exc),
+                    state="deposit_required",
+                    deposit_snapshot=_category_deposit_snapshot(
+                        checks,
+                        online_count,
+                    ),
+                ) from retry_exc
+            if _is_category_permission_error(retry_exc):
+                checks = _category_checks(client, category_ids)
+                raise CategoryApprovalPending(
+                    category_ids,
+                    _category_status_labels(checks),
+                    checks=checks,
+                    submitted=True,
+                    attempts=max(
+                        1,
+                        int(application.get("category_check_attempts") or 0),
+                    ),
+                ) from retry_exc
+            raise
+
+    def recover_apply_exception(
+        client: Any,
+        exc: Exception,
+    ) -> dict[str, Any]:
+        exc_text = str(exc)
+        if "保证金" in exc_text:
+            checks = _category_checks(client, category_ids)
+            online_count = _stock_int(
+                (
+                    application.get("online_product_snapshot")
+                    or {}
+                ).get("count")
             )
-        except Exception:
-            statuses = {}
-        if not statuses or not all(
-            statuses.get(category_id) == "已生效"
-            for category_id in category_ids
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=1,
+                error=exc_text,
+                state="deposit_required",
+                deposit_snapshot=_category_deposit_snapshot(
+                    checks,
+                    online_count,
+                ),
+            ) from exc
+        if _category_apply_hard_rejection(exc):
+            raise CategoryAutoOpenError(
+                "类目开通申请失败：" + exc_text,
+                state="application_error",
+            ) from exc
+        if progress is not None:
+            progress("类目申请结果待确认，正在复查")
+        checks = _category_checks(client, category_ids)
+        hard_error = _category_hard_failure(checks)
+        if hard_error:
+            raise CategoryAutoOpenError(
+                "类目申请被平台拒绝：" + hard_error,
+                state=_category_hard_state(checks)
+                or "failed_category",
+            ) from exc
+        if _category_checks_all(checks, category_ids, "effective"):
+            return retry_after_effective(client)
+        raise CategoryApprovalPending(
+            category_ids,
+            _category_status_labels(checks),
+            checks=checks,
+            submitted=True,
+            attempts=1,
+            error=str(exc),
+        ) from exc
+
+    if saved_application:
+        client = resolve_client()
+        if progress is not None:
+            progress("正在复查类目开通状态")
+        checks = _category_checks(client, category_ids)
+        hard_error = _category_hard_failure(checks)
+        if hard_error:
+            raise CategoryAutoOpenError(
+                "类目不可自动开通：" + hard_error,
+                state=_category_hard_state(checks)
+                or "failed_category",
+            )
+        online_count = online_count_snapshot(client)
+        submitted = bool(application.get("category_apply_submitted"))
+        attempts = max(
+            1,
+            int(application.get("category_check_attempts") or 0) + 1,
+        )
+        deposit_wait = (
+            str(application.get("category_state") or "")
+            == "deposit_required"
+            or _category_pending_state(checks) == "deposit_required"
+        )
+        if deposit_wait and not _deposit_retry_allowed(
+            application,
+            checks,
+            online_count,
+        ):
+            if _deposit_wait_expired(application):
+                raise CategoryAutoOpenError(
+                    "等待补缴保证金超过 7 天且余额未变化，"
+                    "已停止自动重试，请补缴后手动继续",
+                    state="deposit_required",
+                )
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=attempts,
+                error=str(application.get("category_error") or ""),
+                state="deposit_required",
+                deposit_snapshot=_category_deposit_snapshot(
+                    checks,
+                    online_count,
+                ),
+            )
+        if _category_checks_all(checks, category_ids, "effective"):
+            return retry_after_effective(client)
+        if (
+            not submitted
+            and all(
+                can_apply(checks[category_id])
+                for category_id in category_ids
+                if category_id in checks
+            )
+            and all(category_id in checks for category_id in category_ids)
         ):
             if progress is not None:
                 progress("正在提交类目开通申请")
             try:
                 client.batch_add_categories(category_ids)
             except Exception as exc:
+                return recover_apply_exception(client, exc)
+            submitted = True
+            checks = _category_checks(client, category_ids)
+            hard_error = _category_hard_failure(checks)
+            if hard_error:
                 raise CategoryAutoOpenError(
-                    "类目开通申请失败：" + str(exc)
-                ) from exc
-            try:
-                statuses = client.category_relation_statuses(
-                    category_ids
+                    "类目申请被平台拒绝：" + hard_error,
+                    state=_category_hard_state(checks)
+                    or "failed_category",
                 )
-            except Exception:
-                statuses = {}
-        if statuses and not all(
-            statuses.get(category_id) == "已生效"
-            for category_id in category_ids
-        ):
-            raise CategoryApprovalPending(category_ids, statuses)
-        if progress is not None:
-            progress("类目已生效，正在自动重新上货")
-        try:
-            return upload()
-        except Exception as retry_exc:
-            if _is_category_permission_error(retry_exc):
-                raise CategoryApprovalPending(
-                    category_ids,
-                    statuses,
-                ) from retry_exc
+            if _category_checks_all(
+                checks,
+                category_ids,
+                "effective",
+            ):
+                return retry_after_effective(client)
+        pending_review = (
+            submitted
+            and _category_checks_all(
+                checks,
+                category_ids,
+                "pending",
+            )
+        )
+        if pending_review:
+            expired, review_hours = _category_review_expired(application)
+            if expired:
+                raise CategoryAutoOpenError(
+                    "类目申请已等待超过 "
+                    f"{review_hours:g} 小时仍处于审核中，"
+                    "已停止自动重查，请人工确认平台审核结果"
+                )
+        elif attempts > 12:
+            raise CategoryAutoOpenError(
+                "类目状态连续 12 次无法确认，已停止自动重查，请人工处理",
+                state=_category_pending_state(checks),
+            )
+        raise CategoryApprovalPending(
+            category_ids,
+            _category_status_labels(checks),
+            checks=checks,
+            submitted=submitted,
+            attempts=attempts,
+            state=_category_pending_state(checks),
+        )
+
+    try:
+        return upload()
+    except Exception as exc:
+        if _is_category_deposit_failure_error(exc):
+            if not category_ids:
+                raise CategoryAutoOpenError(
+                    "平台要求补缴保证金，但商品缺少目标叶子类目"
+                ) from exc
+            client = resolve_client()
+            online_count = online_count_snapshot(client)
+            checks = _category_checks(client, category_ids)
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=1,
+                error=str(exc),
+                state="deposit_required",
+                deposit_snapshot=_category_deposit_snapshot(
+                    checks,
+                    online_count,
+                ),
+            ) from exc
+        if not _is_category_permission_error(exc):
             raise
+        if not category_ids:
+            raise CategoryAutoOpenError(
+                "未识别到商品目标叶子类目，无法自动申请；"
+                "请检查数据包类目字段或模板兜底类目"
+            ) from exc
+        if progress is not None:
+            progress("正在检查并申请目标类目")
+        client = resolve_client()
+        online_count_snapshot(client)
+        checks = _category_checks(client, category_ids)
+        hard_error = _category_hard_failure(checks)
+        if hard_error:
+            raise CategoryAutoOpenError(
+                "类目不可自动开通：" + hard_error,
+                state=_category_hard_state(checks)
+                or "failed_category",
+            )
+        if _category_checks_all(checks, category_ids, "effective"):
+            return retry_after_effective(client)
+        eligible = (
+            all(category_id in checks for category_id in category_ids)
+            and all(
+                can_apply(checks[category_id])
+                for category_id in category_ids
+            )
+        )
+        if not eligible:
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=any(
+                    str(check.get("state") or "") == "pending"
+                    for check in checks.values()
+                ),
+                attempts=1,
+            )
+        if progress is not None:
+            progress("正在提交类目开通申请")
+        try:
+            client.batch_add_categories(category_ids)
+        except Exception as apply_exc:
+            return recover_apply_exception(client, apply_exc)
+        checks = _category_checks(client, category_ids)
+        hard_error = _category_hard_failure(checks)
+        if hard_error:
+            raise CategoryAutoOpenError(
+                "类目申请被平台拒绝：" + hard_error,
+                state=_category_hard_state(checks)
+                or "failed_category",
+            )
+        if _category_checks_all(checks, category_ids, "effective"):
+            return retry_after_effective(client)
+        raise CategoryApprovalPending(
+            category_ids,
+            _category_status_labels(checks),
+            checks=checks,
+            submitted=True,
+            attempts=1,
+        )
 
 
 def _stable_source_fingerprint(
@@ -545,6 +1370,7 @@ def _recover_upload_tasks(tasks: list[Any]) -> bool:
             items = task["items"]
             changed = True
         verification_count = 0
+        category_waiting_count = 0
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -562,13 +1388,120 @@ def _recover_upload_tasks(tasks: list[Any]) -> bool:
                 item["status"] = "paused"
                 item["message"] = "上次关闭前尚未提交，可继续上传"
                 changed = True
+            elif status == "waiting_category" and not item.get(
+                "category_state"
+            ):
+                payload = item.get("payload")
+                category_ids = _required_category_ids(
+                    payload if isinstance(payload, dict) else {}
+                )
+                item["category_state"] = "waiting"
+                item["category_ids"] = category_ids
+                item["category_apply_submitted"] = True
+                item["category_application_at"] = (
+                    str(item.get("finished_at") or "")
+                    or datetime.now().isoformat(timespec="seconds")
+                )
+                item["category_check_attempts"] = int(
+                    item.get("category_check_attempts") or 0
+                )
+                changed = True
+            if (
+                item.get("status") == "waiting_category"
+                and item.get("category_state") == "deposit_required"
+                and not isinstance(
+                    item.get("category_deposit_snapshot"),
+                    dict,
+                )
+            ):
+                checks = item.get("category_checks")
+                if isinstance(checks, dict) and checks:
+                    online = item.get("online_product_snapshot")
+                    online_count = (
+                        _stock_int(online.get("count"))
+                        if isinstance(online, dict)
+                        else None
+                    )
+                    item["category_deposit_snapshot"] = (
+                        _category_deposit_snapshot(
+                            checks,
+                            online_count,
+                        )
+                    )
+                    changed = True
+            elif (
+                status == "failed"
+                and _is_category_failure_item(item)
+                and str(item.get("category_state") or "")
+                in {"", "failed", "failed_category"}
+            ):
+                if _recoverable_category_failure_item(item):
+                    now = datetime.now().isoformat(timespec="seconds")
+                    item["status"] = "waiting_category"
+                    deposit_failure = _is_category_deposit_failure_item(
+                        item
+                    )
+                    item["category_state"] = (
+                        "deposit_required"
+                        if deposit_failure
+                        else "waiting"
+                    )
+                    item["category_auto_recovery"] = True
+                    item["category_reprocess_available"] = False
+                    item["category_ids"] = _required_category_ids(
+                        item.get("payload") or {}
+                    )
+                    item["category_apply_submitted"] = False
+                    item["category_check_attempts"] = 0
+                    item["category_last_checked_at"] = now
+                    item["category_next_check_at"] = now
+                    item["category_previous_failure_message"] = str(
+                        item.get("message") or ""
+                    )
+                    if deposit_failure:
+                        checks = item.get("category_checks")
+                        if not isinstance(checks, dict):
+                            checks = {}
+                        snapshot = _category_deposit_snapshot(
+                            checks,
+                            100,
+                        )
+                        snapshot["official_error"] = str(
+                            item.get("message") or ""
+                        )[:500]
+                        item["category_deposit_snapshot"] = snapshot
+                    item.pop("category_error", None)
+                    item["message"] = (
+                        (
+                            "平台明确要求补缴保证金，"
+                            "余额或出售中数量变化后自动复查"
+                        )
+                        if deposit_failure
+                        else "检测到历史类目权限失败，正在自动检查类目"
+                    )
+                else:
+                    item["category_state"] = "failed"
+                    item["category_reprocess_available"] = False
+                    item["category_error"] = (
+                        "历史类目失败缺少完整商品 payload 或已有商品 ID，"
+                        "不能安全自动重试"
+                    )
+                changed = True
             if item.get("status") == "verification_pending":
                 verification_count += 1
+            elif item.get("status") == "waiting_category":
+                category_waiting_count += 1
         task_status = str(task.get("status") or "pending")
         if verification_count:
             task["status"] = "needs_verification"
             task["message"] = (
                 f"待核实 {verification_count} 个商品，请先核对远端结果"
+            )
+            changed = True
+        elif category_waiting_count:
+            task["status"] = "needs_category"
+            task["message"] = (
+                f"{category_waiting_count} 个商品自动等待或申请类目"
             )
             changed = True
         elif task_status in {"running", "queued"}:
@@ -869,7 +1802,355 @@ def _taobao_sku_attributes(
     return groups
 
 
+def _wechat_package_sku_id(item: dict[str, Any]) -> str:
+    sku_key = item.get("skuKey")
+    return str(
+        (sku_key.get("skuId") if isinstance(sku_key, dict) else "")
+        or item.get("skuId")
+        or ""
+    ).strip()
+
+
+def _wechat_package_price_cents(
+    value: Any,
+    *,
+    yuan: bool,
+) -> int | None:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return None
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite() or number < 0:
+        return None
+    if yuan:
+        number *= 100
+    return int(number.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _normalize_wechat_package_payload(
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw = payload.get("_raw")
+    if not isinstance(raw, dict):
+        return None
+
+    adapter_sources: list[str] = []
+    adapter_errors: list[str] = []
+    adapter_conflicts: list[str] = []
+
+    def first_images(*values: Any) -> list[str]:
+        for value in values:
+            images = _image_urls(value, 9)
+            if images:
+                return images
+        return []
+
+    head_infos = _json_sequence(raw.get("headImgInfos"))
+    product_head_infos = _json_sequence(
+        raw.get("productHeadimgInfo")
+    )
+    head_images = first_images(
+        payload.get("headImgs"),
+        payload.get("headImg"),
+        raw.get("headImg"),
+        raw.get("headImage"),
+        [
+            item.get("imgUrl")
+            for item in head_infos or []
+            if isinstance(item, dict)
+        ],
+        [
+            item.get("imgUrl")
+            for item in product_head_infos or []
+            if isinstance(item, dict)
+        ],
+        payload.get("specImgs"),
+    )
+    if head_images:
+        adapter_sources.append("head_imgs")
+    else:
+        adapter_errors.append(
+            "源字段 headImgs/headImg/_raw.headImg/"
+            "_raw.headImgInfos[].imgUrl/"
+            "_raw.productHeadimgInfo[].imgUrl 均无可用图片 URL"
+        )
+
+    detail = _json_object(raw.get("detail"))
+    detail_images = _image_urls(
+        detail.get("detailImg"),
+        50,
+    )
+    if detail_images:
+        adapter_sources.append("_raw.detail.detailImg")
+
+    attrs_by_sku: dict[str, list[dict[str, str]]] = {}
+    for group in _json_sequence(raw.get("productSaleAttrs")):
+        if not isinstance(group, dict):
+            continue
+        key = str(group.get("key") or "").strip()
+        if not key:
+            continue
+        for item in group.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("value") or "").strip()
+            if not value:
+                continue
+            for sku_id in item.get("skuIds") or []:
+                attrs_by_sku.setdefault(str(sku_id), []).append(
+                    {"attr_key": key, "attr_value": value}
+                )
+
+    top_sku_specs = {
+        str(item.get("skuId") or ""): item
+        for item in _json_sequence(payload.get("skuSpecs"))
+        if isinstance(item, dict) and item.get("skuId")
+    }
+    for sku_id, item in top_sku_specs.items():
+        for attr in item.get("specAttrs") or []:
+            if not isinstance(attr, dict):
+                continue
+            key = str(attr.get("key") or "").strip()
+            value = str(attr.get("value") or "").strip()
+            if key and value:
+                current = attrs_by_sku.setdefault(sku_id, [])
+                if not any(
+                    existing.get("attr_key") == key
+                    and existing.get("attr_value") == value
+                    for existing in current
+                ):
+                    current.append(
+                        {"attr_key": key, "attr_value": value}
+                    )
+
+    product_skus: dict[str, dict[str, Any]] = {}
+    for item in _json_sequence(raw.get("productSkus")):
+        if not isinstance(item, dict):
+            continue
+        sku_id = _wechat_package_sku_id(item)
+        if not sku_id:
+            continue
+        info = item.get("productSkuInfo")
+        info = info if isinstance(info, dict) else {}
+        stock_info = info.get("stockInfo")
+        stock_info = stock_info if isinstance(stock_info, dict) else {}
+        price = _wechat_package_price_cents(
+            info.get("salePrice"),
+            yuan=False,
+        )
+        stock = _stock_int(stock_info.get("stockNum"))
+        attrs = list(attrs_by_sku.get(sku_id, []))
+        if not attrs:
+            for param in info.get("saleParam") or []:
+                if not isinstance(param, dict):
+                    continue
+                for category in param.get("categorys") or []:
+                    if not isinstance(category, dict):
+                        continue
+                    value = str(category.get("name") or "").strip()
+                    if value:
+                        attrs.append(
+                            {"attr_key": "规格", "attr_value": value}
+                        )
+        product_skus[sku_id] = {
+            "price": price,
+            "stock": stock,
+            "image": str(info.get("thumbImg") or "").strip(),
+            "attrs": attrs,
+        }
+
+    sku_list = _json_object(raw.get("skuList"))
+    sku_info_map = {
+        str(item.get("skuId") or ""): item
+        for item in (
+            _json_sequence(sku_list.get("skuInfo"))
+        )
+        if isinstance(item, dict) and item.get("skuId")
+    }
+    sku_ids = list(
+        dict.fromkeys([*product_skus.keys(), *sku_info_map.keys()])
+    )
+    skus: list[dict[str, Any]] = []
+    for sku_id in sku_ids:
+        primary = product_skus.get(sku_id, {})
+        secondary = sku_info_map.get(sku_id, {})
+        top_spec = top_sku_specs.get(sku_id, {})
+        price = primary.get("price")
+        secondary_price = _wechat_package_price_cents(
+            secondary.get("price"),
+            yuan=False,
+        )
+        if price is None:
+            price = secondary_price
+        elif (
+            secondary_price is not None
+            and abs(int(price) - int(secondary_price)) > 1
+        ):
+            adapter_conflicts.append(
+                f"SKU {sku_id} 价格冲突："
+                f"productSkus={price}分，skuInfo={secondary_price}分；"
+                "采用 productSkus"
+            )
+        stock = primary.get("stock")
+        if stock is None:
+            stock = _stock_int(top_spec.get("stock"))
+        if price is None or price <= 0:
+            adapter_errors.append(
+                f"SKU {sku_id} 在 productSkus.salePrice/"
+                "skuList.skuInfo.price 中均无有效分值"
+            )
+            continue
+        if stock is None or stock < 0:
+            adapter_errors.append(
+                f"SKU {sku_id} 在 productSkus.stockInfo.stockNum/"
+                "skuSpecs.stock 中无有效库存"
+            )
+            continue
+        attrs = list(primary.get("attrs") or [])
+        if not attrs:
+            for attr in top_spec.get("specAttrs") or []:
+                if not isinstance(attr, dict):
+                    continue
+                key = str(attr.get("key") or "").strip()
+                value = str(attr.get("value") or "").strip()
+                if key and value:
+                    attrs.append(
+                        {"attr_key": key, "attr_value": value}
+                    )
+        skus.append(
+            {
+                "out_sku_id": sku_id,
+                "sku_code": sku_id,
+                "sale_price": int(price),
+                "stock_num": int(stock),
+                "thumb_url": (
+                    primary.get("image")
+                    or secondary.get("skuImgUrl")
+                    or top_spec.get("img")
+                    or ""
+                ),
+                "sku_attrs": attrs,
+            }
+        )
+    if skus:
+        adapter_sources.append(
+            "_raw.productSkus + _raw.skuList.skuInfo（按 skuId 合并）"
+        )
+    else:
+        adapter_errors.append(
+            "源字段 _raw.productSkus/_raw.skuList.skuInfo/"
+            "skuSpecs 均无可用 SKU"
+        )
+
+    express = raw.get("expressInfo")
+    express = express if isinstance(express, dict) else {}
+    source_id = str(
+        payload.get("itemId")
+        or payload.get("productId")
+        or express.get("productId")
+        or raw.get("uniqueId")
+        or raw.get("spuCode")
+        or ""
+    ).strip()
+    category_ids = [
+        str(
+            value.get("catId")
+            if isinstance(value, dict)
+            else value
+        ).strip()
+        for value in (
+            payload.get("categoryPathIds")
+            or payload.get("categoryIds")
+            or (
+                _json_sequence(raw.get("category"))
+            )
+        )
+        if isinstance(value, (str, int, dict))
+    ]
+    normalized = {
+        "platform": "微信小店",
+        "title": str(payload.get("title") or raw.get("title") or "").strip(),
+        "short_title": str(
+            payload.get("shortTitle") or raw.get("shortTitle") or ""
+        ).strip()[:20],
+        "source_product_id": source_id,
+        "out_product_id": source_id,
+        "productId": source_id,
+        "uniqueId": str(raw.get("uniqueId") or source_id),
+        "head_imgs": head_images,
+        "desc_info": {
+            "imgs": detail_images,
+            "desc": "",
+        },
+        "cats": [{"cat_id": value} for value in category_ids],
+        "cats_v2": [{"cat_id": value} for value in category_ids],
+        "category_path": "/".join(category_ids),
+        "skus": skus,
+        "deliver_method": 0,
+        "brand_id": "2100000000",
+        "extra_service": deepcopy(DEFAULT_PRODUCT_SERVICES),
+        "_source_format": "wechat_json_package",
+        "_adapter_sources": adapter_sources,
+        "_adapter_errors": adapter_errors,
+        "_adapter_conflicts": adapter_conflicts,
+    }
+    return normalized
+
+
 def _normalize_source_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    wechat_package = _normalize_wechat_package_payload(payload)
+    if wechat_package is not None:
+        return wechat_package
+    if (
+        payload.get("platform") in {"淘宝", "微信小店", "1688"}
+        and (
+            payload.get("head_imgs")
+            or payload.get("headImg")
+            or payload.get("imageList")
+        )
+        and isinstance(payload.get("skus"), list)
+    ):
+        normalized = deepcopy(payload)
+        normalized["head_imgs"] = (
+            normalized.get("head_imgs")
+            or normalized.get("headImg")
+            or normalized.get("imageList")
+            or []
+        )
+        source_id = str(
+            normalized.get("source_product_id")
+            or normalized.get("out_product_id")
+            or normalized.get("productId")
+            or normalized.get("product_id")
+            or normalized.get("offer_id")
+            or ""
+        ).strip()
+        if source_id:
+            normalized["source_product_id"] = source_id
+            normalized.setdefault("out_product_id", source_id)
+        for index, sku in enumerate(normalized.get("skus") or [], 1):
+            if not isinstance(sku, dict):
+                continue
+            sku["sale_price"] = max(0, int(sku.get("sale_price") or 0))
+            sku["stock_num"] = max(0, int(sku.get("stock_num") or 0))
+            sku.setdefault(
+                "out_sku_id",
+                str(
+                    sku.get("sku_code")
+                    or sku.get("skuId")
+                    or f"{source_id or 'SKU'}-{index}"
+                ),
+            )
+            attrs = sku.get("sku_attrs")
+            if not isinstance(attrs, list) or not attrs:
+                sku["sku_attrs"] = [
+                    {"attr_key": "规格", "attr_value": "默认规格"}
+                ]
+        return normalized
+
     if (
         payload.get("productName")
         or payload.get("productId")
@@ -1254,18 +2535,44 @@ class CategoryApprovalPending(RuntimeError):
         self,
         category_ids: list[str],
         statuses: dict[str, str],
+        *,
+        checks: dict[str, dict[str, Any]] | None = None,
+        submitted: bool = False,
+        attempts: int = 0,
+        error: str = "",
+        state: str = "",
+        deposit_snapshot: dict[str, Any] | None = None,
     ) -> None:
         self.category_ids = category_ids
         self.statuses = statuses
+        self.checks = checks or {}
+        self.submitted = submitted
+        self.attempts = attempts
+        self.error = error
+        self.state = state or _category_pending_state(self.checks)
+        self.deposit_snapshot = dict(deposit_snapshot or {})
         labels = "、".join(
             f"{category_id}（{statuses.get(category_id, '待核验')}）"
             for category_id in category_ids
         )
-        super().__init__(f"类目已申请，等待审核生效：{labels}")
+        if self.state == "deposit_required":
+            prefix = "类目需先补缴保证金，补齐后自动复查"
+        elif self.state == "pending" or submitted:
+            prefix = "类目已申请，等待审核生效"
+        else:
+            prefix = "类目状态待确认"
+        detail = f"{prefix}：{labels}"
+        if error:
+            detail += f"；申请请求结果待复查：{error[:300]}"
+        super().__init__(detail)
 
 
 class CategoryAutoOpenError(RuntimeError):
     """The automatic category application could not be completed."""
+
+    def __init__(self, message: str, *, state: str = "failed_category") -> None:
+        self.state = state
+        super().__init__(message)
 
 
 class _ScrollableBody(ttk.Frame):
@@ -3127,9 +4434,7 @@ class UploadPage(ttk.Frame):
             "support_exchange": bool(
                 template.get("support_exchange")
             ),
-            "auto_open_category": bool(
-                template.get("auto_open_category", True)
-            ),
+            "auto_open_category": True,
             "force_fallback_category": bool(
                 template.get("force_fallback_category")
             ),
@@ -3345,8 +4650,25 @@ class UploadPage(ttk.Frame):
                 ("damage_return", "支持损坏包退"),
                 ("fake_one_three", "支持假一赔三"),
                 ("support_exchange", "支持换货"),
-                ("auto_open_category", "缺类目时自动申请并重试"),
             ),
+        )
+        tk.Checkbutton(
+            service_box,
+            text="目标类目未开通时强制自动申请并重试",
+            variable=boolean_vars["auto_open_category"],
+            state="disabled",
+            disabledforeground=TEXT,
+            bg=PANEL,
+            activebackground=PANEL,
+            selectcolor="white",
+            bd=0,
+            anchor="w",
+        ).grid(
+            row=3,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=4,
         )
         ttk.Label(
             service_box,
@@ -3861,13 +5183,21 @@ class UploadPage(ttk.Frame):
             data = json.loads(text)
         except json.JSONDecodeError:
             lines = [line for line in text.splitlines() if line.strip()]
-            if lines and all(line.lstrip().startswith(("{", "[")) for line in lines):
-                data = []
+            parsed_lines: list[Any] = []
+            json_lines_valid = False
+            if lines and all(
+                line.lstrip().startswith(("{", "["))
+                for line in lines
+            ):
+                json_lines_valid = True
                 for line in lines:
                     try:
-                        data.append(json.loads(line))
+                        parsed_lines.append(json.loads(line))
                     except json.JSONDecodeError:
-                        pass
+                        json_lines_valid = False
+                        break
+            if json_lines_valid:
+                data = parsed_lines
             else:
                 dialect = csv.excel_tab
                 try:
@@ -3909,6 +5239,8 @@ class UploadPage(ttk.Frame):
                     ),
                     None,
                 )
+            if not isinstance(payload, dict):
+                payload = row
             title = str(
                 row.get("title")
                 or row.get("subject")
@@ -3937,12 +5269,31 @@ class UploadPage(ttk.Frame):
                     or row.get("skuInfos")
                     or row.get("detailImages")
                     else
+                    "微信小店"
+                    if (
+                        isinstance(row.get("_raw"), dict)
+                        or row.get("itemId")
+                        or row.get("productSaleAttrs")
+                        or row.get("skuList")
+                        or (
+                            row.get("productId")
+                            and row.get("categoryPathIds")
+                        )
+                    )
+                    else
                     "淘宝"
                     if row.get("productName")
                     or row.get("productId")
                     else "微信小店"
                 )
             )
+            if platform == "微信小店" and isinstance(payload, dict):
+                normalized_wechat = _normalize_wechat_package_payload(
+                    payload
+                )
+                if normalized_wechat is not None:
+                    payload = normalized_wechat
+                    title = str(payload.get("title") or title)
             normalized_price: int | None = None
             explicit_source_id = (
                 row.get("source_product_id")
@@ -3988,7 +5339,10 @@ class UploadPage(ttk.Frame):
                 or row.get("价格")
                 or 0
             )
-            if platform == "1688" and isinstance(payload, dict):
+            if (
+                platform in {"1688", "微信小店"}
+                and isinstance(payload, dict)
+            ):
                 sku_prices = [
                     int(item.get("sale_price") or 0)
                     for item in payload.get("skus") or []
@@ -5240,6 +6594,27 @@ class UploadPage(ttk.Frame):
             for item in task.get("items") or []
         )
 
+    def _category_retry_due_items(
+        self,
+        *,
+        include_future: bool = False,
+    ) -> list[tuple[dict, dict]]:
+        now = datetime.now()
+        due: list[tuple[dict, dict]] = []
+        for task in self._tasks:
+            for item in task.get("items") or []:
+                if item.get("status") != "waiting_category":
+                    continue
+                raw_next = str(item.get("category_next_check_at") or "")
+                if not include_future and raw_next:
+                    try:
+                        if datetime.fromisoformat(raw_next) > now:
+                            continue
+                    except ValueError:
+                        pass
+                due.append((task, item))
+        return due
+
     def _cancel_category_retry(self, _event=None) -> None:
         job = getattr(self, "_category_retry_job", None)
         self._category_retry_job = None
@@ -5250,7 +6625,11 @@ class UploadPage(ttk.Frame):
         except (AttributeError, tk.TclError):
             pass
 
-    def _schedule_category_retry(self) -> None:
+    def _schedule_category_retry(
+        self,
+        *,
+        minimum_delay_ms: int = 0,
+    ) -> None:
         if (
             getattr(self, "_category_retry_job", None) is not None
             or not self._has_waiting_category_items()
@@ -5260,16 +6639,39 @@ class UploadPage(ttk.Frame):
             scheduler = self.winfo_toplevel().after
         except (AttributeError, tk.TclError):
             return
-        try:
-            minutes = int(
-                os.environ.get(
-                    "WEIMI_CATEGORY_RETRY_MINUTES",
-                    "10",
-                )
+        waiting = self._category_retry_due_items(include_future=True)
+        next_times = []
+        for _task, item in waiting:
+            raw_next = str(item.get("category_next_check_at") or "")
+            if not raw_next:
+                continue
+            try:
+                next_times.append(datetime.fromisoformat(raw_next))
+            except ValueError:
+                continue
+        if next_times:
+            delay = max(
+                1_000,
+                min(
+                    120 * 60_000,
+                    int(
+                        (min(next_times) - datetime.now()).total_seconds()
+                        * 1000
+                    ),
+                ),
             )
-        except ValueError:
-            minutes = 10
-        delay = max(1, min(120, minutes)) * 60_000
+        else:
+            try:
+                minutes = int(
+                    os.environ.get(
+                        "WEIMI_CATEGORY_RETRY_MINUTES",
+                        "10",
+                    )
+                )
+            except ValueError:
+                minutes = 10
+            delay = max(1, min(120, minutes)) * 60_000
+        delay = max(delay, minimum_delay_ms)
         try:
             self._category_retry_job = scheduler(
                 delay,
@@ -5283,14 +6685,23 @@ class UploadPage(ttk.Frame):
         if not self._has_waiting_category_items():
             return
         if self._running or self._run_requested:
+            self._schedule_category_retry(minimum_delay_ms=60_000)
+            return
+        due_items = self._category_retry_due_items()
+        if not due_items:
             self._schedule_category_retry()
             return
+        self._category_retry_item_ids = {
+            str(item.get("item_id") or "")
+            for _task, item in due_items
+            if str(item.get("item_id") or "")
+        }
         self.window.set_status(
             "正在检查已申请类目并自动恢复上货…",
             busy=True,
         )
         self._start_tasks(automatic=True)
-        self._schedule_category_retry()
+        self._schedule_category_retry(minimum_delay_ms=60_000)
 
     def _start_tasks(self, *, automatic: bool = False) -> None:
         if self._running:
@@ -5400,6 +6811,21 @@ class UploadPage(ttk.Frame):
                 for item in task.get("items") or []:
                     if item.get("status") == "success":
                         continue
+                    if automatic:
+                        item_id = str(item.get("item_id") or "")
+                        allowed_ids = getattr(
+                            self,
+                            "_category_retry_item_ids",
+                            set(),
+                        )
+                        if (
+                            item.get("status") != "waiting_category"
+                            or (
+                                allowed_ids
+                                and item_id not in allowed_ids
+                            )
+                        ):
+                            continue
                     if item.get("status") in {
                         "submitting",
                         "verification_pending",
@@ -5501,6 +6927,16 @@ class UploadPage(ttk.Frame):
                             payload,
                             template,
                         )
+                    category_ids = _required_category_ids(payload)
+                    if item.get("category_auto_recovery"):
+                        if not category_ids:
+                            raise CategoryAutoOpenError(
+                                "历史类目失败商品无法确定叶子类目，"
+                                "已停止自动重提"
+                            )
+                        item["category_state"] = "waiting"
+                        item["category_ids"] = list(category_ids)
+                        item["category_apply_submitted"] = False
                     category_apply_ids = payload.pop(
                         "category_apply_ids",
                         [],
@@ -5517,6 +6953,17 @@ class UploadPage(ttk.Frame):
                         "",
                         str(exc),
                     )
+                except CategoryAutoOpenError as exc:
+                    item["category_state"] = "failed"
+                    item["category_error"] = str(exc)[:500]
+                    return (
+                        "failed",
+                        task,
+                        item,
+                        task_index,
+                        "",
+                        f"目标类目未开通，自动申请失败：{exc}"[:500],
+                    )
                 except Exception as exc:
                     return (
                         "failed",
@@ -5528,7 +6975,8 @@ class UploadPage(ttk.Frame):
                     )
                 with self._task_lock:
                     item["status"] = "submitting"
-                    item["submission_attempt_id"] = uuid.uuid4().hex
+                    if not item.get("submission_attempt_id"):
+                        item["submission_attempt_id"] = uuid.uuid4().hex
                     item["submission_started_at"] = datetime.now().isoformat(
                         timespec="seconds"
                     )
@@ -5562,29 +7010,46 @@ class UploadPage(ttk.Frame):
                             listing_mode=listing_mode,
                         )
 
-                    if template.get("auto_open_category", True):
-                        def update_category_progress(
-                            message: str,
-                        ) -> None:
-                            with self._task_lock:
-                                item["message"] = message
+                    category_business_type = str(
+                        template.get("category_business_type")
+                        or "individual"
+                    )
+                    if category_business_type not in {
+                        "individual",
+                        "enterprise",
+                    }:
+                        category_business_type = "individual"
 
-                        result = _retry_upload_after_category_open(
-                            payload,
-                            submit_product,
-                            lambda: ShopPrivateClient(self.db, store),
-                            progress=update_category_progress,
-                            category_ids=(
-                                category_apply_ids
-                                if isinstance(category_apply_ids, list)
-                                else []
-                            ),
+                    def category_client() -> ShopPrivateClient:
+                        client = ShopPrivateClient(self.db, store)
+                        client.category_business_type = (
+                            category_business_type
                         )
-                        latest_message = str(item.get("message") or "")
-                        if "类目" in latest_message:
-                            category_recovery_message = latest_message
-                    else:
-                        result = submit_product()
+                        return client
+
+                    def update_category_progress(
+                        message: str,
+                    ) -> None:
+                        with self._task_lock:
+                            item["message"] = message
+                        if progress is not None:
+                            progress(
+                                message,
+                                completed_count["value"],
+                                max(1, total_jobs),
+                            )
+
+                    result = _retry_upload_after_category_open(
+                        payload,
+                        submit_product,
+                        category_client,
+                        progress=update_category_progress,
+                        category_ids=category_ids,
+                        application=item,
+                    )
+                    latest_message = str(item.get("message") or "")
+                    if "类目" in latest_message:
+                        category_recovery_message = latest_message
                     product_id = str(
                         result.get("product_id")
                         or payload.get("product_id")
@@ -5615,6 +7080,8 @@ class UploadPage(ttk.Frame):
                         message = "上传成功，已提交出售中"
                     if category_recovery_message:
                         message += "；" + category_recovery_message
+                    item["category_state"] = "effective"
+                    item.pop("category_next_check_at", None)
                     return (
                         "success",
                         task,
@@ -5624,6 +7091,96 @@ class UploadPage(ttk.Frame):
                         message,
                     )
                 except CategoryApprovalPending as exc:
+                    now = datetime.now()
+                    with self._task_lock:
+                        item["category_state"] = "waiting"
+                        item["category_ids"] = list(exc.category_ids)
+                        item["category_statuses"] = dict(exc.statuses)
+                        item["category_checks"] = dict(exc.checks)
+                        if exc.deposit_snapshot:
+                            item["category_deposit_snapshot"] = dict(
+                                exc.deposit_snapshot
+                            )
+                            for key, value in (
+                                (
+                                    "category_required_deposit",
+                                    exc.deposit_snapshot.get(
+                                        "required_deposit"
+                                    ),
+                                ),
+                                (
+                                    "category_amount_to_pay",
+                                    exc.deposit_snapshot.get(
+                                        "amount_to_pay"
+                                    ),
+                                ),
+                                (
+                                    "category_operation_required_deposit",
+                                    exc.deposit_snapshot.get(
+                                        "operation_required_deposit"
+                                    ),
+                                ),
+                                (
+                                    "category_deposit_balance",
+                                    exc.deposit_snapshot.get(
+                                        "deposit_balance"
+                                    ),
+                                ),
+                                (
+                                    "category_real_deposit_balance",
+                                    exc.deposit_snapshot.get(
+                                        "real_deposit_balance"
+                                    ),
+                                ),
+                                (
+                                    "category_deposit_shortfall",
+                                    exc.deposit_snapshot.get(
+                                        "deposit_shortfall"
+                                    ),
+                                ),
+                                (
+                                    "category_deposit_free_trial",
+                                    exc.deposit_snapshot.get(
+                                        "deposit_free_trial"
+                                    ),
+                                ),
+                                (
+                                    "category_business_type",
+                                    exc.deposit_snapshot.get(
+                                        "business_type"
+                                    ),
+                                ),
+                            ):
+                                if value is not None:
+                                    item[key] = value
+                        item["category_apply_submitted"] = bool(
+                            exc.submitted
+                        )
+                        item["category_application_at"] = (
+                            item.get("category_application_at")
+                            or now.isoformat(timespec="seconds")
+                        )
+                        item["category_last_checked_at"] = now.isoformat(
+                            timespec="seconds"
+                        )
+                        item["category_check_attempts"] = int(
+                            exc.attempts or 1
+                        )
+                        if exc.error:
+                            item["category_error"] = str(exc.error)[:500]
+                        else:
+                            item.pop("category_error", None)
+                        item["category_next_check_at"] = (
+                            now
+                            + timedelta(
+                                minutes=(
+                                    30
+                                    if str(exc.state or "")
+                                    == "deposit_required"
+                                    else 10
+                                )
+                            )
+                        ).isoformat(timespec="seconds")
                     return (
                         "waiting_category",
                         task,
@@ -5633,6 +7190,9 @@ class UploadPage(ttk.Frame):
                         str(exc),
                     )
                 except CategoryAutoOpenError as exc:
+                    with self._task_lock:
+                        item["category_state"] = "failed"
+                        item["category_error"] = str(exc)[:500]
                     return (
                         "failed",
                         task,
@@ -5985,6 +7545,30 @@ class UploadPage(ttk.Frame):
         if not payload.get("title"):
             payload["title"] = str(item.get("title") or "")
         template = template or {}
+        freight_template_id = str(
+            template.get("freight_template_id") or ""
+        ).strip()
+        if freight_template_id:
+            payload["express_info"] = {
+                **(
+                    payload.get("express_info")
+                    if isinstance(payload.get("express_info"), dict)
+                    else {}
+                ),
+                "template_id": freight_template_id,
+                "weight": 1000,
+                "express_type": 0,
+            }
+        brand_id = str(template.get("brand_id") or "").strip()
+        if brand_id:
+            payload["brand_id"] = brand_id
+        after_sale_address_id = str(
+            template.get("after_sale_address_id") or ""
+        ).strip()
+        if after_sale_address_id:
+            payload["after_sale_info"] = {
+                "after_sale_address_id": after_sale_address_id,
+            }
         payload["listing"] = (
             0
             if _normalize_listing_mode(template) == "draft"
@@ -6024,6 +7608,8 @@ class UploadPage(ttk.Frame):
             database = getattr(self, "db", None)
             product_id = str(item.get("source_product_id") or "")
             blocked_ids: set[str] = set()
+            records: list[dict[str, Any]] = []
+            title_records: list[dict[str, Any]] = []
             selected_types = set(
                 rule_words(template.get("cloud_violation_types"))
             ) - {"未设置类型时按本机违规商品 ID 过滤"}
@@ -6032,18 +7618,47 @@ class UploadPage(ttk.Frame):
                     blocked_ids = database.violation_blacklist_ids()
                 except Exception:
                     blocked_ids = set()
-            if product_id and product_id in blocked_ids:
-                raise TemplateRuleSkip("模板过滤命中本机违规商品")
-            if database is not None and selected_types:
                 try:
-                    records = json.loads(
+                    raw_records = json.loads(
                         database.get_setting("violation_library", "[]")
                     )
+                    records = [
+                        record
+                        for record in raw_records
+                        if isinstance(record, dict)
+                    ] if isinstance(raw_records, list) else []
                 except (TypeError, ValueError):
                     records = []
-                for record in records if isinstance(records, list) else []:
-                    if not isinstance(record, dict):
-                        continue
+                try:
+                    raw_titles = json.loads(
+                        database.get_setting(
+                            "upload_violation_titles",
+                            "[]",
+                        )
+                    )
+                    title_records = [
+                        record
+                        for record in raw_titles
+                        if isinstance(record, dict)
+                    ] if isinstance(raw_titles, list) else []
+                except (TypeError, ValueError):
+                    title_records = []
+                if not title_records:
+                    title_records = build_upload_violation_titles(records)
+            if product_id and product_id in blocked_ids:
+                raise TemplateRuleSkip("模板过滤命中本机违规商品")
+            candidate_title = apply_template_title_rules(title, template)
+            counterfeited = find_upload_violation_title(
+                candidate_title,
+                title_records,
+            )
+            if counterfeited is not None:
+                raise TemplateRuleSkip(
+                    "云违规标题过滤命中："
+                    f"{counterfeited.get('reason') or '出售假冒商品'}"
+                )
+            if selected_types:
+                for record in records:
                     if str(record.get("product_id") or "") != product_id:
                         continue
                     if str(record.get("reason") or "") in selected_types:
@@ -6154,7 +7769,18 @@ class UploadPage(ttk.Frame):
                 except (TypeError, ValueError):
                     base = int(item.get("price") or 0)
                 sku["sale_price"] = price_for(base)
-                sku["stock_num"] = stock
+                configured_stock = _stock_int(
+                    template.get("stock")
+                )
+                source_stock = _stock_int(sku.get("stock_num"))
+                sku["stock_num"] = (
+                    configured_stock
+                    if configured_stock is not None
+                    and configured_stock > 0
+                    else source_stock
+                    if source_stock is not None
+                    else stock
+                )
             if template.get("low_price_enabled"):
                 sale_prices = sorted(
                     int(sku.get("sale_price") or 0)
@@ -6210,23 +7836,6 @@ class UploadPage(ttk.Frame):
                 payload.get("cats_v2")
             )
 
-        if (
-            not payload.get("cats")
-            and not payload.get("cats_v2")
-            and not payload.get("category_path")
-            and str(template.get("fallback_category") or "").strip()
-        ):
-            category = str(template["fallback_category"]).strip()
-            try:
-                parsed_category = json.loads(category)
-            except json.JSONDecodeError:
-                parsed_category = {"cat_id": category.split("/")[-1].strip()}
-            payload["cats"] = (
-                parsed_category
-                if isinstance(parsed_category, list)
-                else [parsed_category]
-            )
-            payload["cats"] = category_objects(payload["cats"])
         if template.get("enable_custom_attributes"):
             attrs = payload.get("attrs")
             if not isinstance(attrs, list):
@@ -6297,12 +7906,16 @@ class UploadPage(ttk.Frame):
         template: dict[str, Any],
     ) -> dict[str, Any]:
         try:
+            client = ShopPrivateClient(
+                self.db,
+                store,
+            )
+            client.category_business_type = str(
+                template.get("category_business_type") or "individual"
+            )
             catalog = self._category_catalog_cache.get(store.id)
             if not catalog:
-                catalog = ShopPrivateClient(
-                    self.db,
-                    store,
-                ).category_catalog()
+                catalog = client.category_catalog()
                 self._category_catalog_cache[store.id] = catalog
         except Exception as exc:
             raise CategoryAutoOpenError(
@@ -6317,25 +7930,301 @@ class UploadPage(ttk.Frame):
             catalog,
             limit=25,
         )
-        if not ranked:
-            fallback = str(template.get("fallback_category") or "").strip()
-            if fallback:
-                try:
-                    parsed = json.loads(fallback)
-                except json.JSONDecodeError:
-                    parsed = {"cat_id": fallback.split("/")[-1].strip()}
-                payload["cats"] = (
-                    parsed if isinstance(parsed, list) else [parsed]
+        try:
+            deposit_limit_cents = max(
+                0,
+                int(float(template.get("deposit_limit") or 0) * 100),
+            )
+        except (TypeError, ValueError):
+            deposit_limit_cents = 0
+        catalog_by_id = {
+            str(item.get("category_id") or ""): item
+            for item in catalog
+            if isinstance(item, dict)
+        }
+        checker = getattr(
+            client,
+            "category_application_checks",
+            None,
+        )
+        candidate_checks: dict[str, dict[str, Any]] = {}
+        if callable(checker):
+            ids = [
+                str(item.get("category_id") or "")
+                for item in ranked
+                if str(item.get("category_id") or "")
+            ]
+            try:
+                candidate_checks = checker(ids)
+            except Exception as exc:
+                raise CategoryAutoOpenError(
+                    f"{store.name} 无法验证候选类目状态：{exc}"
+                ) from exc
+
+        def candidate_data(
+            item: dict[str, Any],
+            *,
+            source: str,
+        ) -> dict[str, Any]:
+            category_id = str(item.get("category_id") or "")
+            check = candidate_checks.get(category_id)
+            check = check if isinstance(check, dict) else {}
+            score_rows = rank_category_candidates(
+                source_text,
+                [item],
+                limit=1,
+            )
+            score = float(
+                score_rows[0].get("match_score")
+                if score_rows
+                else item.get("match_score")
+                or 0
+            )
+            semantic_ok, semantic_hits = _category_semantic_match(
+                source_text,
+                item,
+            )
+            deposit_amount = _stock_int(check.get("deposit_amount"))
+            deposit_balance = _stock_int(check.get("deposit_balance"))
+            shortfall = _stock_int(check.get("deposit_shortfall"))
+            return {
+                **item,
+                "match_score": score,
+                "semantic_threshold": 2.0,
+                "semantic_key_match": semantic_ok,
+                "semantic_key_hits": semantic_hits,
+                "selection_source": source,
+                "application_state": str(
+                    check.get("state") or "unknown"
+                ),
+                "application_label": str(check.get("label") or ""),
+                "application_reason": str(check.get("reason") or ""),
+                "deposit_amount": deposit_amount,
+                "required_deposit": _stock_int(
+                    check.get("required_deposit")
+                ),
+                "amount_to_pay": _stock_int(
+                    check.get("amount_to_pay")
+                ),
+                "operation_required_deposit": _stock_int(
+                    check.get("operation_required_deposit")
+                ),
+                "deposit_balance": deposit_balance,
+                "real_deposit_balance": _stock_int(
+                    check.get("real_deposit_balance")
+                ),
+                "deposit_shortfall": shortfall,
+                "deposit_free_trial": bool(
+                    check.get("deposit_free_trial")
+                ),
+                "business_type": str(
+                    check.get("business_type") or ""
+                ),
+                "_check": check,
+            }
+
+        def is_compliant(item: dict[str, Any]) -> bool:
+            score = float(item.get("match_score") or 0)
+            if score < 2 or not bool(
+                item.get("semantic_key_match")
+            ):
+                return False
+            if not callable(checker):
+                return True
+            state = str(item.get("application_state") or "")
+            if state not in {
+                "effective",
+                "not_applied",
+                "pending",
+                "deposit_required",
+            }:
+                return False
+            return True
+
+        evaluated = [
+            candidate_data(item, source="auto")
+            for item in ranked
+        ]
+        auto_compliant = [
+            item for item in evaluated if is_compliant(item)
+        ]
+        auto_compliant.sort(
+            key=lambda item: (
+                int(item.get("deposit_amount") or 0),
+                -float(item.get("match_score") or 0),
+                str(item.get("category_id") or ""),
+            ),
+        )
+
+        fallback_error = ""
+        try:
+            fallback_ids = _fallback_category_ids(
+                template.get("fallback_category")
+            )
+        except ValueError as exc:
+            fallback_ids = []
+            fallback_error = str(exc)
+        fallback_candidate: dict[str, Any] | None = None
+        if fallback_ids:
+            leaf_id = fallback_ids[-1]
+            catalog_item = catalog_by_id.get(leaf_id)
+            if catalog_item is None:
+                fallback_error = (
+                    f"兜底类目 {leaf_id} 不在当前官方类目树中"
                 )
-                return payload
+            else:
+                fallback_candidate = candidate_data(
+                    catalog_item,
+                    source="fallback",
+                )
+                fallback_path = [
+                    str(value)
+                    for value in fallback_candidate.get(
+                        "id_path"
+                    )
+                    or []
+                    if str(value)
+                ]
+                if (
+                    len(fallback_ids) > 1
+                    and fallback_path
+                    and fallback_path[-len(fallback_ids):]
+                    != fallback_ids
+                ):
+                    fallback_error = (
+                        "兜底类目路径与官方类目树不一致："
+                        + "/".join(fallback_ids)
+                    )
+                    fallback_candidate = None
+                elif not is_compliant(fallback_candidate):
+                    state = str(
+                        fallback_candidate.get(
+                            "application_state"
+                        )
+                        or ""
+                    )
+                    if float(
+                        fallback_candidate.get("match_score") or 0
+                    ) < 2:
+                        fallback_error = (
+                            "兜底类目与商品语义不匹配："
+                            + str(fallback_candidate.get("path") or "")
+                        )
+                    else:
+                        fallback_error = (
+                            "兜底类目当前不可申请："
+                            f"{fallback_candidate.get('application_label') or state}"
+                            f"（{fallback_candidate.get('application_reason') or '无原因'}）"
+                        )
+                    fallback_candidate = None
+
+        force_fallback = bool(
+            template.get("force_fallback_category")
+        )
+        if auto_compliant:
+            best = auto_compliant[0]
+        elif force_fallback:
+            if not fallback_ids:
+                raise CategoryAutoOpenError(
+                    "已开启强制兜底类目，但模板没有配置兜底类目"
+                )
+            if fallback_candidate is None:
+                raise CategoryAutoOpenError(
+                    fallback_error or "兜底类目验证失败"
+                )
+            best = fallback_candidate
+        else:
             raise CategoryAutoOpenError(
-                f"{store.name} 没有找到匹配类目，请先配置模板兜底类目"
+                fallback_error
+                or (
+                    f"{store.name} 没有符合语义、资质和保证金上限的类目"
+                )
             )
-        best = ranked[0]
-        if float(best.get("match_score") or 0) < 2:
-            raise CategoryAutoOpenError(
-                f"{store.name} 的类目匹配可信度不足：{best.get('path', '')}"
+
+        if (
+            fallback_candidate is not None
+            and all(
+                str(item.get("category_id") or "")
+                != str(fallback_candidate.get("category_id") or "")
+                for item in evaluated
             )
+        ):
+            evaluated.append(fallback_candidate)
+        selected_id = str(best.get("category_id") or "")
+        selected_deposit = int(best.get("deposit_amount") or 0)
+        selected_score = float(best.get("match_score") or 0)
+        for item in evaluated:
+            item["selected"] = (
+                str(item.get("category_id") or "") == selected_id
+            )
+            if item["selected"]:
+                item["unselected_reason"] = ""
+                continue
+            if not bool(item.get("semantic_key_match")):
+                item["unselected_reason"] = (
+                    "语义未命中叶子关键品类词，"
+                    f"匹配分门槛 2.0，实际 {float(item.get('match_score') or 0):.1f}"
+                )
+                continue
+            state = str(item.get("application_state") or "")
+            if state not in {
+                "effective",
+                "not_applied",
+                "pending",
+                "deposit_required",
+            }:
+                item["unselected_reason"] = (
+                    f"当前状态不可申请：{item.get('application_label') or state}"
+                )
+                continue
+            deposit = int(item.get("deposit_amount") or 0)
+            if deposit_limit_cents > 0 and deposit > deposit_limit_cents:
+                item["unselected_reason"] = (
+                    f"保证金 {deposit} 分超过模板上限 {deposit_limit_cents} 分"
+                )
+                continue
+            if item.get("selection_source") == "fallback":
+                item["unselected_reason"] = (
+                    "已有自动匹配合规候选，兜底类目不覆盖自动匹配"
+                )
+            elif deposit > selected_deposit:
+                item["unselected_reason"] = (
+                    f"保证金高于已选类目 {best.get('category_id') or ''}"
+                )
+            elif (
+                deposit == selected_deposit
+                and float(item.get("match_score") or 0) < selected_score
+            ):
+                item["unselected_reason"] = (
+                    f"保证金相同，匹配分低于已选类目 {best.get('category_id') or ''}"
+                )
+            else:
+                item["unselected_reason"] = "合规候选排序未选中"
+        payload["_category_candidates"] = evaluated[:8]
+        payload["_category_selected"] = {
+            "category_id": str(best.get("category_id") or ""),
+            "path": str(best.get("path") or ""),
+            "match_score": float(best.get("match_score") or 0),
+            "selection_source": str(
+                best.get("selection_source") or ""
+            ),
+            "application_state": str(
+                best.get("application_state") or "unknown"
+            ),
+            "deposit_amount": best.get("deposit_amount"),
+            "required_deposit": best.get("required_deposit"),
+            "amount_to_pay": best.get("amount_to_pay"),
+            "operation_required_deposit": best.get(
+                "operation_required_deposit"
+            ),
+            "deposit_balance": best.get("deposit_balance"),
+            "real_deposit_balance": best.get(
+                "real_deposit_balance"
+            ),
+            "deposit_shortfall": best.get("deposit_shortfall"),
+            "deposit_free_trial": best.get("deposit_free_trial"),
+            "business_type": best.get("business_type"),
+        }
         path_ids = [
             str(value)
             for value in best.get("id_path") or []
@@ -6360,6 +8249,30 @@ class UploadPage(ttk.Frame):
             "category_id": str(best.get("category_id") or ""),
             "path": str(best.get("path") or ""),
             "score": float(best.get("match_score") or 0),
+            "selection_source": str(
+                best.get("selection_source") or ""
+            ),
+            "application_state": str(
+                best.get("application_state") or "unknown"
+            ),
+            "deposit_amount": best.get("deposit_amount"),
+            "required_deposit": best.get("required_deposit"),
+            "amount_to_pay": best.get("amount_to_pay"),
+            "operation_required_deposit": best.get(
+                "operation_required_deposit"
+            ),
+            "deposit_balance": best.get("deposit_balance"),
+            "real_deposit_balance": best.get(
+                "real_deposit_balance"
+            ),
+            "deposit_shortfall": best.get("deposit_shortfall"),
+            "deposit_free_trial": best.get("deposit_free_trial"),
+            "business_type": best.get("business_type"),
+            "candidates": evaluated[:8],
+            "semantic_rule": (
+                "完整路径/标题命中至少一个叶子关键品类词，"
+                "且匹配分不低于 2.0"
+            ),
         }
         return payload
 

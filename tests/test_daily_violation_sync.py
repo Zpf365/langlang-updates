@@ -212,3 +212,47 @@ def test_store_sync_filters_non_actionable_records_and_uses_app_id() -> None:
     assert result.success == 1
     assert [row["record_id"] for row in rows] == ["keep", "explicit-1"]
     assert rows[-1]["store_app_id"] == "wx-store"
+
+
+def test_counterfeit_violation_titles_are_published_to_upload_filter() -> None:
+    settings: dict[str, str] = {}
+
+    class Db:
+        @staticmethod
+        def get_setting(key, default=""):
+            return settings.get(key, default)
+
+        @staticmethod
+        def set_setting(key, value):
+            settings[key] = value
+
+        @staticmethod
+        def get_product(_store_id, _product_id):
+            return None
+
+    class Client:
+        def __init__(self, _db, _store):
+            pass
+
+        @staticmethod
+        def platform_violation_records():
+            return [
+                {
+                    "record_id": "fake-1",
+                    "product_id": "10001",
+                    "title": "毛绒花束捧花｜520生日礼物",
+                    "reason": "出售假冒商品",
+                    "source": "违规记录",
+                    "status": "已处理",
+                    "head_img": "https://example.test/fake.jpg",
+                }
+            ]
+
+    store = SimpleNamespace(id=9, name="店铺", app_id="wx-store")
+    with patch("weimi_manager.service.ShopPrivateClient", Client):
+        SyncService(Db()).sync_violation_library(store)
+
+    titles = json.loads(settings["upload_violation_titles"])
+    assert titles[0]["title"] == "毛绒花束捧花｜520生日礼物"
+    assert titles[0]["normalized"] == "毛绒花束捧花|520生日礼物"
+    assert titles[0]["reason"] == "出售假冒商品"

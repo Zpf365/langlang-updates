@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 
 from .browser_runtime import browser_launch_options
-from .db import Database
+from .db import SHANGHAI_TZ, Database
 from .models import Store
 
 SHOP_HOME = "https://store.weixin.qq.com/shop"
@@ -712,6 +712,11 @@ class WechatWebSession:
         captured: list[dict[str, Any]] = []
         failures: list[str] = []
         created_ids: list[int] = []
+        current_state = self._page_initial_state(page)
+        current_app_id = str(
+            (current_state.get("user_info") or {}).get("appid")
+            or ""
+        )
         for account_index, item in enumerate(switch_accounts, 1):
             app_id = str(
                 item.get("appid") or item.get("appId") or ""
@@ -725,11 +730,6 @@ class WechatWebSession:
                     account_index - 1,
                     len(switch_accounts),
                 )
-            current_state = self._page_initial_state(page)
-            current_app_id = str(
-                (current_state.get("user_info") or {}).get("appid")
-                or ""
-            )
             account_state = current_state
             if current_app_id != app_id:
                 if not self._switch_shop(page, app_id):
@@ -737,19 +737,6 @@ class WechatWebSession:
                         str(item.get("nickname") or app_id)
                     )
                     continue
-                page.wait_for_timeout(1800)
-                try:
-                    page.goto(
-                        WORKBENCH_URL,
-                        wait_until="domcontentloaded",
-                        timeout=60000,
-                    )
-                except Exception as exc:
-                    failures.append(
-                        f"{item.get('nickname') or app_id}: {exc}"
-                    )
-                    continue
-                page.wait_for_timeout(1800)
                 account_state = {}
                 for _attempt in range(8):
                     refreshed_state = self._page_initial_state(page)
@@ -762,13 +749,41 @@ class WechatWebSession:
                     if refreshed_app_id == app_id:
                         account_state = refreshed_state
                         break
+                    page.wait_for_timeout(180)
+                if not account_state:
+                    # Only use the slower full-page fallback when the fast
+                    # session-state poll did not confirm the switch.
+                    try:
+                        page.goto(
+                            WORKBENCH_URL,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                    except Exception as exc:
+                        failures.append(
+                            f"{item.get('nickname') or app_id}: {exc}"
+                        )
+                        continue
                     page.wait_for_timeout(500)
+                    for _attempt in range(8):
+                        refreshed_state = self._page_initial_state(page)
+                        refreshed_app_id = str(
+                            (refreshed_state.get("user_info") or {}).get(
+                                "appid"
+                            )
+                            or ""
+                        )
+                        if refreshed_app_id == app_id:
+                            account_state = refreshed_state
+                            break
+                        page.wait_for_timeout(500)
                 if not account_state:
                     failures.append(
                         f"{item.get('nickname') or app_id}: "
                         "切换后未确认店铺身份"
                     )
                     continue
+            current_app_id = app_id
             account = normalize_shop_switch_account(
                 item,
                 account_state,
@@ -783,15 +798,6 @@ class WechatWebSession:
             if not cookies:
                 failures.append(
                     f"{account['name']}: 没有可保存的登录 Cookie"
-                )
-                continue
-            probe_status, probe_detail = self.probe_payload(
-                {"cookies": cookies}
-            )
-            if probe_status != "已登录":
-                failures.append(
-                    f"{account['name']}: "
-                    f"{probe_status}（{probe_detail}）"
                 )
                 continue
             store_id, created = self.db.ensure_web_login_store(
@@ -1786,7 +1792,10 @@ class WechatWebSession:
             if expires > 0:
                 item["expires"] = expires
             cookies.append(item)
-        start = datetime.fromtimestamp(max(int(time.time()) + 60, start_time))
+        start = datetime.fromtimestamp(
+            max(int(time.time()) + 60, start_time),
+            SHANGHAI_TZ,
+        )
         end = start + timedelta(days=max(1, int(days)))
         start_text = start.strftime("%Y-%m-%d %H:%M:%S")
         end_text = end.strftime("%Y-%m-%d %H:%M:%S")
@@ -1905,9 +1914,35 @@ class WechatWebSession:
                     or "原平台限时抢购创建失败"
                 )
             )
+        def response_activity_id(value: Any) -> str:
+            if isinstance(value, dict):
+                for key in (
+                    "newActivityId",
+                    "new_activity_id",
+                    "snapupTaskId",
+                    "activityId",
+                    "activity_id",
+                ):
+                    candidate = str(value.get(key) or "").strip()
+                    if candidate and candidate != str(activity_id):
+                        return candidate
+                for item in value.values():
+                    candidate = response_activity_id(item)
+                    if candidate:
+                        return candidate
+            elif isinstance(value, list):
+                for item in value:
+                    candidate = response_activity_id(item)
+                    if candidate:
+                        return candidate
+            return ""
+
+        new_activity_id = response_activity_id(result)
         return {
             "status": "created",
-            "activity_id": str(activity_id),
+            "activity_id": new_activity_id or str(activity_id),
+            "source_activity_id": str(activity_id),
+            "new_activity_id": new_activity_id,
             "store_id": store.id,
             "start_time": int(start.timestamp()),
             "end_time": int(end.timestamp()),
@@ -1943,7 +1978,10 @@ class WechatWebSession:
             if expires > 0:
                 item["expires"] = expires
             cookies.append(item)
-        start = datetime.fromtimestamp(max(int(time.time()) + 60, start_time))
+        start = datetime.fromtimestamp(
+            max(int(time.time()) + 60, start_time),
+            SHANGHAI_TZ,
+        )
         end = start + timedelta(days=max(1, int(days)))
         start_text = start.strftime("%Y-%m-%d %H:%M:%S")
         end_text = end.strftime("%Y-%m-%d %H:%M:%S")
@@ -2155,6 +2193,7 @@ class WechatWebSession:
         self,
         store: Store,
         url: str = WORKBENCH_URL,
+        page_setup: Callable[[Any], None] | None = None,
     ) -> None:
         PlaywrightError, sync_playwright = playwright_api()
         storage_path = self.data_dir / "edge_profiles" / f"store_{store.id}"
@@ -2244,6 +2283,9 @@ class WechatWebSession:
                         f"后台店铺校验失败：目标 {store.name}"
                         f"（{store.app_id}），实际打开 {actual_app_id}"
                     )
+            if page_setup is not None:
+                page_setup(page)
+                page.wait_for_timeout(800)
             while context.pages:
                 time.sleep(1)
                 try:
@@ -2281,6 +2323,66 @@ class WechatWebSession:
 
     def open_official_product_backend(self, store: Store) -> None:
         self.open_official_backend(store, WORKBENCH_URL)
+
+    def open_official_product(
+        self,
+        store: Store,
+        product_id: str,
+        *,
+        target: str = "product",
+    ) -> None:
+        normalized_id = str(product_id or "").strip()
+        if not normalized_id:
+            raise ValueError("product_id 不能为空")
+        # Product-level routes are not stable enough to hard-code. Always
+        # enter from the product list, locate the exact ID, then click the
+        # verified row action.
+        path = "/shop/goods/list"
+
+        def locate_product(page: Any) -> None:
+            search = page.locator(
+                "input[placeholder*='商品'], input[placeholder*='ID']"
+            ).first
+            if search.count() == 0:
+                raise WebSessionError("商品列表页未找到商品搜索框")
+            search.fill(normalized_id)
+            search.press("Enter")
+            page.wait_for_timeout(1800)
+            matches = page.get_by_text(normalized_id, exact=True)
+            count = matches.count()
+            if count == 0:
+                raise WebSessionError(
+                    f"平台未找到商品 {normalized_id}，已停留在商品列表"
+                )
+            if count != 1:
+                raise WebSessionError(
+                    f"商品 {normalized_id} 搜索结果不唯一，已停止继续打开"
+                )
+            row = matches.first.locator("xpath=ancestor::tr[1]").first
+            if row.count() == 0:
+                row = matches.first.locator(
+                    "xpath=ancestor::*[contains(@class,'table-row')][1]"
+                ).first
+            if row.count() == 0:
+                raise WebSessionError("无法定位商品所在行，已停留在商品列表")
+            label = "数据" if target in {"product_stats", "content", "growth"} else "编辑"
+            action = row.get_by_text(label, exact=True).first
+            if action.count() == 0:
+                raise WebSessionError(
+                    f"商品 {normalized_id} 所在行没有“{label}”入口"
+                )
+            action.click()
+            page.wait_for_timeout(1600)
+            if normalized_id not in page.locator("body").inner_text(timeout=5000):
+                raise WebSessionError(
+                    f"点击后未确认商品 {normalized_id}，已停止操作"
+                )
+
+        self.open_official_backend(
+            store,
+            f"https://store.weixin.qq.com{path}",
+            page_setup=locate_product,
+        )
 
     def probe(self, store: Store) -> tuple[str, str]:
         payload = self.db.get_web_cookies(store.id)

@@ -1,0 +1,3265 @@
+{
+  "_raw": {
+    "afterSaleInfo": {
+      "afterSaleAddressId": "35991256002"
+    },
+    "asyncUpproductRet": 0,
+    "barCodeType": 0,
+    "brandId": "2100000000",
+    "canAddShopBag": true,
+    "canAddUserFavory": true,
+    "canGenOrder": true,
+    "canGiveGroupPresent": false,
+    "canGivePresent": false,
+    "canntGenOrderMsg": "",
+    "canntGivePresnetMsg": "",
+    "category": [
+      {
+        "catId": "6472"
+      },
+      {
+        "catId": "6497"
+      },
+      {
+        "catId": "6499"
+      }
+    ],
+    "changeCatLevel": 0,
+    "copyFromSpuId": "0",
+    "customConfig": {
+      "customTextMaxLength": 0
+    },
+    "deliverMethod": 0,
+    "detail": {
+      "desc": "",
+      "detailImg": [
+        "https://cdn.example.test/wechat/image-001.jpg",
+        "https://cdn.example.test/wechat/image-002.jpg",
+        "https://cdn.example.test/wechat/image-003.jpg",
+        "https://cdn.example.test/wechat/image-004.jpg",
+        "https://cdn.example.test/wechat/image-005.jpg",
+        "https://cdn.example.test/wechat/image-006.jpg",
+        "https://cdn.example.test/wechat/image-007.jpg",
+        "https://cdn.example.test/wechat/image-008.jpg",
+        "https://cdn.example.test/wechat/image-009.jpg",
+        "https://cdn.example.test/wechat/image-010.jpg",
+        "https://cdn.example.test/wechat/image-011.jpg",
+        "https://cdn.example.test/wechat/image-012.jpg",
+        "https://cdn.example.test/wechat/image-013.jpg",
+        "https://cdn.example.test/wechat/image-014.jpg",
+        "https://cdn.example.test/wechat/image-015.jpg",
+        "https://cdn.example.test/wechat/image-016.jpg"
+      ]
+    },
+    "empty": false,
+    "expressInfo": {
+      "piece": 1,
+      "price": 4990,
+      "productId": "10000161946828",
+      "templateId": "549082530004",
+      "weight": 0
+    },
+    "extraService": {
+      "damageGuarantee": 0,
+      "deliverAfterCheck": 0,
+      "exchangeSupport": 1,
+      "fakeOnePayFour": 0,
+      "fastRefund": 1,
+      "freeReturnQuota": 0,
+      "freightInsurance": 0,
+      "luxuryGuarantee": 0,
+      "noPayAfterUseReason": 6,
+      "payAfterUse": 0,
+      "refundOrderTime": 0,
+      "sevenDayReturn": 1
+    },
+    "givePresentInfo": {
+      "allowSecretPresent": true,
+      "canChangeSkus": false,
+      "supportPresentCard": false,
+      "usePresentHeadImg": 0
+    },
+    "headImage": "",
+    "headImg": [
+      "https://cdn.example.test/wechat/image-017.jpg",
+      "https://cdn.example.test/wechat/image-018.jpg",
+      "https://cdn.example.test/wechat/image-019.jpg",
+      "https://cdn.example.test/wechat/image-020.jpg"
+    ],
+    "headImgInfos": [
+      {
+        "imgHeight": 760,
+        "imgUrl": "https://cdn.example.test/wechat/image-021.jpg",
+        "imgWidth": 760
+      },
+      {
+        "imgHeight": 800,
+        "imgUrl": "https://cdn.example.test/wechat/image-022.jpg",
+        "imgWidth": 800
+      },
+      {
+        "imgHeight": 800,
+        "imgUrl": "https://cdn.example.test/wechat/image-023.jpg",
+        "imgWidth": 800
+      },
+      {
+        "imgHeight": 800,
+        "imgUrl": "https://cdn.example.test/wechat/image-024.jpg",
+        "imgWidth": 800
+      }
+    ],
+    "hideBottomBar": false,
+    "hideInWindow": false,
+    "iconTags": [
+      {
+        "tagName": "7天无理由退换货",
+        "tagType": 4
+      }
+    ],
+    "illegalRecordId": 0,
+    "invoiceConfig": {
+      "taxPreferMark": 0,
+      "taxRateValue": 0
+    },
+    "invoiceConfigV2": {
+      "taxPreferMark": 0,
+      "taxRateValue": 0
+    },
+    "isDuplicatedInShop": false,
+    "lastEditDraftTime": "1762138595",
+    "listingTime": "1762138630",
+    "maxPresaleEndTime": 0,
+    "nodeCatId": "6499",
+    "orderIconTags": [
+      {
+        "tagName": "7天无理由退换货",
+        "tagType": 4
+      }
+    ],
+    "originNodeCatId": "6499",
+    "originUploadSource": 3,
+    "param": [
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "适用年龄"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "6 个月以上"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 1,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "类别"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 1,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "其他"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "商品材质"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "塑料"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "生产企业名称"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "见详情"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "尺寸（长）"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "22 cm"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "尺寸（宽）"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "5 cm"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "尺寸（高）"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "5 cm"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "物品（含配件）清单"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 0,
+              "isRequired": 1
+            },
+            "fCatId": "0",
+            "name": "爬珠圣诞老人"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 1,
+              "isRequired": 0
+            },
+            "fCatId": "0",
+            "name": "产地"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 1,
+              "isRequired": 0
+            },
+            "fCatId": "0",
+            "name": "中国大陆"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 1,
+              "isRequired": 0
+            },
+            "fCatId": "0",
+            "name": "包装清单"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 2,
+              "isCustomize": 1,
+              "isRequired": 0
+            },
+            "fCatId": "0",
+            "name": "盒装"
+          }
+        ]
+      },
+      {
+        "categorys": [
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 1,
+              "isCustomize": 0,
+              "isRequired": 0
+            },
+            "fCatId": "0",
+            "name": "适用人群"
+          },
+          {
+            "brandCat": "0",
+            "catId": "0",
+            "catInfo": {
+              "inputType": 1,
+              "isCustomize": 0,
+              "isRequired": 0
+            },
+            "fCatId": "0",
+            "name": "儿童"
+          }
+        ]
+      }
+    ],
+    "presaleTag": 0,
+    "presaleTagType": 0,
+    "presentNeedSelectSku": true,
+    "presentPriceLimit": 0,
+    "productHeadimgInfo": [
+      {
+        "imgUrl": "https://cdn.example.test/wechat/image-025.jpg",
+        "mainColors": {
+          "blue": 49,
+          "green": 62,
+          "red": 80
+        }
+      }
+    ],
+    "productSaleAttrs": [
+      {
+        "hasImg": true,
+        "items": [
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-026.jpg",
+            "skuIds": [
+              "2696503115"
+            ],
+            "value": "【2个装】爬珠+爬烟囱老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-027.jpg",
+            "skuIds": [
+              "2696572494"
+            ],
+            "value": "金脚爬珠老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-028.jpg",
+            "skuIds": [
+              "2696479386"
+            ],
+            "value": "音乐爬烟囱老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-029.jpg",
+            "skuIds": [
+              "2696572493"
+            ],
+            "value": "音乐鹿拉车老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-030.jpg",
+            "skuIds": [
+              "2696459272"
+            ],
+            "value": "音乐闪灯舞台萨克斯老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-031.jpg",
+            "skuIds": [
+              "2696479387"
+            ],
+            "value": "单手倒立老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-032.jpg",
+            "skuIds": [
+              "2696444503"
+            ],
+            "value": "头顶倒立老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-033.jpg",
+            "skuIds": [
+              "2696550793"
+            ],
+            "value": "降落伞老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-034.jpg",
+            "skuIds": [
+              "2696479388"
+            ],
+            "value": "红色爬梯老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-035.jpg",
+            "skuIds": [
+              "2696527027"
+            ],
+            "value": "白色爬梯老人"
+          },
+          {
+            "imgUrl": "https://cdn.example.test/wechat/image-036.jpg",
+            "skuIds": [
+              "2696512378"
+            ],
+            "value": "音乐爬双梯老人"
+          }
+        ],
+        "key": "颜色"
+      }
+    ],
+    "productSkus": [
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1730431845003",
+                  "catInfo": {
+                    "editByUser": 1,
+                    "isCustomize": 0
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "2000000000006",
+                  "name": "【2个装】爬珠+爬烟囱老人",
+                  "priority": 1
+                }
+              ]
+            }
+          ],
+          "salePrice": 11590,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "78",
+            "stockNum": "1922",
+            "totalLock": "0",
+            "totalNum": "1922",
+            "totalSold": "78",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-037.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696503115",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1429240055",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "金脚爬珠老人",
+                  "priority": 2
+                }
+              ]
+            }
+          ],
+          "salePrice": 5890,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "153",
+            "stockNum": "1847",
+            "totalLock": "0",
+            "totalNum": "1847",
+            "totalSold": "153",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-038.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696572494",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1441375442",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "音乐爬烟囱老人",
+                  "priority": 3
+                }
+              ]
+            }
+          ],
+          "salePrice": 5890,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "33",
+            "stockNum": "1967",
+            "totalLock": "0",
+            "totalNum": "1967",
+            "totalSold": "33",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-039.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696479386",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "943366957",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "音乐鹿拉车老人",
+                  "priority": 4
+                }
+              ]
+            }
+          ],
+          "salePrice": 7290,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "29",
+            "stockNum": "1971",
+            "totalLock": "0",
+            "totalNum": "1971",
+            "totalSold": "29",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-040.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696572493",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1366115722",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "音乐闪灯舞台萨克斯老人",
+                  "priority": 5
+                }
+              ]
+            }
+          ],
+          "salePrice": 7290,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "17",
+            "stockNum": "1983",
+            "totalLock": "0",
+            "totalNum": "1983",
+            "totalSold": "17",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-041.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696459272",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1730431845001",
+                  "catInfo": {
+                    "editByUser": 1,
+                    "isCustomize": 0
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "2000000000004",
+                  "name": "单手倒立老人",
+                  "priority": 6
+                }
+              ]
+            }
+          ],
+          "salePrice": 6490,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "1",
+            "stockNum": "1999",
+            "totalLock": "0",
+            "totalNum": "1999",
+            "totalSold": "1",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-042.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696479387",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1730431845002",
+                  "catInfo": {
+                    "editByUser": 1,
+                    "isCustomize": 0
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "2000000000005",
+                  "name": "头顶倒立老人",
+                  "priority": 7
+                }
+              ]
+            }
+          ],
+          "salePrice": 6490,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "1",
+            "stockNum": "1999",
+            "totalLock": "0",
+            "totalNum": "1999",
+            "totalSold": "1",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-043.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696444503",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1328702928",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "降落伞老人",
+                  "priority": 8
+                }
+              ]
+            }
+          ],
+          "salePrice": 5990,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "165",
+            "stockNum": "1835",
+            "totalLock": "0",
+            "totalNum": "1835",
+            "totalSold": "165",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-044.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696550793",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "1445827710",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "红色爬梯老人",
+                  "priority": 9
+                }
+              ]
+            }
+          ],
+          "salePrice": 4990,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "30",
+            "stockNum": "1970",
+            "totalLock": "0",
+            "totalNum": "1970",
+            "totalSold": "30",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-045.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696479388",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "713219854",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "白色爬梯老人",
+                  "priority": 10
+                }
+              ]
+            }
+          ],
+          "salePrice": 4990,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "8",
+            "stockNum": "1992",
+            "totalLock": "0",
+            "totalNum": "1992",
+            "totalSold": "8",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-046.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696527027",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      },
+      {
+        "createTime": "1772529680",
+        "productSkuInfo": {
+          "barCode": "",
+          "originUploadSource": 3,
+          "saleParam": [
+            {
+              "categorys": [
+                {
+                  "catId": "1762138595054",
+                  "catInfo": {
+                    "isCustomize": 1
+                  },
+                  "catType": 8,
+                  "desc": "",
+                  "name": "颜色",
+                  "priority": 1
+                },
+                {
+                  "brandCat": "0",
+                  "catId": "868407925",
+                  "catInfo": {
+                    "editByUser": 0,
+                    "isCustomize": 1
+                  },
+                  "catType": 0,
+                  "desc": "",
+                  "fCatId": "1447691993",
+                  "name": "音乐爬双梯老人",
+                  "priority": 11
+                }
+              ]
+            }
+          ],
+          "salePrice": 6590,
+          "skuCode": "",
+          "skuDeliverInfo": {
+            "spotAfterPresaleEnd": 0,
+            "stockType": 0
+          },
+          "stockInfo": {
+            "exclusiveLock": "0",
+            "exclusiveNum": "0",
+            "exclusiveSold": "0",
+            "finderTotalLock": "0",
+            "finderTotalNum": "0",
+            "finderTotalSold": "0",
+            "lockStock": "0",
+            "priceIncrease": "0",
+            "soldStock": "14",
+            "stockNum": "1986",
+            "totalLock": "0",
+            "totalNum": "1986",
+            "totalSold": "14",
+            "unsellableNum": "0"
+          },
+          "thumbImg": "https://cdn.example.test/wechat/image-047.jpg",
+          "uploadSource": 6
+        },
+        "skuKey": {
+          "productKey": {
+            "productId": "10000161946828"
+          },
+          "skuId": "2696512378",
+          "skuSnapId": "1248474843"
+        },
+        "status": 5,
+        "updateTime": "1772529680"
+      }
+    ],
+    "productType": 1,
+    "qualificationList": [
+      {
+        "qualificationId": "1111492",
+        "qualificationUrl": [
+          "https://cdn.example.test/wechat/image-048.jpg"
+        ],
+        "showCertType": 0
+      }
+    ],
+    "qualificationWording": "",
+    "recommendCategory": {
+      "interfaceName": "none",
+      "isAccepted": false,
+      "recommendSource": "none",
+      "useNewInterface": 0
+    },
+    "releaseMode": 0,
+    "serviceDesc": {
+      "desc": ""
+    },
+    "shopcatVersion": 0,
+    "shortTitle": "创意电动圣诞老人儿童礼物",
+    "showPresentBtn": false,
+    "skuIdList": {
+      "skuIds": [
+        "2696503115",
+        "2696572494",
+        "2696479386",
+        "2696572493",
+        "2696459272",
+        "2696479387",
+        "2696444503",
+        "2696550793",
+        "2696479388",
+        "2696527027",
+        "2696512378"
+      ]
+    },
+    "skuList": {
+      "buyButtonWording": "购买",
+      "canUseSubsidy": false,
+      "defaultSelectedSkuId": "2696479388",
+      "discountedPrice": 0,
+      "estimateActivityDiscountedPrice": "0",
+      "estimateActivityId": "0",
+      "estimateActivitySubsidyType": 0,
+      "estimateBatchId": "",
+      "estimateCashCouponDiscountCouponId": "",
+      "estimateCashCouponDiscountPrice": "0",
+      "estimateCashCouponPromoteType": 0,
+      "estimateCashCouponSecondBusinessScene": 0,
+      "estimateCouponId": "0",
+      "estimateCouponPromoteType": 0,
+      "estimateFavorCouponId": "0",
+      "estimateLimitedDiscountInfo": {},
+      "estimateNextLevelPrice": "0",
+      "estimatePlatformDiscountCouponId": "0",
+      "estimatePrice": 4990,
+      "estimateRelatedActivityId": "0",
+      "estimateSkuSpecUnitPrice": {},
+      "estimateSubsidyRuleId": "0",
+      "isDiscounted": false,
+      "isOfficialSubsidy": false,
+      "maxPrice": 11590,
+      "minPrice": 4990,
+      "minPriceSkuId": "2696479388",
+      "minPriceType": 0,
+      "minPriceWording": "",
+      "originPrice": 4990,
+      "preEstimatePrice": "4990",
+      "referencePrice": 4990,
+      "showStrikethroughPrice": 2,
+      "skuInfo": [
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 11590,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 11590,
+          "preEstimatePrice": "11590",
+          "price": 11590,
+          "priceType": 0,
+          "referencePrice": 11590,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696503115",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 5890,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 5890,
+          "preEstimatePrice": "5890",
+          "price": 5890,
+          "priceType": 0,
+          "referencePrice": 5890,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696572494",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 5890,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 5890,
+          "preEstimatePrice": "5890",
+          "price": 5890,
+          "priceType": 0,
+          "referencePrice": 5890,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696479386",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 7290,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 7290,
+          "preEstimatePrice": "7290",
+          "price": 7290,
+          "priceType": 0,
+          "referencePrice": 7290,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696572493",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 7290,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 7290,
+          "preEstimatePrice": "7290",
+          "price": 7290,
+          "priceType": 0,
+          "referencePrice": 7290,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696459272",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 6490,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 6490,
+          "preEstimatePrice": "6490",
+          "price": 6490,
+          "priceType": 0,
+          "referencePrice": 6490,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696479387",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 6490,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 6490,
+          "preEstimatePrice": "6490",
+          "price": 6490,
+          "priceType": 0,
+          "referencePrice": 6490,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696444503",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 5990,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 5990,
+          "preEstimatePrice": "5990",
+          "price": 5990,
+          "priceType": 0,
+          "referencePrice": 5990,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696550793",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 4990,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 4990,
+          "preEstimatePrice": "4990",
+          "price": 4990,
+          "priceType": 0,
+          "referencePrice": 4990,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696479388",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 4990,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 4990,
+          "preEstimatePrice": "4990",
+          "price": 4990,
+          "priceType": 0,
+          "referencePrice": 4990,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696527027",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        },
+        {
+          "activityBanner": {},
+          "allowOrderWithDiscountedPriceNum": "1000",
+          "barCode": "",
+          "canUseCoupon": true,
+          "discountedPrice": 0,
+          "estimatePrice": 6590,
+          "estimatePriceType": 0,
+          "isDiscounted": false,
+          "originPrice": 6590,
+          "preEstimatePrice": "6590",
+          "price": 6590,
+          "priceType": 0,
+          "referencePrice": 6590,
+          "showStrikethroughPrice": 2,
+          "skuId": "2696512378",
+          "skuImgUrl": {
+            "productSubsidyLabelImgUrl": "",
+            "productSubsidyLabelImgUrl4ProductDetail": ""
+          },
+          "skuSnapId": "1248474843"
+        }
+      ],
+      "subsidyType": 0,
+      "withoutMicroMemberPriceWording": ""
+    },
+    "snapshotInfo": {
+      "auditId": "7861071864",
+      "snapshotId": "1248474843"
+    },
+    "spuCode": "TB660361518354",
+    "spuLimited": {
+      "limitedBuyNum": 0,
+      "periodType": 0
+    },
+    "spuTotalStock": {
+      "exclusiveLock": "0",
+      "exclusiveNum": "0",
+      "exclusiveSold": "0",
+      "limitedDiscountStockNum": "0",
+      "lockStock": "0",
+      "soldStock": "529",
+      "stockNum": "21471",
+      "totalLock": "0",
+      "totalNum": "21471",
+      "totalSold": "529",
+      "unsellableNum": "0"
+    },
+    "subTitle": "",
+    "title": "圣诞节电动爬珠圣诞老人 儿童圣诞节创意礼物",
+    "titleUtf8Token": "",
+    "totalOrderNum": "0",
+    "totalSoldNum": "533",
+    "totalStockNum": "21471",
+    "totalVisitNum": "0",
+    "uniqueId": "4237021302764453899",
+    "updateStatusTime": "0",
+    "uploadSource": 6,
+    "virtualType": 2
+  },
+  "brandId": "2100000000",
+  "catId": "6472/6497/6499",
+  "categoryIds": [
+    "6472",
+    "6497",
+    "6499"
+  ],
+  "categoryNames": [
+    "",
+    "",
+    "创意玩具"
+  ],
+  "categoryPathIds": [
+    "10000132",
+    "10000137",
+    "6499"
+  ],
+  "categoryPathNames": [
+    "玩具乐器",
+    "创意减压",
+    "创意玩具"
+  ],
+  "couponEnrichment": {
+    "accountContext": {
+      "shopIsNewCustomer": {
+        "display": "未知",
+        "source": "",
+        "status": "unknown",
+        "value": null
+      },
+      "source": "connected-wechat"
+    },
+    "complete": false,
+    "coupons": [],
+    "coverage": {
+      "observedCouponCount": 0,
+      "omittedProductCouponObjects": 0,
+      "omittedSKUCount": 0,
+      "queriedCouponCount": 0,
+      "queryLimit": 20,
+      "referencedCouponCount": 0,
+      "unobservedCouponCount": 0,
+      "unqueriedCouponCount": 0,
+      "unresolvedReferenceCount": 0
+    },
+    "currency": "CNY",
+    "moneyUnit": "fen",
+    "observedAt": "未知",
+    "recordIdentity": {
+      "productId": "10000161946828"
+    },
+    "schemaVersion": 1,
+    "scope": "referenced-coupons-only",
+    "skus": [
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "11590",
+          "source": "_raw.skuList.skuInfo[0].estimatePrice",
+          "status": "observed",
+          "value": 11590
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "11590",
+          "source": "_raw.skuList.skuInfo[0].price",
+          "status": "observed",
+          "value": 11590
+        },
+        "skuId": {
+          "display": "2696503115",
+          "source": "_raw.skuList.skuInfo[0].skuId",
+          "status": "observed",
+          "value": "2696503115"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "5890",
+          "source": "_raw.skuList.skuInfo[1].estimatePrice",
+          "status": "observed",
+          "value": 5890
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "5890",
+          "source": "_raw.skuList.skuInfo[1].price",
+          "status": "observed",
+          "value": 5890
+        },
+        "skuId": {
+          "display": "2696572494",
+          "source": "_raw.skuList.skuInfo[1].skuId",
+          "status": "observed",
+          "value": "2696572494"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "5890",
+          "source": "_raw.skuList.skuInfo[2].estimatePrice",
+          "status": "observed",
+          "value": 5890
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "5890",
+          "source": "_raw.skuList.skuInfo[2].price",
+          "status": "observed",
+          "value": 5890
+        },
+        "skuId": {
+          "display": "2696479386",
+          "source": "_raw.skuList.skuInfo[2].skuId",
+          "status": "observed",
+          "value": "2696479386"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "7290",
+          "source": "_raw.skuList.skuInfo[3].estimatePrice",
+          "status": "observed",
+          "value": 7290
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "7290",
+          "source": "_raw.skuList.skuInfo[3].price",
+          "status": "observed",
+          "value": 7290
+        },
+        "skuId": {
+          "display": "2696572493",
+          "source": "_raw.skuList.skuInfo[3].skuId",
+          "status": "observed",
+          "value": "2696572493"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "7290",
+          "source": "_raw.skuList.skuInfo[4].estimatePrice",
+          "status": "observed",
+          "value": 7290
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "7290",
+          "source": "_raw.skuList.skuInfo[4].price",
+          "status": "observed",
+          "value": 7290
+        },
+        "skuId": {
+          "display": "2696459272",
+          "source": "_raw.skuList.skuInfo[4].skuId",
+          "status": "observed",
+          "value": "2696459272"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "6490",
+          "source": "_raw.skuList.skuInfo[5].estimatePrice",
+          "status": "observed",
+          "value": 6490
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "6490",
+          "source": "_raw.skuList.skuInfo[5].price",
+          "status": "observed",
+          "value": 6490
+        },
+        "skuId": {
+          "display": "2696479387",
+          "source": "_raw.skuList.skuInfo[5].skuId",
+          "status": "observed",
+          "value": "2696479387"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "6490",
+          "source": "_raw.skuList.skuInfo[6].estimatePrice",
+          "status": "observed",
+          "value": 6490
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "6490",
+          "source": "_raw.skuList.skuInfo[6].price",
+          "status": "observed",
+          "value": 6490
+        },
+        "skuId": {
+          "display": "2696444503",
+          "source": "_raw.skuList.skuInfo[6].skuId",
+          "status": "observed",
+          "value": "2696444503"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "5990",
+          "source": "_raw.skuList.skuInfo[7].estimatePrice",
+          "status": "observed",
+          "value": 5990
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "5990",
+          "source": "_raw.skuList.skuInfo[7].price",
+          "status": "observed",
+          "value": 5990
+        },
+        "skuId": {
+          "display": "2696550793",
+          "source": "_raw.skuList.skuInfo[7].skuId",
+          "status": "observed",
+          "value": "2696550793"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "4990",
+          "source": "_raw.skuList.skuInfo[8].estimatePrice",
+          "status": "observed",
+          "value": 4990
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "4990",
+          "source": "_raw.skuList.skuInfo[8].price",
+          "status": "observed",
+          "value": 4990
+        },
+        "skuId": {
+          "display": "2696479388",
+          "source": "_raw.skuList.skuInfo[8].skuId",
+          "status": "observed",
+          "value": "2696479388"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "4990",
+          "source": "_raw.skuList.skuInfo[9].estimatePrice",
+          "status": "observed",
+          "value": 4990
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "4990",
+          "source": "_raw.skuList.skuInfo[9].price",
+          "status": "observed",
+          "value": 4990
+        },
+        "skuId": {
+          "display": "2696527027",
+          "source": "_raw.skuList.skuInfo[9].skuId",
+          "status": "observed",
+          "value": "2696527027"
+        }
+      },
+      {
+        "couponReferences": [],
+        "estimatePriceFen": {
+          "display": "6590",
+          "source": "_raw.skuList.skuInfo[10].estimatePrice",
+          "status": "observed",
+          "value": 6590
+        },
+        "oldCustomerPriceFen": {
+          "display": "未知",
+          "source": "",
+          "status": "unknown",
+          "value": null
+        },
+        "priceFen": {
+          "display": "6590",
+          "source": "_raw.skuList.skuInfo[10].price",
+          "status": "observed",
+          "value": 6590
+        },
+        "skuId": {
+          "display": "2696512378",
+          "source": "_raw.skuList.skuInfo[10].skuId",
+          "status": "observed",
+          "value": "2696512378"
+        }
+      }
+    ],
+    "status": "not-queried"
+  },
+  "detailImgCount": 16,
+  "estimatePrice_yuan": "49.90",
+  "headImg": [
+    "https://cdn.example.test/wechat/image-049.jpg",
+    "https://cdn.example.test/wechat/image-050.jpg",
+    "https://cdn.example.test/wechat/image-051.jpg",
+    "https://cdn.example.test/wechat/image-052.jpg"
+  ],
+  "headImgs": [
+    "https://cdn.example.test/wechat/image-053.jpg",
+    "https://cdn.example.test/wechat/image-054.jpg",
+    "https://cdn.example.test/wechat/image-055.jpg",
+    "https://cdn.example.test/wechat/image-056.jpg"
+  ],
+  "itemId": "10000161946828",
+  "listingTime": "1762138630",
+  "maxPrice": 115.9,
+  "maxPrice_yuan": "115.90",
+  "minDiscountPrice": 0,
+  "minEstimatePrice": 49.9,
+  "minPrice": 49.9,
+  "minPrice_yuan": "49.90",
+  "params": "适用年龄=6 个月以上; 类别=其他; 商品材质=塑料; 生产企业名称=见详情; 尺寸（长）=22 cm; 尺寸（宽）=5 cm; 尺寸（高）=5 cm; 物品（含配件）清单=爬珠圣诞老人; 产地=中国大陆; 包装清单=盒装; 适用人群=儿童",
+  "priceBreakdown": {
+    "currency": "CNY",
+    "entries": [
+      {
+        "conditional": false,
+        "kind": "listed",
+        "label": "标价",
+        "max": 115.9,
+        "min": 49.9,
+        "source": "skuList.skuInfo.price"
+      },
+      {
+        "conditional": false,
+        "kind": "original",
+        "label": "原价",
+        "max": 115.9,
+        "min": 49.9,
+        "source": "skuList.skuInfo.originPrice"
+      },
+      {
+        "conditional": false,
+        "kind": "reference",
+        "label": "参考价",
+        "max": 115.9,
+        "min": 49.9,
+        "source": "skuList.skuInfo.referencePrice"
+      },
+      {
+        "conditional": true,
+        "kind": "estimated",
+        "label": "预估价",
+        "max": 115.9,
+        "min": 49.9,
+        "source": "skuList.skuInfo.estimatePrice"
+      },
+      {
+        "conditional": true,
+        "kind": "discount",
+        "label": "优惠减免",
+        "max": 0,
+        "min": 0,
+        "source": "skuList.skuInfo.discountedPrice"
+      }
+    ],
+    "schema": 1
+  },
+  "pricingEvidence": {
+    "complete": false,
+    "currency": "CNY",
+    "discountViewScope": "wordingList-and-productdetail-are-separate-non-additive-views",
+    "issues": [
+      "sku-discounts-or-hit-types-unavailable"
+    ],
+    "moneyUnit": "fen",
+    "productId": "10000161946828",
+    "productLimits": {
+      "limitedBuyNum": {
+        "display": "0",
+        "source": "_raw.spuLimited.limitedBuyNum",
+        "status": "observed",
+        "value": 0
+      },
+      "periodType": {
+        "display": "0",
+        "source": "_raw.spuLimited.periodType",
+        "status": "observed",
+        "value": 0
+      },
+      "updateTime": {
+        "display": "未知",
+        "source": "",
+        "status": "unknown",
+        "value": null
+      }
+    },
+    "schemaVersion": 1,
+    "scope": "native-snapshot-only;not-checkout;not-repricing;not-complete-offer-set",
+    "skus": [
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[0].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696503115",
+        "source": "_raw.skuList.skuInfo[0]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[1].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696572494",
+        "source": "_raw.skuList.skuInfo[1]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[2].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696479386",
+        "source": "_raw.skuList.skuInfo[2]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[3].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696572493",
+        "source": "_raw.skuList.skuInfo[3]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[4].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696459272",
+        "source": "_raw.skuList.skuInfo[4]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[5].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696479387",
+        "source": "_raw.skuList.skuInfo[5]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[6].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696444503",
+        "source": "_raw.skuList.skuInfo[6]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[7].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696550793",
+        "source": "_raw.skuList.skuInfo[7]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[8].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696479388",
+        "source": "_raw.skuList.skuInfo[8]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[9].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696527027",
+        "source": "_raw.skuList.skuInfo[9]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      },
+      {
+        "directActivityQuotes": [],
+        "hitPromoteTypes": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "limits": {
+          "allowOrderWithDiscountedPriceNum": {
+            "display": "1000",
+            "source": "_raw.skuList.skuInfo[10].allowOrderWithDiscountedPriceNum",
+            "status": "observed",
+            "value": 1000
+          },
+          "allowOrderWithDiscountedPriceNumSource": {
+            "display": "未知",
+            "source": "",
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "skuId": "2696512378",
+        "source": "_raw.skuList.skuInfo[10]",
+        "wordingList": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        },
+        "wordingListForProductdetail": {
+          "items": [],
+          "source": "",
+          "status": "unknown"
+        }
+      }
+    ],
+    "status": "partial"
+  },
+  "productCategory": "玩具乐器 > 创意减压 > 创意玩具",
+  "productCategorySource": "微信官方类目快照 2026-10-29",
+  "productCategoryStatus": "mapped",
+  "productId": "10000161946828",
+  "qualImgs": [
+    "https://cdn.example.test/wechat/image-057.jpg"
+  ],
+  "saleAttrs": [
+    {
+      "key": "颜色",
+      "values": [
+        "【2个装】爬珠+爬烟囱老人",
+        "金脚爬珠老人",
+        "音乐爬烟囱老人",
+        "音乐鹿拉车老人",
+        "音乐闪灯舞台萨克斯老人",
+        "单手倒立老人",
+        "头顶倒立老人",
+        "降落伞老人",
+        "红色爬梯老人",
+        "白色爬梯老人",
+        "音乐爬双梯老人"
+      ]
+    }
+  ],
+  "saleAttrsText": "颜色:【2个装】爬珠+爬烟囱老人/金脚爬珠老人/音乐爬烟囱老人/音乐鹿拉车老人/音乐闪灯舞台萨克斯老人/单手倒立老人/头顶倒立老人/降落伞老人/红色爬梯老人/白色爬梯老人/音乐爬双梯老人",
+  "services": "7天无理由/极速退款/换货/7天无理由退换货",
+  "shortTitle": "脱敏测试微信商品",
+  "skuAttrs": [
+    {
+      "skuId": "2696503115",
+      "values": [
+        "颜色",
+        "【2个装】爬珠+爬烟囱老人"
+      ]
+    },
+    {
+      "skuId": "2696572494",
+      "values": [
+        "颜色",
+        "金脚爬珠老人"
+      ]
+    },
+    {
+      "skuId": "2696479386",
+      "values": [
+        "颜色",
+        "音乐爬烟囱老人"
+      ]
+    },
+    {
+      "skuId": "2696572493",
+      "values": [
+        "颜色",
+        "音乐鹿拉车老人"
+      ]
+    },
+    {
+      "skuId": "2696459272",
+      "values": [
+        "颜色",
+        "音乐闪灯舞台萨克斯老人"
+      ]
+    },
+    {
+      "skuId": "2696479387",
+      "values": [
+        "颜色",
+        "单手倒立老人"
+      ]
+    },
+    {
+      "skuId": "2696444503",
+      "values": [
+        "颜色",
+        "头顶倒立老人"
+      ]
+    },
+    {
+      "skuId": "2696550793",
+      "values": [
+        "颜色",
+        "降落伞老人"
+      ]
+    },
+    {
+      "skuId": "2696479388",
+      "values": [
+        "颜色",
+        "红色爬梯老人"
+      ]
+    },
+    {
+      "skuId": "2696527027",
+      "values": [
+        "颜色",
+        "白色爬梯老人"
+      ]
+    },
+    {
+      "skuId": "2696512378",
+      "values": [
+        "颜色",
+        "音乐爬双梯老人"
+      ]
+    }
+  ],
+  "skuCount": 11,
+  "skuSpecs": [
+    {
+      "img": "https://cdn.example.test/wechat/image-058.jpg",
+      "originPrice": "115.90",
+      "price": "115.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 115.9,
+            "min": 115.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 115.9,
+            "min": 115.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 115.9,
+            "min": 115.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 115.9,
+            "min": 115.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696503115",
+      "spec": "颜色:【2个装】爬珠+爬烟囱老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "【2个装】爬珠+爬烟囱老人"
+        }
+      ],
+      "stock": 1922
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-059.jpg",
+      "originPrice": "58.90",
+      "price": "58.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696572494",
+      "spec": "颜色:金脚爬珠老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "金脚爬珠老人"
+        }
+      ],
+      "stock": 1847
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-060.jpg",
+      "originPrice": "58.90",
+      "price": "58.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 58.9,
+            "min": 58.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696479386",
+      "spec": "颜色:音乐爬烟囱老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "音乐爬烟囱老人"
+        }
+      ],
+      "stock": 1967
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-061.jpg",
+      "originPrice": "72.90",
+      "price": "72.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696572493",
+      "spec": "颜色:音乐鹿拉车老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "音乐鹿拉车老人"
+        }
+      ],
+      "stock": 1971
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-062.jpg",
+      "originPrice": "72.90",
+      "price": "72.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 72.9,
+            "min": 72.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696459272",
+      "spec": "颜色:音乐闪灯舞台萨克斯老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "音乐闪灯舞台萨克斯老人"
+        }
+      ],
+      "stock": 1983
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-063.jpg",
+      "originPrice": "64.90",
+      "price": "64.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696479387",
+      "spec": "颜色:单手倒立老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "单手倒立老人"
+        }
+      ],
+      "stock": 1999
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-064.jpg",
+      "originPrice": "64.90",
+      "price": "64.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 64.9,
+            "min": 64.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696444503",
+      "spec": "颜色:头顶倒立老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "头顶倒立老人"
+        }
+      ],
+      "stock": 1999
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-065.jpg",
+      "originPrice": "59.90",
+      "price": "59.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 59.9,
+            "min": 59.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 59.9,
+            "min": 59.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 59.9,
+            "min": 59.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 59.9,
+            "min": 59.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696550793",
+      "spec": "颜色:降落伞老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "降落伞老人"
+        }
+      ],
+      "stock": 1835
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-066.jpg",
+      "originPrice": "49.90",
+      "price": "49.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696479388",
+      "spec": "颜色:红色爬梯老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "红色爬梯老人"
+        }
+      ],
+      "stock": 1970
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-067.jpg",
+      "originPrice": "49.90",
+      "price": "49.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 49.9,
+            "min": 49.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696527027",
+      "spec": "颜色:白色爬梯老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "白色爬梯老人"
+        }
+      ],
+      "stock": 1992
+    },
+    {
+      "img": "https://cdn.example.test/wechat/image-068.jpg",
+      "originPrice": "65.90",
+      "price": "65.90",
+      "priceBreakdown": {
+        "currency": "CNY",
+        "entries": [
+          {
+            "conditional": false,
+            "kind": "listed",
+            "label": "标价",
+            "max": 65.9,
+            "min": 65.9,
+            "source": "skuList.skuInfo.price"
+          },
+          {
+            "conditional": false,
+            "kind": "original",
+            "label": "原价",
+            "max": 65.9,
+            "min": 65.9,
+            "source": "skuList.skuInfo.originPrice"
+          },
+          {
+            "conditional": false,
+            "kind": "reference",
+            "label": "参考价",
+            "max": 65.9,
+            "min": 65.9,
+            "source": "skuList.skuInfo.referencePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "estimated",
+            "label": "预估价",
+            "max": 65.9,
+            "min": 65.9,
+            "source": "skuList.skuInfo.estimatePrice"
+          },
+          {
+            "conditional": true,
+            "kind": "discount",
+            "label": "优惠减免",
+            "max": 0,
+            "min": 0,
+            "source": "skuList.skuInfo.discountedPrice"
+          }
+        ],
+        "schema": 1
+      },
+      "skuId": "2696512378",
+      "spec": "颜色:音乐爬双梯老人",
+      "specAttrs": [
+        {
+          "key": "颜色",
+          "value": "音乐爬双梯老人"
+        }
+      ],
+      "stock": 1986
+    }
+  ],
+  "specImgs": [
+    "https://cdn.example.test/wechat/image-069.jpg",
+    "https://cdn.example.test/wechat/image-070.jpg",
+    "https://cdn.example.test/wechat/image-071.jpg",
+    "https://cdn.example.test/wechat/image-072.jpg",
+    "https://cdn.example.test/wechat/image-073.jpg",
+    "https://cdn.example.test/wechat/image-074.jpg",
+    "https://cdn.example.test/wechat/image-075.jpg",
+    "https://cdn.example.test/wechat/image-076.jpg",
+    "https://cdn.example.test/wechat/image-077.jpg",
+    "https://cdn.example.test/wechat/image-078.jpg",
+    "https://cdn.example.test/wechat/image-079.jpg"
+  ],
+  "subTitle": "",
+  "title": "脱敏测试微信商品数据包",
+  "totalOrder": "0",
+  "totalSold": "533",
+  "totalStock": "21471",
+  "totalVisit": "0",
+  "videoUrls": []
+}

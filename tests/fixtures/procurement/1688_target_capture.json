@@ -1,0 +1,54 @@
+{
+  "fixture_name": "desensitized-1688-target-capture",
+  "url": "https://detail.1688.com/offer/1048048297681.html",
+  "offer_id": "1048048297681",
+  "dom": {
+    "title": "厨房整理第1名",
+    "product_title": "",
+    "main_images": []
+  },
+  "responses": [
+    {
+      "url": "https://h5api.m.1688.com/h5/mtop.1688.recommend/1.0/?offerId=999999999999",
+      "data": {
+        "data": {
+          "offerId": "999999999999",
+          "subject": "厨房整理第1名",
+          "price": "1.00",
+          "skuInfoList": [
+            {
+              "skuId": "RECOMMEND-SKU",
+              "price": "1.00",
+              "stock": 999,
+              "specAttrs": "颜色:推荐色"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "url": "https://h5api.m.1688.com/h5/mtop.1688.offer.get/1.0/?offerId=1048048297681",
+      "data": {
+        "data": {
+          "offerId": "1048048297681",
+          "subject": "官方目标商品",
+          "categoryPath": "家居 / 收纳",
+          "skuInfos": [
+            {
+              "skuId": "REAL-BLACK-XL",
+              "price": "46.80",
+              "stock": 20,
+              "specAttrs": "颜色:黑色;尺码:XL"
+            },
+            {
+              "skuId": "REAL-WHITE-L",
+              "price": "47.80",
+              "stock": 8,
+              "specAttrs": "颜色:白色;尺码:L"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

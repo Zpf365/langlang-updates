@@ -406,6 +406,7 @@ class ReferenceBigScreenPage(BasePage):
             ),
         )
         self.rank_trees: dict[str, ttk.Treeview] = {}
+        self.rank_more_buttons: dict[str, tk.Button] = {}
         for column, (title, columns, key) in enumerate(definitions):
             panel, body = self._panel(bottom, title)
             panel.grid(
@@ -415,7 +416,7 @@ class ReferenceBigScreenPage(BasePage):
                 padx=(0 if column == 0 else 6, 0),
             )
             heading = panel.winfo_children()[0]
-            tk.Button(
+            more_button = tk.Button(
                 heading,
                 text="更多数据",
                 command=lambda route=key: self._show_more(route),
@@ -427,7 +428,9 @@ class ReferenceBigScreenPage(BasePage):
                 bd=0,
                 cursor="hand2",
                 font=("Microsoft YaHei UI", 8),
-            ).pack(side="right")
+            )
+            more_button.pack(side="right")
+            self.rank_more_buttons[key] = more_button
             tree = ttk.Treeview(
                 body,
                 columns=tuple(item[0] for item in columns),
@@ -556,6 +559,17 @@ class ReferenceBigScreenPage(BasePage):
             else:
                 values.append(_number(int(row.values[0]), hidden=hidden))
             tree.insert("", "end", values=values)
+        if rows:
+            if not tree.winfo_manager():
+                tree.pack(fill="both", expand=True)
+            more_button = getattr(self, "rank_more_buttons", {}).get(key)
+            if more_button is not None and not more_button.winfo_manager():
+                more_button.pack(side="right")
+        else:
+            tree.pack_forget()
+            more_button = getattr(self, "rank_more_buttons", {}).get(key)
+            if more_button is not None:
+                more_button.pack_forget()
 
     def _draw_chart(self) -> None:
         if not hasattr(self, "chart"):

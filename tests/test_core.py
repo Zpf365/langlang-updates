@@ -106,7 +106,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(grouped["week_revenue"], 17500)
         self.assertEqual(grouped["month_revenue"], 17500)
 
-    def test_store_metrics_do_not_replace_sales_with_platform_gift_gmv(
+    def test_store_metrics_use_official_pay_gmv_instead_of_local_cache(
         self,
     ) -> None:
         store_id = self.db.add_store(
@@ -166,8 +166,11 @@ class CoreTests(unittest.TestCase):
             def deposit_balance(self):
                 return 0
 
-            def recommend_overview(self, _yesterday):
-                return {"exposure": 0}
+            def recommend_overview(self, _yesterday=False, *, days=None):
+                return {"exposure": 700 if days == 7 else 100}
+
+            def status_counts(self):
+                return {"sales": 5}
 
             def search_overview(self, _days):
                 return {"search_exposure_yesterday": 0}
@@ -203,10 +206,15 @@ class CoreTests(unittest.TestCase):
         ):
             metrics = service.refresh_store_metrics(store)
 
-        self.assertEqual(metrics["gmv_today"], 17500)
+        self.assertEqual(metrics["gmv_today"], 949999)
+        self.assertEqual(metrics["today_orders"], 65)
+        self.assertEqual(metrics["buyers_today"], 88)
+        self.assertEqual(
+            metrics["_gift_exclusion"]["today"]["deducted_amount"],
+            50000,
+        )
         self.assertEqual(metrics["gmv_7d"], 17500)
         self.assertEqual(metrics["gmv_30d"], 17500)
-        self.assertEqual(metrics["today_orders"], 3)
 
     def test_empty_store_page_schedules_followup_refresh(self) -> None:
         tree = SimpleNamespace(children=[])
@@ -1093,6 +1101,50 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(updated_order)
         self.assertEqual(updated_order.status, 21)
 
+    def test_sync_store_profile_replaces_app_id_placeholder_name(self) -> None:
+        store_id = self.db.add_store("demo-store", "demo-store", "local")
+        store = self.db.get_store(store_id)
+        self.assertIsNotNone(store)
+
+        SyncService(self.db).sync_store_profile(store)
+
+        refreshed = self.db.get_store(store_id)
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed.name, "澜琅演示店铺")
+        self.assertEqual(
+            self.db.get_store_profile(store_id)["nickname"],
+            "澜琅演示店铺",
+        )
+
+    def test_store_refresh_resolves_app_id_placeholder_name(self) -> None:
+        store_id = self.db.add_store("demo-store", "demo-store", "local")
+        store = self.db.get_store(store_id)
+        self.assertIsNotNone(store)
+        service = SyncService(self.db)
+
+        with patch.object(
+            service,
+            "sync_store_profile",
+            wraps=service.sync_store_profile,
+        ) as sync_profile:
+            service.refresh_store_metrics(store)
+
+        sync_profile.assert_called_once_with(store)
+        refreshed = self.db.get_store(store_id)
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed.name, "澜琅演示店铺")
+
+    def test_store_profile_does_not_overwrite_user_renamed_store(self) -> None:
+        store_id = self.db.add_store("我的自定义店铺", "demo-store", "local")
+        store = self.db.get_store(store_id)
+        self.assertIsNotNone(store)
+
+        SyncService(self.db).sync_store_profile(store)
+
+        refreshed = self.db.get_store(store_id)
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed.name, "我的自定义店铺")
+
     def test_product_add_reads_nested_id_and_mirrors_remote_image(self) -> None:
         store_id = self.db.add_store(
             "图片转存测试",
@@ -1446,6 +1498,59 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(prepared["deliver_method"], 0)
         self.assertEqual(client.freight_calls, 1)
         self.assertEqual(client.address_calls, 1)
+
+    def test_product_payload_rejects_stale_cross_store_delivery_config(
+        self,
+    ) -> None:
+        store_id = self.db.add_store(
+            "模板归属校验店铺",
+            "wx-delivery-ownership",
+            "secret",
+        )
+        store = self.db.get_store(store_id)
+        assert store
+
+        class FakeClient:
+            def fetch_freight_template_ids(self):
+                return ["955819508004"]
+
+            def fetch_merchant_address_ids(self):
+                return ["75563108002"]
+
+            def fetch_freight_template_detail(self, _template_id):
+                return {"name": "全国包邮（偏远地区除外）"}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "不属于当前店铺或已失效",
+        ):
+            SyncService(self.db)._prepare_product_payload(
+                store,
+                FakeClient(),
+                {
+                    "title": "模板归属测试",
+                    "head_imgs": [
+                        "https://mmecimage.cn/source-1",
+                        "https://mmecimage.cn/source-2",
+                        "https://mmecimage.cn/source-3",
+                    ],
+                    "desc_info": {
+                        "imgs": ["https://mmecimage.cn/source-1"],
+                        "desc": "",
+                    },
+                    "cats": [{"cat_id": "1470"}],
+                    "skus": [{"sale_price": 100, "stock_num": 1}],
+                    "deliver_method": 0,
+                    "express_info": {
+                        "template_id": "1103871366004",
+                        "weight": 1000,
+                        "express_type": 0,
+                    },
+                    "after_sale_info": {
+                        "after_sale_address_id": "75563108002",
+                    },
+                },
+            )
 
     def test_product_payload_rejects_fewer_than_three_head_images(
         self,
@@ -2245,6 +2350,46 @@ class CoreTests(unittest.TestCase):
             "/channels/ec/product/limiteddiscounttask/add",
         )
 
+    def test_client_batches_every_league_item_in_groups_of_twenty(self) -> None:
+        calls = []
+        client = object.__new__(WechatShopClient)
+        client.app_id = "wx-test"
+        client.write_authorizer = lambda _app_id, _action: None
+
+        def post(path, payload, *, action):
+            calls.append((path, dict(payload), action))
+            return {
+                "errcode": 0,
+                "result_info_list": [
+                    {
+                        "product_id": item["product_id"],
+                        "errcode": 0,
+                    }
+                    for item in payload["list"]
+                ],
+            }
+
+        client._post_write_api = post
+        result = client.batch_add_league_items(
+            [
+                {"product_id": str(1000 + index), "ratio": 20}
+                for index in range(45)
+            ],
+        )
+
+        self.assertEqual([len(call[1]["list"]) for call in calls], [20, 20, 5])
+        self.assertEqual(result["requested_count"], 45)
+        self.assertEqual(result["batch_count"], 3)
+        self.assertEqual(result["errcode"], 0)
+        self.assertEqual(len(result["result_info_list"]), 45)
+        self.assertTrue(
+            all(call[1]["list"][0]["ratio"] == 20 for call in calls)
+        )
+        self.assertEqual(
+            [call[2] for call in calls],
+            ["league_items_add", "league_items_add", "league_items_add"],
+        )
+
     def test_limited_discount_uses_platform_limit_and_half_up_rounding(
         self,
     ) -> None:
@@ -2703,6 +2848,7 @@ class CoreTests(unittest.TestCase):
                                 {
                                     "productId": "10001",
                                     "productDesc": "测试商品",
+                                    "productImg": "https://example.test/violation.jpg",
                                 }
                             ],
                             "status": 5,
@@ -2725,6 +2871,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["reason"], "价格违规")
         self.assertEqual(rows[0]["status"], "超时未申诉")
         self.assertEqual(rows[0]["fix"], "及时改价")
+        self.assertEqual(
+            rows[0]["head_img"],
+            "https://example.test/violation.jpg",
+        )
 
     def test_store_info_uses_get_request(self) -> None:
         transport = GetTransport()
@@ -2762,6 +2912,7 @@ class CoreTests(unittest.TestCase):
         os.environ["WEIMI_DISABLE_AUTO_UPDATE"] = "1"
         try:
             window = MainWindow(AppPaths.discover())
+            window.withdraw()
             window.update_idletasks()
             window.update()
             self.assertEqual(window.title().split(" · ")[0], "澜琅")
@@ -2794,7 +2945,6 @@ class CoreTests(unittest.TestCase):
                 "no_traffic",
                 "hosted",
                 "team",
-                "sales_related",
             }
             self.assertIn("stores", window._pages)
             self.assertLess(len(window._pages), len(expected_pages))
@@ -2836,6 +2986,10 @@ class CoreTests(unittest.TestCase):
                     None,
                 )
             )
+            task_deadline = time.monotonic() + 5
+            while window._task_running and time.monotonic() < task_deadline:
+                window.update()
+                time.sleep(0.02)
             window.set_status("上一页遗留结果", busy=False)
             window.show_page("finance")
             window.update_idletasks()
@@ -2865,11 +3019,7 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(window.dynamic_page.empty_label.winfo_exists())
             window.show_page("sales_related")
             window.update_idletasks()
-            self.assertEqual(window.title_var.get(), "动销中心")
-            self.assertEqual(
-                type(window.sales_related_page).__name__,
-                "DongxiaoPage",
-            )
+            self.assertNotIn("sales_related", window._pages)
             window.show_page("operations")
             window.update_idletasks()
             self.assertTrue(window.operations_page._action_buttons)
@@ -2946,6 +3096,7 @@ class CoreTests(unittest.TestCase):
             window.update_idletasks()
             window.update()
             self.assertIsNotNone(window._big_screen_window)
+            window._big_screen_window.withdraw()
             self.assertTrue(window._big_screen_window.winfo_exists())
             self.assertTrue(bool(window._big_screen_window.attributes("-fullscreen")))
             window._big_screen_window.screen_page.tree.focus_set()
@@ -2965,6 +3116,7 @@ class CoreTests(unittest.TestCase):
             workbench = window._order_workbench_window
             self.assertIsNotNone(workbench)
             self.assertTrue(workbench.winfo_exists())
+            workbench.withdraw()
             workbench.show("profit")
             workbench.update_idletasks()
             self.assertIn("利润统计", workbench.heading_var.get())

@@ -1424,7 +1424,9 @@ def test_failed_v8_migration_rolls_back_to_complete_v7(
 
 def test_database_initialization_applies_dongxiao_with_legacy_schema(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("LANGLANG_ENABLE_DONGXIAO_ISOLATED", "1")
     path = tmp_path / "integrated.db"
     Database(path)
 

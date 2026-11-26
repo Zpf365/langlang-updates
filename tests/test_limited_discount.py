@@ -910,6 +910,61 @@ def test_service_creates_one_multi_product_activity_for_store() -> None:
     )
 
 
+def test_service_rejects_unsupported_snapup_stock_before_network_write() -> None:
+    class Private:
+        def __init__(self) -> None:
+            self.created = False
+
+        @staticmethod
+        def fetch_snapup_products(_product_ids):
+            return [
+                {
+                    "productKey": {"productId": "P1"},
+                    "status": 5,
+                    "productSkus": [
+                        {
+                            "skuKey": {"skuId": "SKU-P1"},
+                            "status": 5,
+                            "productSkuInfo": {
+                                "salePrice": 2000,
+                                "stockInfo": {"stockNum": "8"},
+                            },
+                        }
+                    ],
+                }
+            ]
+
+        def create_snapup_activity(self, _payload):
+            self.created = True
+            return {"code": 0}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        service = SyncService(Database(Path(tmp) / "snapup-stock.db"))
+        private = Private()
+        store = Store(
+            id=1,
+            name="库存参数测试店",
+            app_id="wx-snapup-stock",
+            group_name="",
+            status="",
+            last_sync_at=None,
+            created_at="2026-11-13T00:00:00+00:00",
+        )
+        with patch(
+            "weimi_manager.service.ShopPrivateClient",
+            return_value=private,
+        ):
+            with pytest.raises(ValueError, match="禁止设置抢购库存"):
+                service.create_snapup_activity(
+                    store,
+                    ["P1"],
+                    0.8,
+                    stock_limit_per_sku=1,
+                )
+
+    assert private.created is False
+
+
 def test_service_snapup_creation_truncates_to_platform_limit() -> None:
     class Private:
         def __init__(self) -> None:

@@ -5,9 +5,9 @@ import threading
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtWidgets import (
     QComboBox,
@@ -35,6 +35,7 @@ from ...ui.upload_page import (
     _normalize_duplicate_filter_mode,
     _normalize_listing_mode,
     _recover_upload_tasks,
+    _required_category_ids,
     _retry_upload_after_category_open,
 )
 from ...ui.upload_page import (
@@ -45,15 +46,32 @@ from .common import TaskPage
 from .dialogs import PayloadDialog
 
 
+def _category_client_with_business_type(
+    database: Database,
+    store: Store,
+    business_type: str,
+) -> ShopPrivateClient:
+    client = ShopPrivateClient(database, store)
+    client.category_business_type = business_type
+    return client
+
+
 class _PayloadAdapter:
     def __init__(self, database: Database) -> None:
         self.db = database
+        self._category_catalog_cache: dict[int, list[dict[str, Any]]] = {}
 
 
 class UploadRunner:
     """Runs persisted 1.6 upload tasks without depending on Tk widgets."""
 
-    def __init__(self, workspace, tasks: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        workspace,
+        tasks: list[dict[str, Any]],
+        *,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> None:
         self.workspace = workspace
         self.db = workspace.db
         self.service = workspace.service
@@ -61,9 +79,17 @@ class UploadRunner:
         self.lock = threading.RLock()
         self.paused = threading.Event()
         self.cancelled = threading.Event()
+        self.progress = progress
+        self._jobs_total = 0
+        self._jobs_completed = 0
         self.adapter = _PayloadAdapter(self.db)
 
-    def run(self, selected: list[dict[str, Any]]) -> list[str]:
+    def run(
+        self,
+        selected: list[dict[str, Any]],
+        *,
+        selected_item_ids: set[str] | None = None,
+    ) -> list[str]:
         _recover_upload_tasks(self.tasks)
         self._save()
         stores = {store.id: store for store in self.db.list_stores()}
@@ -83,10 +109,14 @@ class UploadRunner:
             task["message"] = "正在上传"
             mode = _normalize_duplicate_filter_mode(task.get("template") or {})
             for item in task.get("items") or []:
+                if (
+                    selected_item_ids
+                    and str(item.get("item_id") or "") not in selected_item_ids
+                ):
+                    continue
                 if item.get("status") in {
                     "success",
                     "verification_pending",
-                    "waiting_category",
                 }:
                     continue
                 source_id = str(item.get("source_product_id") or "")
@@ -106,6 +136,8 @@ class UploadRunner:
                 item["status"] = "pending"
                 item["message"] = "等待上传"
                 jobs_by_store[store_id].append((task, item))
+        self._jobs_total = sum(len(jobs) for jobs in jobs_by_store.values())
+        self._jobs_completed = 0
         self._save()
 
         workers = max(1, min(8, len(jobs_by_store)))
@@ -146,23 +178,195 @@ class UploadRunner:
                 item["message"] = "等待继续"
                 continue
             template = task.get("template") or {}
+            category_business_type = str(
+                template.get("category_business_type") or "individual"
+            )
+            if category_business_type not in {
+                "individual",
+                "enterprise",
+            }:
+                category_business_type = "individual"
             try:
                 payload = LegacyUploadPage._upload_payload(
                     self.adapter,
                     item,
                     template,
                 )
+                if payload.pop("_auto_category_required", False):
+                    payload = LegacyUploadPage._auto_match_category(
+                        self.adapter,
+                        store,
+                        payload,
+                        template,
+                    )
+                selection = payload.get("auto_category")
+                if isinstance(selection, dict):
+                    item["category_selection"] = {
+                        key: selection.get(key)
+                        for key in (
+                            "category_id",
+                            "path",
+                            "score",
+                            "selection_source",
+                            "application_state",
+                            "deposit_amount",
+                            "required_deposit",
+                            "amount_to_pay",
+                            "operation_required_deposit",
+                            "deposit_balance",
+                            "real_deposit_balance",
+                            "deposit_shortfall",
+                            "deposit_free_trial",
+                            "business_type",
+                        )
+                    }
+                    item["category_candidates"] = list(
+                        selection.get("candidates") or []
+                    )
+                category_ids = _required_category_ids(payload)
+                if item.get("category_auto_recovery"):
+                    if not category_ids:
+                        raise CategoryAutoOpenError(
+                            "历史类目失败商品无法确定叶子类目，"
+                            "已停止自动重提"
+                        )
+                    item["category_state"] = "waiting"
+                    item["category_ids"] = list(category_ids)
+                    item["category_apply_submitted"] = False
+                payload.pop("category_apply_ids", None)
+                payload.pop("category_name", None)
+                payload.pop("category_hint", None)
+                payload.pop("auto_category", None)
                 listing_mode = _normalize_listing_mode(template)
             except TemplateRuleSkip as exc:
                 self._set_item(task, item, "skipped", str(exc))
+                continue
+            except CategoryApprovalPending as exc:
+                now = datetime.now()
+                with self.lock:
+                    item["category_state"] = str(
+                        exc.state or "waiting"
+                    )
+                    item["category_ids"] = list(exc.category_ids)
+                    item["category_statuses"] = dict(exc.statuses)
+                    item["category_checks"] = dict(exc.checks)
+                    if exc.deposit_snapshot:
+                        item["category_deposit_snapshot"] = dict(
+                            exc.deposit_snapshot
+                        )
+                        for key, value in (
+                            (
+                                "category_required_deposit",
+                                exc.deposit_snapshot.get(
+                                    "required_deposit"
+                                ),
+                            ),
+                            (
+                                "category_amount_to_pay",
+                                exc.deposit_snapshot.get(
+                                    "amount_to_pay"
+                                ),
+                            ),
+                            (
+                                "category_operation_required_deposit",
+                                exc.deposit_snapshot.get(
+                                    "operation_required_deposit"
+                                ),
+                            ),
+                            (
+                                "category_deposit_balance",
+                                exc.deposit_snapshot.get(
+                                    "deposit_balance"
+                                ),
+                            ),
+                            (
+                                "category_real_deposit_balance",
+                                exc.deposit_snapshot.get(
+                                    "real_deposit_balance"
+                                ),
+                            ),
+                            (
+                                "category_deposit_shortfall",
+                                exc.deposit_snapshot.get(
+                                    "deposit_shortfall"
+                                ),
+                            ),
+                            (
+                                "category_deposit_free_trial",
+                                exc.deposit_snapshot.get(
+                                    "deposit_free_trial"
+                                ),
+                            ),
+                            (
+                                "category_business_type",
+                                exc.deposit_snapshot.get(
+                                    "business_type"
+                                ),
+                            ),
+                        ):
+                            if value is not None:
+                                item[key] = value
+                    item["category_apply_submitted"] = bool(
+                        exc.submitted
+                    )
+                    item["category_application_at"] = (
+                        item.get("category_application_at")
+                        or now.isoformat(timespec="seconds")
+                    )
+                    item["category_last_checked_at"] = now.isoformat(
+                        timespec="seconds"
+                    )
+                    item["category_check_attempts"] = int(
+                        exc.attempts or 1
+                    )
+                    item["category_next_check_at"] = (
+                        now
+                        + timedelta(
+                            minutes=(
+                                30
+                                if str(exc.state or "")
+                                == "deposit_required"
+                                else 10
+                            )
+                        )
+                    ).isoformat(timespec="seconds")
+                    if exc.error:
+                        item["category_error"] = str(exc.error)[:500]
+                    else:
+                        item.pop("category_error", None)
+                self._set_item(
+                    task,
+                    item,
+                    "waiting_category",
+                    str(exc),
+                )
+                continue
+            except CategoryAutoOpenError as exc:
+                item["category_state"] = str(
+                    getattr(exc, "state", "") or "failed_category"
+                )
+                item["category_error"] = str(exc)[:500]
+                self._set_item(
+                    task,
+                    item,
+                    "failed",
+                    f"目标类目未开通，自动申请失败：{exc}"[:500],
+                )
+                errors.append(
+                    f"{store.name} / {item.get('title', '')}: "
+                    f"目标类目自动处理失败：{exc}"
+                )
                 continue
             except Exception as exc:
                 self._set_item(task, item, "failed", str(exc)[:500])
                 continue
             with self.lock:
                 item["status"] = "submitting"
-                item["submission_attempt_id"] = uuid.uuid4().hex
-                item["submission_started_at"] = datetime.now().isoformat(timespec="seconds")
+                if not item.get("submission_attempt_id"):
+                    item["submission_attempt_id"] = uuid.uuid4().hex
+                item["submission_started_at"] = datetime.now().isoformat(
+                    timespec="seconds"
+                )
                 item["message"] = "正在提交，结果尚未确认"
             try:
                 self._save()
@@ -184,14 +388,32 @@ class UploadRunner:
                         listing_mode=listing_mode,
                     )
 
-                if template.get("auto_open_category", True):
-                    result = _retry_upload_after_category_open(
-                        payload,
-                        submit_product,
-                        lambda: ShopPrivateClient(self.db, store),
-                    )
-                else:
-                    result = submit_product()
+                def update_category_progress(message: str) -> None:
+                    with self.lock:
+                        item["message"] = message
+                    try:
+                        self._save()
+                    except Exception:
+                        pass
+                    if self.progress is not None:
+                        self.progress(
+                            message,
+                            self._jobs_completed,
+                            max(1, self._jobs_total),
+                        )
+
+                result = _retry_upload_after_category_open(
+                    payload,
+                    submit_product,
+                    lambda: _category_client_with_business_type(
+                        self.db,
+                        store,
+                        category_business_type,
+                    ),
+                    progress=update_category_progress,
+                    category_ids=category_ids,
+                    application=item,
+                )
                 product_id = str(result.get("product_id") or payload.get("product_id") or "")
                 if not product_id:
                     self._set_item(
@@ -203,6 +425,8 @@ class UploadRunner:
                     continue
                 item["product_id"] = product_id
                 item["status"] = "success"
+                item["category_state"] = "effective"
+                item.pop("category_next_check_at", None)
                 item["message"] = (
                     "上传成功，已转入仓库"
                     if listing_mode == "warehouse"
@@ -228,14 +452,118 @@ class UploadRunner:
                         "远端已创建商品，但本地任务/历史保存失败，请先核实：" + str(exc)[:300]
                     )
             except CategoryApprovalPending as exc:
+                now = datetime.now()
+                with self.lock:
+                    item["category_state"] = str(
+                        exc.state or "waiting"
+                    )
+                    item["category_ids"] = list(exc.category_ids)
+                    item["category_statuses"] = dict(exc.statuses)
+                    item["category_checks"] = dict(exc.checks)
+                    if exc.deposit_snapshot:
+                        item["category_deposit_snapshot"] = dict(
+                            exc.deposit_snapshot
+                        )
+                        for key, value in (
+                            (
+                                "category_required_deposit",
+                                exc.deposit_snapshot.get(
+                                    "required_deposit"
+                                ),
+                            ),
+                            (
+                                "category_amount_to_pay",
+                                exc.deposit_snapshot.get(
+                                    "amount_to_pay"
+                                ),
+                            ),
+                            (
+                                "category_operation_required_deposit",
+                                exc.deposit_snapshot.get(
+                                    "operation_required_deposit"
+                                ),
+                            ),
+                            (
+                                "category_deposit_balance",
+                                exc.deposit_snapshot.get(
+                                    "deposit_balance"
+                                ),
+                            ),
+                            (
+                                "category_real_deposit_balance",
+                                exc.deposit_snapshot.get(
+                                    "real_deposit_balance"
+                                ),
+                            ),
+                            (
+                                "category_deposit_shortfall",
+                                exc.deposit_snapshot.get(
+                                    "deposit_shortfall"
+                                ),
+                            ),
+                            (
+                                "category_deposit_free_trial",
+                                exc.deposit_snapshot.get(
+                                    "deposit_free_trial"
+                                ),
+                            ),
+                            (
+                                "category_business_type",
+                                exc.deposit_snapshot.get(
+                                    "business_type"
+                                ),
+                            ),
+                        ):
+                            if value is not None:
+                                item[key] = value
+                    item["category_apply_submitted"] = bool(exc.submitted)
+                    item["category_application_at"] = (
+                        item.get("category_application_at")
+                        or now.isoformat(timespec="seconds")
+                    )
+                    item["category_last_checked_at"] = now.isoformat(
+                        timespec="seconds"
+                    )
+                    item["category_check_attempts"] = int(exc.attempts or 1)
+                    if exc.error:
+                        item["category_error"] = str(exc.error)[:500]
+                    else:
+                        item.pop("category_error", None)
+                    item["category_next_check_at"] = (
+                        now
+                        + timedelta(
+                            minutes=(
+                                30
+                                if str(exc.state or "")
+                                == "deposit_required"
+                                else 10
+                            )
+                        )
+                    ).isoformat(timespec="seconds")
                 self._set_item(task, item, "waiting_category", str(exc))
             except CategoryAutoOpenError as exc:
+                item["category_state"] = str(
+                    getattr(exc, "state", "") or "failed_category"
+                )
+                item["category_error"] = str(exc)[:500]
                 self._set_item(
                     task,
                     item,
                     "failed",
                     f"目标类目未开通，自动申请失败：{exc}"[:500],
                 )
+                errors.append(
+                    f"{store.name} / {item.get('title', '')}: "
+                    f"目标类目自动处理失败：{exc}"
+                )
+            except PermissionError as exc:
+                self._set_item(
+                    task,
+                    item,
+                    "failed",
+                    "未提交到微信小店：本地授权拒绝：" + str(exc)[:400],
+                )
+                errors.append(f"{store.name} / {item.get('title', '')}: {exc}")
             except Exception as exc:
                 rejection = _definitive_upload_failure_message(exc)
                 if rejection:
@@ -251,7 +579,16 @@ class UploadRunner:
             finally:
                 with self.lock:
                     self._refresh_task_status(task)
+                    self._jobs_completed += 1
+                    completed = self._jobs_completed
+                    total = self._jobs_total
                 self._save()
+                if self.progress is not None:
+                    self.progress(
+                        f"上传任务处理中 {completed}/{total}",
+                        completed,
+                        total,
+                    )
 
     def _set_item(
         self,

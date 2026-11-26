@@ -8,7 +8,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 from weimi_manager.shop_private import ShopPrivateClient
+from weimi_manager.service import SyncService
 from weimi_manager.source_1688 import (
+    is_1688_official_url,
     normalize_1688_capture,
     normalized_1688_row,
     parse_1688_links,
@@ -91,6 +93,38 @@ REAL_PACKAGE_SHAPE = {
 
 
 class Source1688Tests(unittest.TestCase):
+    def test_official_1688_outbound_whitelist_blocks_third_party_hosts(
+        self,
+    ) -> None:
+        for url in (
+            "https://detail.1688.com/offer/1098691125768.html",
+            "https://h5api.m.1688.com/h5/mtop.1688.offer.get/1.0/",
+            "https://cbu01.alicdn.com/img/main.jpg",
+            "data:image/png;base64,AAAA",
+            "blob:https://detail.1688.com/example",
+        ):
+            self.assertTrue(is_1688_official_url(url), url)
+        for url in (
+            "https://example.com/api/parse",
+            "https://api.third-party.test/1688",
+            "https://1688.com.evil.example/offer/123",
+            "ftp://detail.1688.com/offer/123.html",
+        ):
+            self.assertFalse(is_1688_official_url(url), url)
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "weimi_manager"
+            / "source_1688.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('page.route("**/*", route_official)', source)
+        self.assertIn(
+            "is_1688_official_url(route.request.url)",
+            source,
+        )
+        self.assertNotIn("requests.", source)
+        self.assertNotIn("httpx.", source)
+
     def test_link_parser_accepts_only_1688_and_deduplicates(self) -> None:
         links = parse_1688_links(
             "\n".join(
@@ -280,6 +314,48 @@ class Source1688Tests(unittest.TestCase):
         )
         self.assertEqual(result["category_apply_ids"], ["547711"])
 
+    def test_sync_service_adds_official_category_path_before_upload(
+        self,
+    ) -> None:
+        service = SyncService(object())
+        store = SimpleNamespace(id=7, name="上货类目店铺")
+        catalog = [
+            {
+                "category_id": "547711",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": [
+                    "10000173",
+                    "10000175",
+                    "10000673",
+                    "547711",
+                ],
+            }
+        ]
+        with mock.patch(
+            "weimi_manager.service.ShopPrivateClient",
+            return_value=SimpleNamespace(
+                category_catalog=lambda: catalog,
+            ),
+        ):
+            result = service._ensure_product_category(
+                store,
+                {
+                    "title": "女士冬季保暖加厚棉鞋",
+                    "category_hint": "保暖棉鞋",
+                },
+            )
+        self.assertEqual(
+            result["cats_v2"],
+            [
+                {"cat_id": "10000173"},
+                {"cat_id": "10000175"},
+                {"cat_id": "10000673"},
+                {"cat_id": "547711"},
+            ],
+        )
+        self.assertEqual(result["category_path"], "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋")
+
     def test_category_open_uses_leaf_id_instead_of_all_path_nodes(self) -> None:
         payload = {
             "cats": [
@@ -290,6 +366,90 @@ class Source1688Tests(unittest.TestCase):
             "category_apply_ids": ["101"],
         }
         self.assertEqual(_required_category_ids(payload), ["101"])
+
+    def test_category_candidate_uses_compliant_semantic_match_before_price(
+        self,
+    ) -> None:
+        service = SyncService(object())
+        store = SimpleNamespace(id=7, name="候选类目店铺")
+        catalog = [
+            {
+                "category_id": "EXACT",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": ["100", "200", "EXACT"],
+            },
+            {
+                "category_id": "CHEAPER",
+                "name": "加厚棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 加厚棉鞋",
+                "id_path": ["100", "200", "CHEAPER"],
+            },
+            {
+                "category_id": "UNRELATED",
+                "name": "手机壳",
+                "path": "数码 / 手机配件 / 手机壳",
+                "id_path": ["900", "UNRELATED"],
+            },
+        ]
+
+        class PrivateClient:
+            def category_catalog(self):
+                return catalog
+
+            def category_application_checks(self, category_ids):
+                return {
+                    category_id: {
+                        "state": (
+                            "deposit_required"
+                            if category_id == "EXACT"
+                            else "not_applied"
+                        ),
+                        "label": (
+                            "保证金不足"
+                            if category_id == "EXACT"
+                            else "未申请"
+                        ),
+                        "reason": (
+                            "需补缴 200000 分"
+                            if category_id == "EXACT"
+                            else ""
+                        ),
+                        "eligible": category_id != "EXACT",
+                        "deposit_amount": (
+                            200000
+                            if category_id == "EXACT"
+                            else 10000
+                        ),
+                        "deposit_shortfall": (
+                            200000
+                            if category_id == "EXACT"
+                            else 0
+                        ),
+                    }
+                    for category_id in category_ids
+                }
+
+        with mock.patch(
+            "weimi_manager.service.ShopPrivateClient",
+            return_value=PrivateClient(),
+        ):
+            result = service._ensure_product_category(
+                store,
+                {
+                    "title": "女士冬季保暖加厚棉鞋",
+                    "category_hint": "保暖棉鞋",
+                },
+            )
+
+        assert result["category_apply_ids"] == ["CHEAPER"]
+        assert result["_category_selected"]["application_state"] == "not_applied"
+        assert result["_category_selected"]["deposit_amount"] == 10000
+        assert {
+            item["category_id"]
+            for item in result["_category_candidates"]
+        } >= {"EXACT", "CHEAPER"}
+        assert "UNRELATED" not in result["category_apply_ids"]
 
     def test_1688_data_package_uses_same_normalizer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

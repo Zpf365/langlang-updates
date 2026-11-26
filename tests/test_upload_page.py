@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import json
 import os
 import tempfile
@@ -18,6 +19,7 @@ from weimi_manager.models import Product, Store
 from weimi_manager.ui.theme import apply_theme
 from weimi_manager.ui.upload_page import (
     CategoryApprovalPending,
+    CategoryAutoOpenError,
     TemplateRuleSkip,
     UploadPage,
     _definitive_upload_failure_message,
@@ -26,6 +28,7 @@ from weimi_manager.ui.upload_page import (
     _normalize_duplicate_filter_mode,
     _normalize_source_payload,
     _recover_upload_tasks,
+    _required_category_ids,
     _retry_upload_after_category_open,
     _ScrollableBody,
     _stores_matching_group_names,
@@ -35,6 +38,155 @@ from weimi_manager.wechat_api import WechatApiError
 
 
 class UploadPageContractTests(unittest.TestCase):
+    def test_required_category_ids_only_submits_leaf_categories(self) -> None:
+        self.assertEqual(
+            _required_category_ids(
+                {
+                    "category_apply_ids": ["1000", "2000", "3001"],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "2000"},
+                        {"cat_id": "3001"},
+                    ],
+                }
+            ),
+            ["3001"],
+        )
+        self.assertEqual(
+            _required_category_ids(
+                {
+                    "cats": [
+                        {"cat_id": "100"},
+                        {"cat_id": "200"},
+                        {"cat_id": "301"},
+                    ]
+                }
+            ),
+            ["301"],
+        )
+        self.assertEqual(
+            _required_category_ids(
+                {"category_apply_ids": ["401", "402"]}
+            ),
+            ["401", "402"],
+        )
+        for platform in ("1688", "淘宝", "微信小店"):
+            with self.subTest(platform=platform):
+                self.assertEqual(
+                    _required_category_ids(
+                        {
+                            "platform": platform,
+                            "category_apply_ids": ["501", "502", "603"],
+                            "cats_v2": [
+                                {"cat_id": "501"},
+                                {"cat_id": "502"},
+                                {"cat_id": "603"},
+                            ],
+                        }
+                    ),
+                    ["603"],
+                )
+
+    def test_legacy_category_failures_enter_automatic_recovery_only_when_safe(
+        self,
+    ) -> None:
+        complete_payload = {
+            "title": "历史类目商品",
+            "head_imgs": [
+                "https://example.invalid/1.jpg",
+                "https://example.invalid/2.jpg",
+                "https://example.invalid/3.jpg",
+            ],
+            "skus": [{"sale_price": 100, "stock_num": 2}],
+            "cats_v2": [
+                {"cat_id": "1000"},
+                {"cat_id": "2001"},
+            ],
+        }
+        tasks = [
+            {
+                "id": "legacy-task",
+                "items": [
+                    {
+                        "item_id": "legacy-failed",
+                        "status": "failed",
+                        "message": (
+                            "商品未创建, 错误码:6600145 原因:无该类目权限"
+                        ),
+                        "payload": complete_payload,
+                    },
+                    {
+                        "item_id": "legacy-waiting",
+                        "status": "waiting_category",
+                        "payload": {
+                            "cats_v2": [
+                                {"cat_id": "1000"},
+                                {"cat_id": "2001"},
+                            ]
+                        },
+                    },
+                    {
+                        "item_id": "legacy-error-code-only",
+                        "status": "failed",
+                        "message": "商品未创建",
+                        "error_code": 6600145,
+                    },
+                    {
+                        "item_id": "ordinary-failed",
+                        "status": "failed",
+                        "message": "商品信息格式错误",
+                        "payload": complete_payload,
+                    },
+                    {
+                        "item_id": "verification-pending",
+                        "status": "verification_pending",
+                        "message": "远端结果未知",
+                        "payload": complete_payload,
+                    },
+                    {
+                        "item_id": "already-created",
+                        "status": "failed",
+                        "message": "6600145",
+                        "product_id": "WX-EXISTS",
+                        "payload": complete_payload,
+                    },
+                ],
+            }
+        ]
+
+        changed = _recover_upload_tasks(tasks)
+
+        self.assertTrue(changed)
+        (
+            failed,
+            waiting,
+            error_code_only,
+            ordinary_failed,
+            verification_pending,
+            already_created,
+        ) = tasks[0]["items"]
+        self.assertEqual(failed["status"], "waiting_category")
+        self.assertEqual(failed["category_state"], "waiting")
+        self.assertTrue(failed["category_auto_recovery"])
+        self.assertFalse(failed["category_apply_submitted"])
+        self.assertEqual(failed["category_ids"], ["2001"])
+        self.assertEqual(waiting["category_state"], "waiting")
+        self.assertEqual(waiting["category_ids"], ["2001"])
+        self.assertTrue(waiting["category_apply_submitted"])
+        self.assertEqual(error_code_only["category_state"], "failed")
+        self.assertFalse(error_code_only["category_reprocess_available"])
+        self.assertEqual(ordinary_failed["status"], "failed")
+        self.assertNotIn("category_state", ordinary_failed)
+        self.assertEqual(
+            verification_pending["status"],
+            "verification_pending",
+        )
+        self.assertNotIn("category_state", verification_pending)
+        self.assertEqual(already_created["status"], "failed")
+        self.assertEqual(already_created["category_state"], "failed")
+        self.assertFalse(already_created["category_reprocess_available"])
+        self.assertEqual(tasks[0]["status"], "needs_verification")
+
     def test_1688_upload_keeps_source_code_and_creates_sku_mapping(
         self,
     ) -> None:
@@ -163,8 +315,13 @@ class UploadPageContractTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.applied: list[list[str]] = []
 
-            def category_relation_statuses(self, _category_ids):
-                return {}
+            def category_relation_statuses(self, category_ids):
+                if not self.applied:
+                    return {}
+                return {
+                    str(category_id): "已生效"
+                    for category_id in category_ids
+                }
 
             def batch_add_categories(self, category_ids):
                 self.applied.append(list(category_ids))
@@ -209,6 +366,803 @@ class UploadPageContractTests(unittest.TestCase):
         self.assertEqual(raised.exception.category_ids, ["101"])
         self.assertEqual(raised.exception.statuses, {"101": "审核中"})
 
+    def test_category_rejection_stops_without_retrying_upload(self) -> None:
+        upload_calls = []
+
+        class CategoryClient:
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": "unavailable",
+                        "label": "不可申请",
+                        "reason": "平台禁止该叶子类目申请",
+                        "eligible": False,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, _category_ids):
+                raise AssertionError("unavailable category must not apply")
+
+        with self.assertRaises(CategoryAutoOpenError) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "100"}, {"cat_id": "201"}]},
+                lambda: upload_calls.append("upload") or (
+                    (_ for _ in ()).throw(
+                        WechatApiError("无该类目权限", code=6600145)
+                    )
+                ),
+                CategoryClient(),
+            )
+
+        self.assertIn("平台禁止", str(raised.exception))
+        self.assertEqual(upload_calls, ["upload"])
+
+    def test_missing_leaf_category_stops_with_actionable_reason(self) -> None:
+        with self.assertRaises(CategoryAutoOpenError) as raised:
+            _retry_upload_after_category_open(
+                {"title": "No category"},
+                lambda: (_ for _ in ()).throw(
+                    WechatApiError("无该类目权限", code=6600145)
+                ),
+                object(),
+            )
+
+        self.assertIn("未识别到", str(raised.exception))
+        self.assertIn("叶子类目", str(raised.exception))
+
+    def test_unknown_category_apply_result_waits_without_reapplying(self) -> None:
+        upload_calls = []
+
+        class CategoryClient:
+            checks = 0
+
+            def category_application_checks(self, category_ids):
+                self.checks += 1
+                state = "not_applied" if self.checks == 1 else "unknown"
+                return {
+                    str(category_id): {
+                        "state": state,
+                        "label": (
+                            "未申请" if state == "not_applied" else "状态未知"
+                        ),
+                        "reason": "" if state == "not_applied" else "网络超时",
+                        "eligible": state == "not_applied",
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, _category_ids):
+                raise RuntimeError("商家后台网络异常：timeout")
+
+        with self.assertRaises(CategoryApprovalPending) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "3001"}]},
+                lambda: upload_calls.append("upload") or (
+                    (_ for _ in ()).throw(
+                        WechatApiError("无该类目权限", code=6600145)
+                    )
+                ),
+                CategoryClient(),
+            )
+
+        self.assertTrue(raised.exception.submitted)
+        self.assertIn("网络异常", raised.exception.error)
+        self.assertEqual(upload_calls, ["upload"])
+
+    def test_explicit_category_apply_rejection_stops_immediately(self) -> None:
+        class CategoryClient:
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, _category_ids):
+                raise RuntimeError("平台禁止该叶子类目申请")
+
+        with self.assertRaises(CategoryAutoOpenError) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "3001"}]},
+                lambda: (_ for _ in ()).throw(
+                    WechatApiError("无该类目权限", code=6600145)
+                ),
+                CategoryClient(),
+            )
+
+        self.assertIn("禁止", str(raised.exception))
+
+    def test_waiting_category_unknown_stops_after_limited_checks(self) -> None:
+        upload_calls = []
+
+        class CategoryClient:
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": "unknown",
+                        "label": "状态未知",
+                        "reason": "网络超时",
+                        "eligible": False,
+                    }
+                    for category_id in category_ids
+                }
+
+        with self.assertRaises(CategoryAutoOpenError) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "100"}, {"cat_id": "201"}]},
+                lambda: upload_calls.append("upload") or {
+                    "product_id": "should-not-run"
+                },
+                CategoryClient(),
+                application={
+                    "category_state": "waiting",
+                    "category_ids": ["201"],
+                    "category_apply_submitted": True,
+                    "category_check_attempts": 12,
+                },
+            )
+
+        self.assertIn("12 次", str(raised.exception))
+        self.assertEqual(upload_calls, [])
+
+    def test_pending_category_review_is_not_limited_to_twelve_checks(
+        self,
+    ) -> None:
+        upload_calls = []
+        category_calls = []
+
+        class CategoryClient:
+            effective = False
+
+            def category_application_checks(self, category_ids):
+                category_calls.append(tuple(category_ids))
+                state = "effective" if self.effective else "pending"
+                return {
+                    str(category_id): {
+                        "state": state,
+                        "label": "已生效" if self.effective else "审核中",
+                        "reason": "",
+                        "eligible": False,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, _category_ids):
+                raise AssertionError("pending category must not reapply")
+
+        client = CategoryClient()
+        application = {
+            "category_state": "waiting",
+            "category_ids": ["3001"],
+            "category_apply_submitted": True,
+            "category_application_at": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+        }
+        for _ in range(15):
+            with self.assertRaises(CategoryApprovalPending) as raised:
+                _retry_upload_after_category_open(
+                    {"cats_v2": [{"cat_id": "3001"}]},
+                    lambda: upload_calls.append("upload") or {
+                        "product_id": "must-not-exist"
+                    },
+                    client,
+                    application=application,
+                )
+            application["category_check_attempts"] = (
+                raised.exception.attempts
+            )
+
+        self.assertEqual(upload_calls, [])
+        self.assertEqual(len(category_calls), 15)
+        client.effective = True
+        result = _retry_upload_after_category_open(
+            {"cats_v2": [{"cat_id": "3001"}]},
+            lambda: upload_calls.append("upload") or {
+                "product_id": "WX-PENDING-APPROVED"
+            },
+            client,
+            application=application,
+        )
+
+        self.assertEqual(result["product_id"], "WX-PENDING-APPROVED")
+        self.assertEqual(upload_calls, ["upload"])
+
+    def test_deposit_required_state_waits_without_reapplying_unchanged_request(
+        self,
+    ) -> None:
+        upload_calls = []
+        category_calls = []
+        apply_calls = []
+
+        class CategoryClient:
+            state = "deposit_required"
+
+            def category_application_checks(self, category_ids):
+                category_calls.append(self.state)
+                return {
+                    str(category_id): {
+                        "state": self.state,
+                        "label": (
+                            "保证金不足"
+                            if self.state == "deposit_required"
+                            else (
+                                "已生效"
+                                if self.state == "effective"
+                                else "未申请"
+                            )
+                        ),
+                        "reason": (
+                            "需补缴 100000 分"
+                            if self.state == "deposit_required"
+                            else ""
+                        ),
+                        "eligible": self.state == "not_applied",
+                        "required_deposit": 100000,
+                        "amount_to_pay": 100000,
+                        "operation_required_deposit": 0,
+                        "deposit_balance": 0,
+                        "real_deposit_balance": 0,
+                        "deposit_shortfall": 0,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, category_ids):
+                apply_calls.append(list(category_ids))
+                self.state = "pending"
+
+        client = CategoryClient()
+        application = {
+            "status": "waiting_category",
+            "category_state": "deposit_required",
+            "category_ids": ["3001"],
+            "category_apply_submitted": False,
+            "category_deposit_snapshot": {
+                "required_deposit": 100000,
+                "amount_to_pay": 100000,
+                "operation_required_deposit": 0,
+                "deposit_balance": 0,
+                "real_deposit_balance": 0,
+                "deposit_shortfall": 0,
+                "online_count": None,
+            },
+        }
+        with self.assertRaises(CategoryApprovalPending) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "3001"}]},
+                lambda: upload_calls.append("upload") or {
+                    "product_id": "must-not-exist"
+                },
+                client,
+                application=application,
+            )
+        self.assertEqual(raised.exception.state, "deposit_required")
+        self.assertFalse(raised.exception.submitted)
+        self.assertEqual(apply_calls, [])
+        self.assertEqual(upload_calls, [])
+        self.assertEqual(category_calls, ["deposit_required"])
+
+    def test_deposit_error_from_apply_is_waiting_not_failed(self) -> None:
+        class CategoryClient:
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, _category_ids):
+                raise RuntimeError("保证金不足，需补缴 200000 分")
+
+        with self.assertRaises(CategoryApprovalPending) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "3001"}]},
+                lambda: (_ for _ in ()).throw(
+                    WechatApiError("无该类目权限", code=6600145)
+                ),
+                CategoryClient(),
+            )
+
+        self.assertEqual(raised.exception.state, "deposit_required")
+        self.assertIn("保证金", str(raised.exception))
+
+    def test_6600133_preserves_official_deposit_error_and_snapshot(
+        self,
+    ) -> None:
+        upload_calls = []
+        apply_calls = []
+
+        class CategoryClient:
+            def online_product_count(self):
+                return {"count": 101}
+
+            def category_application_checks(self, category_ids):
+                return {
+                    category_id: {
+                        "state": "effective",
+                        "label": "已生效",
+                        "eligible": False,
+                        "required_deposit": 200000,
+                        "amount_to_pay": 200000,
+                        "operation_required_deposit": 0,
+                        "deposit_balance": 0,
+                        "real_deposit_balance": 0,
+                        "deposit_shortfall": 0,
+                        "deposit_free_trial": True,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, category_ids):
+                apply_calls.append(list(category_ids))
+
+        def upload():
+            upload_calls.append("upload")
+            raise WechatApiError(
+                "商品信息检查不通过, 错误码:6600133 "
+                "原因:当前你的店铺已上架100个商品，"
+                "如需上架请先缴纳足额保证金",
+                code=6600133,
+            )
+
+        application = {}
+        with self.assertRaises(CategoryApprovalPending) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "1713"}]},
+                upload,
+                CategoryClient(),
+                application=application,
+            )
+
+        self.assertEqual(raised.exception.state, "deposit_required")
+        self.assertFalse(raised.exception.submitted)
+        self.assertIn("6600133", str(raised.exception))
+        self.assertEqual(upload_calls, ["upload"])
+        self.assertEqual(apply_calls, [])
+        self.assertEqual(
+            raised.exception.deposit_snapshot["online_count"],
+            101,
+        )
+
+    def test_historical_6600133_recovers_to_deposit_wait_without_payload_loss(
+        self,
+    ) -> None:
+        tasks = [
+            {
+                "id": "task-deposit-history",
+                "items": [
+                    {
+                        "item_id": "item-deposit-history",
+                        "status": "failed",
+                        "message": (
+                            "商品信息检查不通过, 错误码:6600133 "
+                            "原因:当前你的店铺已上架100个商品，"
+                            "如需上架请先缴纳足额保证金"
+                        ),
+                        "payload": {
+                            "head_imgs": [
+                                "https://example.invalid/1.jpg"
+                            ],
+                            "skus": [
+                                {"sale_price": 100, "stock_num": 1}
+                            ],
+                            "cats_v2": [{"cat_id": "1713"}],
+                        },
+                    }
+                ],
+            }
+        ]
+
+        self.assertTrue(_recover_upload_tasks(tasks))
+        item = tasks[0]["items"][0]
+        self.assertEqual(item["status"], "waiting_category")
+        self.assertEqual(item["category_state"], "deposit_required")
+        self.assertEqual(item["category_ids"], ["1713"])
+        self.assertIn("category_deposit_snapshot", item)
+        self.assertEqual(
+            item["category_deposit_snapshot"]["online_count"],
+            100,
+        )
+        self.assertIn("6600133", item["category_previous_failure_message"])
+
+    def test_saved_deposit_wait_does_not_reapply_unchanged_category(
+        self,
+    ) -> None:
+        upload_calls = []
+        apply_calls = []
+
+        class CategoryClient:
+            def online_product_count(self):
+                return {"count": 101}
+
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                        "required_deposit": 200000,
+                        "amount_to_pay": 200000,
+                        "operation_required_deposit": 0,
+                        "deposit_balance": 0,
+                        "real_deposit_balance": 0,
+                        "deposit_shortfall": 0,
+                        "deposit_free_trial": True,
+                        "business_type": "individual",
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, category_ids):
+                apply_calls.append(list(category_ids))
+
+        application = {
+            "status": "waiting_category",
+            "category_state": "deposit_required",
+            "category_ids": ["1713"],
+            "category_apply_submitted": False,
+            "category_error": "保证金不足，需补缴 200000 分",
+            "category_deposit_snapshot": {
+                "deposit_balance": 0,
+                "real_deposit_balance": 0,
+                "operation_required_deposit": 0,
+                "online_count": 101,
+            },
+        }
+        with self.assertRaises(CategoryApprovalPending) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "1713"}]},
+                lambda: upload_calls.append("upload") or {
+                    "product_id": "must-not-exist"
+                },
+                CategoryClient(),
+                application=application,
+            )
+
+        self.assertEqual(raised.exception.state, "deposit_required")
+        self.assertFalse(raised.exception.submitted)
+        self.assertEqual(apply_calls, [])
+        self.assertEqual(upload_calls, [])
+
+    def test_saved_deposit_wait_reapplies_after_wallet_balance_change(
+        self,
+    ) -> None:
+        apply_calls = []
+        upload_calls = []
+
+        class CategoryClient:
+            state = "not_applied"
+
+            def online_product_count(self):
+                return {"count": 101}
+
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": self.state,
+                        "label": (
+                            "未申请"
+                            if self.state == "not_applied"
+                            else "已生效"
+                        ),
+                        "reason": "",
+                        "eligible": self.state == "not_applied",
+                        "required_deposit": 200000,
+                        "amount_to_pay": 200000,
+                        "operation_required_deposit": 0,
+                        "deposit_balance": 200000,
+                        "real_deposit_balance": 200000,
+                        "deposit_shortfall": 0,
+                        "deposit_free_trial": True,
+                        "business_type": "individual",
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, category_ids):
+                apply_calls.append(list(category_ids))
+                self.state = "effective"
+
+        application = {
+            "status": "waiting_category",
+            "category_state": "deposit_required",
+            "category_ids": ["1713"],
+            "category_apply_submitted": False,
+            "category_error": "保证金不足，需补缴 200000 分",
+            "category_deposit_snapshot": {
+                "deposit_balance": 0,
+                "real_deposit_balance": 0,
+                "operation_required_deposit": 0,
+                "deposit_shortfall": 0,
+                "online_count": 101,
+            },
+        }
+
+        result = _retry_upload_after_category_open(
+            {"cats_v2": [{"cat_id": "1713"}]},
+            lambda: upload_calls.append("upload") or {
+                "product_id": "WX-DEPOSIT-RECOVERED"
+            },
+            CategoryClient(),
+            application=application,
+        )
+
+        self.assertEqual(result["product_id"], "WX-DEPOSIT-RECOVERED")
+        self.assertEqual(apply_calls, [["1713"]])
+        self.assertEqual(upload_calls, ["upload"])
+
+    def test_saved_deposit_wait_stops_after_long_unchanged_window(
+        self,
+    ) -> None:
+        class CategoryClient:
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                        "required_deposit": 200000,
+                        "amount_to_pay": 200000,
+                        "operation_required_deposit": 0,
+                        "deposit_balance": 0,
+                        "real_deposit_balance": 0,
+                        "deposit_shortfall": 0,
+                        "deposit_free_trial": True,
+                    }
+                    for category_id in category_ids
+                }
+
+        application = {
+            "status": "waiting_category",
+            "category_state": "deposit_required",
+            "category_ids": ["1713"],
+            "category_apply_submitted": False,
+            "category_application_at": "2026-11-01T09:00:00",
+            "category_deposit_snapshot": {
+                "deposit_balance": 0,
+                "real_deposit_balance": 0,
+                "operation_required_deposit": 0,
+                "deposit_shortfall": 0,
+                "online_count": 101,
+            },
+        }
+
+        with self.assertRaises(CategoryAutoOpenError) as raised:
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "1713"}]},
+                lambda: {"product_id": "must-not-exist"},
+                CategoryClient(),
+                application=application,
+            )
+
+        self.assertEqual(raised.exception.state, "deposit_required")
+        self.assertIn("保证金", str(raised.exception))
+
+    def test_under_100_live_products_applies_category_without_deposit_block(
+        self,
+    ) -> None:
+        upload_calls = []
+        apply_calls = []
+        online_calls = []
+
+        class CategoryClient:
+            state = "not_applied"
+
+            def online_product_count(self):
+                online_calls.append(True)
+                return {
+                    "count": 99,
+                    "source": "官方实时出售中商品数",
+                }
+
+            def category_application_checks(self, category_ids):
+                return {
+                    category_id: {
+                        "state": self.state,
+                        "label": (
+                            "未申请"
+                            if self.state == "not_applied"
+                            else "已生效"
+                        ),
+                        "reason": "",
+                        "eligible": self.state == "not_applied",
+                        "required_deposit": 100000,
+                        "amount_to_pay": 100000,
+                        "deposit_balance": 0,
+                        "deposit_shortfall": 100000,
+                        "deposit_free_trial": True,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, category_ids):
+                apply_calls.append(list(category_ids))
+                self.state = "effective"
+
+        client = CategoryClient()
+        application = {}
+
+        def upload():
+            upload_calls.append("upload")
+            if len(upload_calls) == 1:
+                raise WechatApiError(
+                    "无该类目权限",
+                    code=6600145,
+                )
+            return {"product_id": "WX-UNDER-100"}
+
+        result = _retry_upload_after_category_open(
+            {"cats_v2": [{"cat_id": "547307"}]},
+            upload,
+            client,
+            application=application,
+        )
+
+        self.assertEqual(result["product_id"], "WX-UNDER-100")
+        self.assertEqual(upload_calls, ["upload", "upload"])
+        self.assertEqual(apply_calls, [["547307"]])
+        self.assertEqual(online_calls, [True])
+        self.assertEqual(
+            application["online_product_snapshot"]["count"],
+            99,
+        )
+
+    def test_deposit_fields_are_informational_above_100_live_products(
+        self,
+    ) -> None:
+        apply_calls = []
+        upload_calls = []
+
+        class CategoryClient:
+            state = "not_applied"
+
+            def online_product_count(self):
+                return {"count": 100}
+
+            def category_application_checks(self, category_ids):
+                return {
+                    category_id: {
+                        "state": self.state,
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                        "required_deposit": 100000,
+                        "amount_to_pay": 100000,
+                        "deposit_balance": 0,
+                        "deposit_shortfall": 100000,
+                        "deposit_free_trial": False,
+                    }
+                    for category_id in category_ids
+                }
+
+            def batch_add_categories(self, category_ids):
+                apply_calls.append(list(category_ids))
+                self.state = "effective"
+
+        def upload():
+            upload_calls.append("upload")
+            if len(upload_calls) == 1:
+                raise WechatApiError(
+                    "无该类目权限",
+                    code=6600145,
+                )
+            return {"product_id": "WX-AT-100"}
+
+        result = _retry_upload_after_category_open(
+            {"cats_v2": [{"cat_id": "547307"}]},
+            upload,
+            CategoryClient(),
+        )
+
+        self.assertEqual(result["product_id"], "WX-AT-100")
+        self.assertEqual(apply_calls, [["547307"]])
+        self.assertEqual(upload_calls, ["upload", "upload"])
+
+    def test_pending_category_review_has_long_manual_fallback(
+        self,
+    ) -> None:
+        class CategoryClient:
+            def category_application_checks(self, category_ids):
+                return {
+                    str(category_id): {
+                        "state": "pending",
+                        "label": "审核中",
+                        "reason": "",
+                        "eligible": False,
+                    }
+                    for category_id in category_ids
+                }
+
+        with patch.dict(
+            os.environ,
+            {"WEIMI_CATEGORY_REVIEW_MAX_HOURS": "72"},
+        ):
+            with self.assertRaises(CategoryAutoOpenError) as raised:
+                _retry_upload_after_category_open(
+                    {"cats_v2": [{"cat_id": "3001"}]},
+                    lambda: {"product_id": "must-not-exist"},
+                    CategoryClient(),
+                    application={
+                        "category_state": "waiting",
+                        "category_ids": ["3001"],
+                        "category_apply_submitted": True,
+                        "category_application_at": (
+                            datetime.now() - timedelta(days=4)
+                        ).isoformat(timespec="seconds"),
+                    },
+                )
+
+        self.assertIn("72 小时", str(raised.exception))
+
+    def test_empty_or_partial_category_checks_are_never_treated_as_effective(
+        self,
+    ) -> None:
+        upload_calls = []
+
+        class EmptyCategoryClient:
+            def category_application_checks(self, _category_ids):
+                return {}
+
+        with self.assertRaises(CategoryApprovalPending):
+            _retry_upload_after_category_open(
+                {"cats_v2": [{"cat_id": "100"}, {"cat_id": "201"}]},
+                lambda: upload_calls.append("upload") or {
+                    "product_id": "must-not-exist"
+                },
+                EmptyCategoryClient(),
+                application={
+                    "category_state": "waiting",
+                    "category_ids": ["201"],
+                    "category_apply_submitted": True,
+                },
+            )
+
+        class PartialCategoryClient:
+            def category_application_checks(self, _category_ids):
+                return {
+                    "201": {
+                        "state": "effective",
+                        "label": "已生效",
+                        "reason": "",
+                        "eligible": False,
+                    }
+                }
+
+        with self.assertRaises(CategoryApprovalPending):
+            _retry_upload_after_category_open(
+                {
+                    "cats_v2": [
+                        {"cat_id": "100"},
+                        {"cat_id": "201"},
+                        {"cat_id": "202"},
+                    ]
+                },
+                lambda: upload_calls.append("upload") or {
+                    "product_id": "must-not-exist"
+                },
+                PartialCategoryClient(),
+                category_ids=["201", "202"],
+                application={
+                    "category_state": "waiting",
+                    "category_ids": ["201", "202"],
+                    "category_apply_submitted": True,
+                },
+            )
+
+        self.assertEqual(upload_calls, [])
+
     def test_automatic_category_retry_resumes_waiting_items(self) -> None:
         class FakeWindow:
             def __init__(self) -> None:
@@ -242,6 +1196,80 @@ class UploadPageContractTests(unittest.TestCase):
             page.window.statuses,
             ["正在检查已申请类目并自动恢复上货…"],
         )
+
+    def test_automatic_category_retry_waits_for_next_check_time(self) -> None:
+        class FakeWindow:
+            def set_status(self, *_args, **_kwargs) -> None:
+                raise AssertionError("future category check must not start")
+
+        page = object.__new__(UploadPage)
+        page.window = FakeWindow()
+        page._tasks = [
+            {
+                "id": "future-task",
+                "status": "needs_category",
+                "items": [
+                    {
+                        "item_id": "future-item",
+                        "status": "waiting_category",
+                        "category_next_check_at": (
+                            datetime.now() + timedelta(minutes=10)
+                        ).isoformat(timespec="seconds"),
+                    }
+                ],
+            }
+        ]
+        page._running = False
+        page._run_requested = False
+        page._category_retry_job = None
+        page._start_tasks = Mock()
+
+        page._auto_retry_category_tasks()
+
+        page._start_tasks.assert_not_called()
+
+    def test_automatic_category_retry_defers_while_upload_is_running(
+        self,
+    ) -> None:
+        class FakeTopLevel:
+            def __init__(self) -> None:
+                self.delay = None
+
+            def after(self, delay, _callback):
+                self.delay = delay
+                return "retry-job"
+
+        class FakeWindow:
+            def set_status(self, *_args, **_kwargs) -> None:
+                raise AssertionError("running upload must be allowed to finish")
+
+        top_level = FakeTopLevel()
+        page = object.__new__(UploadPage)
+        page.window = FakeWindow()
+        page._tasks = [
+            {
+                "id": "running-task",
+                "items": [
+                    {
+                        "item_id": "running-item",
+                        "status": "waiting_category",
+                        "category_next_check_at": (
+                            datetime.now() - timedelta(minutes=1)
+                        ).isoformat(timespec="seconds"),
+                    }
+                ],
+            }
+        ]
+        page._running = True
+        page._run_requested = False
+        page._category_retry_job = None
+        page._start_tasks = Mock()
+        page.winfo_toplevel = lambda: top_level
+
+        page._auto_retry_category_tasks()
+
+        page._start_tasks.assert_not_called()
+        self.assertGreaterEqual(top_level.delay, 60_000)
 
     def test_group_selection_includes_all_stores_in_selected_groups(
         self,
@@ -1332,6 +2360,443 @@ class UploadPageContractTests(unittest.TestCase):
         self.assertEqual(rows[0]["stock"], 0)
         self.assertTrue(rows[0]["stock_known"])
 
+    def test_auto_category_applies_template_deposit_limit_as_hard_cap(
+        self,
+    ) -> None:
+        page = object.__new__(UploadPage)
+        page.db = object()
+        page._category_catalog_cache = {}
+        catalog = [
+            {
+                "category_id": "HIGH",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": ["100", "200", "HIGH"],
+            },
+            {
+                "category_id": "LOW",
+                "name": "加厚棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 加厚棉鞋",
+                "id_path": ["100", "200", "LOW"],
+            },
+        ]
+
+        class Client:
+            def category_catalog(self):
+                return catalog
+
+            def category_application_checks(self, ids):
+                return {
+                    category_id: {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                        "deposit_amount": (
+                            50000 if category_id == "HIGH" else 10000
+                        ),
+                        "deposit_balance": 0,
+                        "deposit_shortfall": (
+                            50000 if category_id == "HIGH" else 10000
+                        ),
+                    }
+                    for category_id in ids
+                }
+
+        store = SimpleNamespace(id=7, name="保证金上限店铺")
+        with patch(
+            "weimi_manager.ui.upload_page.ShopPrivateClient",
+            return_value=Client(),
+        ):
+            result = page._auto_match_category(
+                store,
+                {
+                    "title": "女士冬季保暖加厚棉鞋",
+                    "category_hint": "保暖棉鞋",
+                },
+                {"deposit_limit": 200},
+            )
+
+        self.assertEqual(result["category_apply_ids"], ["LOW"])
+        self.assertEqual(
+            result["_category_selected"]["deposit_amount"],
+            10000,
+        )
+
+    def test_auto_category_sorts_compliant_candidates_by_deposit_then_score(
+        self,
+    ) -> None:
+        page = object.__new__(UploadPage)
+        page.db = object()
+        page._category_catalog_cache = {}
+        catalog = [
+            {
+                "category_id": "1000",
+                "name": "女士运动鞋",
+                "path": "鞋靴 / 女鞋 / 女士运动鞋",
+                "id_path": ["10", "20", "1000"],
+            },
+            {
+                "category_id": "2000",
+                "name": "女士运动鞋",
+                "path": "鞋靴 / 女鞋 / 运动鞋 / 女士运动鞋",
+                "id_path": ["10", "20", "2000"],
+            },
+            {
+                "category_id": "20000",
+                "name": "女士运动鞋",
+                "path": "鞋靴 / 女鞋 / 运动户外 / 女士运动鞋",
+                "id_path": ["10", "20", "20000"],
+            },
+            {
+                "category_id": "100",
+                "name": "手机壳",
+                "path": "数码 / 手机配件 / 手机壳",
+                "id_path": ["90", "100"],
+            },
+            {
+                "category_id": "700",
+                "name": "女士休闲鞋",
+                "path": "鞋靴 / 女鞋 / 女士休闲鞋",
+                "id_path": ["10", "20", "700"],
+            },
+        ]
+
+        class Client:
+            qualification_missing = False
+
+            def category_catalog(self):
+                return catalog
+
+            def category_application_checks(self, ids):
+                return {
+                    category_id: {
+                        "state": (
+                            "qualification_required"
+                            if self.qualification_missing
+                            and category_id == "1000"
+                            else "not_applied"
+                        ),
+                        "label": (
+                            "缺资质"
+                            if self.qualification_missing
+                            and category_id == "1000"
+                            else "未申请"
+                        ),
+                        "reason": "",
+                        "eligible": category_id != "1000"
+                        or not self.qualification_missing,
+                        "deposit_amount": {
+                            "1000": 1000,
+                            "2000": 2000,
+                            "20000": 20000,
+                            "100": 100,
+                            "700": 700,
+                        }[category_id],
+                        "deposit_balance": 0,
+                        "deposit_shortfall": 0,
+                    }
+                    for category_id in ids
+                }
+
+        client = Client()
+        store = SimpleNamespace(id=7, name="候选排序店铺")
+        with patch(
+            "weimi_manager.ui.upload_page.ShopPrivateClient",
+            return_value=client,
+        ):
+            selected = page._auto_match_category(
+                store,
+                {
+                    "title": "女士运动鞋",
+                    "category_hint": "女鞋 / 女士运动鞋",
+                },
+                {"deposit_limit": 300},
+            )
+            client.qualification_missing = True
+            page._category_catalog_cache = {}
+            fallback = page._auto_match_category(
+                store,
+                {
+                    "title": "女士运动鞋",
+                    "category_hint": "女鞋 / 女士运动鞋",
+                },
+                {"deposit_limit": 300},
+            )
+
+        self.assertEqual(selected["category_apply_ids"], ["1000"])
+        candidates = {
+            item["category_id"]: item
+            for item in selected["_category_candidates"]
+        }
+        self.assertTrue(candidates["1000"]["selected"])
+        self.assertNotIn("100", candidates)
+        self.assertFalse(candidates["700"]["selected"])
+        self.assertIn(
+            "语义未命中",
+            candidates["700"]["unselected_reason"],
+        )
+        self.assertNotIn("100", selected["category_apply_ids"])
+        self.assertIn(
+            "保证金高于",
+            candidates["2000"]["unselected_reason"],
+        )
+        self.assertEqual(fallback["category_apply_ids"], ["2000"])
+
+    def test_auto_category_over_limit_is_kept_as_upload_candidate(self) -> None:
+        page = object.__new__(UploadPage)
+        page.db = object()
+        page._category_catalog_cache = {}
+        catalog = [
+            {
+                "category_id": "HIGH",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": ["100", "200", "HIGH"],
+            }
+        ]
+
+        class Client:
+            def category_catalog(self):
+                return catalog
+
+            def category_application_checks(self, ids):
+                return {
+                    "HIGH": {
+                        "state": "deposit_required",
+                        "label": "保证金不足",
+                        "reason": "需补缴 30000 分",
+                        "eligible": False,
+                        "deposit_amount": 30000,
+                        "deposit_balance": 0,
+                        "deposit_shortfall": 30000,
+                    }
+                }
+
+        store = SimpleNamespace(id=7, name="保证金不足店铺")
+        with patch(
+            "weimi_manager.ui.upload_page.ShopPrivateClient",
+            return_value=Client(),
+        ):
+            selected = page._auto_match_category(
+                store,
+                {
+                    "title": "女士冬季保暖棉鞋",
+                    "category_hint": "保暖棉鞋",
+                },
+                {"deposit_limit": 200},
+            )
+
+        self.assertEqual(selected["category_apply_ids"], ["HIGH"])
+        self.assertEqual(
+            selected["auto_category"]["deposit_amount"],
+            30000,
+        )
+
+    def test_fallback_does_not_override_credible_auto_match_when_disabled(
+        self,
+    ) -> None:
+        page = object.__new__(UploadPage)
+        page.db = object()
+        page._category_catalog_cache = {}
+        catalog = [
+            {
+                "category_id": "AUTO",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": ["100", "200", "AUTO"],
+            },
+            {
+                "category_id": "FALLBACK",
+                "name": "手机壳",
+                "path": "数码 / 手机配件 / 手机壳",
+                "id_path": ["900", "FALLBACK"],
+            },
+        ]
+
+        class Client:
+            def category_catalog(self):
+                return catalog
+
+            def category_application_checks(self, ids):
+                return {
+                    category_id: {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                        "deposit_amount": (
+                            50000 if category_id == "300" else 10000
+                        ),
+                        "deposit_balance": 10000,
+                        "deposit_shortfall": (
+                            40000 if category_id == "300" else 0
+                        ),
+                    }
+                    for category_id in ids
+                }
+
+        with patch(
+            "weimi_manager.ui.upload_page.ShopPrivateClient",
+            return_value=Client(),
+        ):
+            result = page._auto_match_category(
+                SimpleNamespace(id=7, name="自动匹配店铺"),
+                {
+                    "title": "女士冬季保暖棉鞋",
+                    "category_hint": "保暖棉鞋",
+                },
+                {
+                    "fallback_category": "FALLBACK",
+                    "force_fallback_category": False,
+                    "deposit_limit": 200,
+                },
+            )
+
+        self.assertEqual(result["category_apply_ids"], ["AUTO"])
+        self.assertEqual(
+            result["_category_selected"]["selection_source"],
+            "auto",
+        )
+
+    def test_force_fallback_never_overrides_lower_deposit_auto_match(
+        self,
+    ) -> None:
+        page = object.__new__(UploadPage)
+        page.db = object()
+        page._category_catalog_cache = {}
+        catalog = [
+            {
+                "category_id": "300",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": ["100", "200", "300"],
+            },
+            {
+                "category_id": "400",
+                "name": "加厚棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 加厚棉鞋",
+                "id_path": ["100", "200", "400"],
+            },
+            {
+                "category_id": "500",
+                "name": "手机壳",
+                "path": "数码 / 手机配件 / 手机壳",
+                "id_path": ["900", "500"],
+            },
+        ]
+
+        class Client:
+            def category_catalog(self):
+                return catalog
+
+            def category_application_checks(self, ids):
+                return {
+                    category_id: {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                        "deposit_amount": (
+                            50000 if category_id == "300" else 10000
+                        ),
+                        "deposit_balance": 10000,
+                        "deposit_shortfall": (
+                            40000 if category_id == "300" else 0
+                        ),
+                    }
+                    for category_id in ids
+                }
+
+        store = SimpleNamespace(id=7, name="强制兜底店铺")
+        payload = {
+            "title": "女士冬季保暖加厚棉鞋",
+            "category_hint": "保暖棉鞋",
+        }
+        with patch(
+            "weimi_manager.ui.upload_page.ShopPrivateClient",
+            return_value=Client(),
+        ):
+            valid = page._auto_match_category(
+                store,
+                dict(payload),
+                {
+                    "fallback_category": '["100", "200", "400"]',
+                    "force_fallback_category": True,
+                    "deposit_limit": 200,
+                },
+            )
+
+        self.assertEqual(valid["category_apply_ids"], ["400"])
+        self.assertEqual(
+            valid["_category_selected"]["selection_source"],
+            "auto",
+        )
+
+    def test_force_fallback_does_not_override_semantic_leaf_over_deposit_cap(
+        self,
+    ) -> None:
+        page = object.__new__(UploadPage)
+        page.db = object()
+        page._category_catalog_cache = {}
+        catalog = [
+            {
+                "category_id": "300",
+                "name": "保暖棉鞋",
+                "path": "鞋靴 / 女鞋 / 棉鞋 / 保暖棉鞋",
+                "id_path": ["100", "200", "300"],
+            },
+            {
+                "category_id": "500",
+                "name": "手机壳",
+                "path": "数码 / 手机配件 / 手机壳",
+                "id_path": ["900", "500"],
+            },
+        ]
+
+        class Client:
+            def category_catalog(self):
+                return catalog
+
+            def category_application_checks(self, ids):
+                return {
+                    category_id: {
+                        "state": "not_applied",
+                        "label": "未申请",
+                        "reason": "",
+                        "eligible": True,
+                        "deposit_amount": (
+                            50000 if category_id == "300" else 10000
+                        ),
+                        "deposit_balance": 10000,
+                        "deposit_shortfall": 0,
+                    }
+                    for category_id in ids
+                }
+
+        with patch(
+            "weimi_manager.ui.upload_page.ShopPrivateClient",
+            return_value=Client(),
+        ):
+            selected = page._auto_match_category(
+                SimpleNamespace(id=7, name="强制兜底店铺"),
+                {
+                    "title": "女士冬季保暖加厚棉鞋",
+                    "category_hint": "保暖棉鞋",
+                },
+                {
+                    "fallback_category": "500",
+                    "force_fallback_category": True,
+                    "deposit_limit": 200,
+                },
+            )
+
+        self.assertEqual(selected["category_apply_ids"], ["300"])
+        self.assertEqual(
+            selected["_category_selected"]["selection_source"],
+            "auto",
+        )
+
     def test_old_taobao_batch_rows_are_renormalized_from_raw_skus(self) -> None:
         page = object.__new__(UploadPage)
         raw = {
@@ -1611,6 +3076,31 @@ class UploadPageContractTests(unittest.TestCase):
             {"颜色", "规格"},
         )
 
+    def test_normalized_wechat_row_gets_default_sku_attribute(self) -> None:
+        normalized = _normalize_source_payload(
+            {
+                "platform": "微信小店",
+                "source_product_id": "WX-NORMALIZED",
+                "out_product_id": "WX-NORMALIZED",
+                "title": "已标准化微信商品",
+                "head_imgs": ["https://example.test/main.jpg"],
+                "skus": [
+                    {
+                        "out_sku_id": "WX-SKU-1",
+                        "sale_price": 1200,
+                        "stock_num": 6,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(normalized["source_product_id"], "WX-NORMALIZED")
+        self.assertEqual(normalized["skus"][0]["out_sku_id"], "WX-SKU-1")
+        self.assertEqual(
+            normalized["skus"][0]["sku_attrs"],
+            [{"attr_key": "规格", "attr_value": "默认规格"}],
+        )
+
     def test_template_controls_immediate_listing_and_draft(self) -> None:
         page = object.__new__(UploadPage)
         item = {
@@ -1647,6 +3137,45 @@ class UploadPageContractTests(unittest.TestCase):
         self.assertEqual(immediate["listing"], 1)
         self.assertEqual(draft["listing"], 0)
         self.assertEqual(delayed["listing"], 0)
+
+    def test_template_store_options_override_source_defaults(self) -> None:
+        page = object.__new__(UploadPage)
+        item = {
+            "title": "店铺配置测试",
+            "price": 100,
+            "stock": 5,
+            "payload": {
+                "title": "店铺配置测试",
+                "cats_v2": [{"cat_id": "10000111"}],
+                "head_imgs": ["https://example.test/a.jpg"],
+                "skus": [{"sale_price": 100, "stock_num": 5}],
+                "express_info": {"template_id": "old-freight"},
+                "after_sale_info": {
+                    "after_sale_address_id": "old-address",
+                },
+                "brand_id": "old-brand",
+            },
+        }
+
+        result = page._upload_payload(
+            item,
+            {
+                "name": "店铺配置",
+                "freight_template_id": "new-freight",
+                "brand_id": "new-brand",
+                "after_sale_address_id": "new-address",
+            },
+        )
+
+        self.assertEqual(
+            result["express_info"]["template_id"],
+            "new-freight",
+        )
+        self.assertEqual(result["brand_id"], "new-brand")
+        self.assertEqual(
+            result["after_sale_info"]["after_sale_address_id"],
+            "new-address",
+        )
 
     def test_cloud_violation_type_filter_does_not_subtract_list_and_set(
         self,
@@ -1701,6 +3230,107 @@ class UploadPageContractTests(unittest.TestCase):
                             "cloud_violation_types": "明确违规",
                         },
                     )
+
+    def test_cloud_violation_filter_blocks_exact_counterfeit_title(
+        self,
+    ) -> None:
+        class FakeDb:
+            @staticmethod
+            def violation_blacklist_ids():
+                return set()
+
+            @staticmethod
+            def get_setting(key, default=""):
+                if key == "upload_violation_titles":
+                    return json.dumps(
+                        [
+                            {
+                                "title": "毛绒花束捧花｜520生日礼物",
+                                "normalized": "毛绒花束捧花｜520生日礼物",
+                                "reason": "出售假冒商品",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                return default
+
+        page = object.__new__(UploadPage)
+        page.db = FakeDb()
+        item = {
+            "source_product_id": "SOURCE-NEW",
+            "title": "毛绒花束捧花｜520生日礼物",
+            "price": 100,
+            "stock": 5,
+            "payload": {
+                "title": "毛绒花束捧花｜520生日礼物",
+                "platform": "淘宝",
+                "cats": [{"cat_id": "10000111"}],
+                "head_imgs": ["https://example.test/a.jpg"],
+                "skus": [{"sale_price": 100, "stock_num": 5}],
+            },
+        }
+
+        with self.assertRaisesRegex(
+            TemplateRuleSkip,
+            "云违规标题过滤命中：出售假冒商品",
+        ):
+            page._upload_payload(
+                item,
+                {
+                    "name": "云违规标题过滤",
+                    "price_multiplier": 1,
+                    "cloud_violation": True,
+                },
+            )
+
+    def test_cloud_violation_filter_uses_final_template_title(self) -> None:
+        class FakeDb:
+            @staticmethod
+            def violation_blacklist_ids():
+                return set()
+
+            @staticmethod
+            def get_setting(key, default=""):
+                if key == "upload_violation_titles":
+                    return json.dumps(
+                        [
+                            {
+                                "title": "新品·新款售假标题 热卖",
+                                "normalized": "新品·新款售假标题 热卖",
+                                "reason": "出售假冒商品",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                return default
+
+        page = object.__new__(UploadPage)
+        page.db = FakeDb()
+        with self.assertRaisesRegex(
+            TemplateRuleSkip,
+            "云违规标题过滤命中：出售假冒商品",
+        ):
+            page._upload_payload(
+                {
+                    "source_product_id": "SOURCE-FINAL-TITLE",
+                    "title": "【促销】旧款售假标题",
+                    "price": 100,
+                    "payload": {
+                        "title": "【促销】旧款售假标题",
+                        "platform": "淘宝",
+                        "cats": [{"cat_id": "10000111"}],
+                        "head_imgs": ["https://example.test/a.jpg"],
+                        "skus": [{"sale_price": 100, "stock_num": 5}],
+                    },
+                },
+                {
+                    "strip_title_brackets": True,
+                    "title_replace_rules": "旧款=新款",
+                    "title_prefix": "新品·",
+                    "title_suffix": " 热卖",
+                    "cloud_violation": True,
+                },
+            )
 
     def test_duplicate_filter_defaults_to_store_and_can_be_disabled(
         self,
@@ -1996,15 +3626,19 @@ class UploadPageContractTests(unittest.TestCase):
 
         class FakeCategoryClient:
             def __init__(self, _db, _store) -> None:
-                pass
+                self.applied = False
 
-            @staticmethod
-            def category_relation_statuses(_category_ids):
-                return {}
+            def category_relation_statuses(self, category_ids):
+                if not self.applied:
+                    return {}
+                return {
+                    str(category_id): "已生效"
+                    for category_id in category_ids
+                }
 
-            @staticmethod
-            def batch_add_categories(category_ids):
+            def batch_add_categories(self, category_ids):
                 category_calls.append(tuple(category_ids))
+                self.applied = True
                 return {"success": True}
 
         class FakeWindow:
@@ -2962,6 +4596,8 @@ class UploadPageContractTests(unittest.TestCase):
             {
                 "strip_title_brackets": True,
                 "title_replace_rules": "旧款 = 新款",
+                "title_prefix": "新品·",
+                "title_suffix": " 热卖",
                 "fixed_price_enabled": True,
                 "fixed_price": 1999,
                 "final_price_decimals": 2,
@@ -2972,7 +4608,7 @@ class UploadPageContractTests(unittest.TestCase):
                 "delivery_time": "48小时内发货",
             },
         )
-        self.assertEqual(result["title"], "新款棉柔巾")
+        self.assertEqual(result["title"], "新品·新款棉柔巾 热卖")
         self.assertEqual(result["skus"][0]["sale_price"], 1999)
         self.assertEqual(
             result["attrs"],

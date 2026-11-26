@@ -132,6 +132,7 @@ class AuthSessionTests(unittest.TestCase):
                 refresh_token="refresh-value",
                 expires_at="2026-11-08T12:00:00+00:00",
                 last_login_at="2026-11-08T10:00:00+00:00",
+                entitlements={"module.finance": True},
             )
             store.save(account)
             raw = store.path.read_bytes()
@@ -364,6 +365,12 @@ class AuthSessionTests(unittest.TestCase):
                     },
                 }
 
+            def my_ops_capabilities(self, _access_token):
+                return {
+                    "module.finance": True,
+                    "module.runtime_logs": False,
+                }
+
             def register_device(self, *_args):
                 return {}
 
@@ -388,6 +395,66 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(context.organization_id, "org-1")
         self.assertEqual(context.member_role, "operator")
         self.assertTrue(context.permissions["stores_view"])
+        self.assertEqual(
+            context.entitlements,
+            {
+                "module.finance": True,
+                "module.runtime_logs": False,
+            },
+        )
+
+    def test_login_fails_closed_when_capability_pull_fails(self) -> None:
+        class CapabilityFailureClient:
+            def login_by_username(self, username, _password):
+                return SessionTokens(
+                    user_id="user-capability",
+                    account_id="user-capability",
+                    username=username,
+                    email="capability@example.com",
+                    access_token="access",
+                    refresh_token="refresh",
+                    expires_at="2026-11-11T12:00:00+00:00",
+                )
+
+            def organization_context(self, _access_token):
+                return {
+                    "organization_id": "org-1",
+                    "role": "owner",
+                    "permissions": {},
+                }
+
+            def my_ops_capabilities(self, _access_token):
+                raise AuthError(
+                    "capability service unavailable",
+                    503,
+                )
+
+            def register_device(self, *_args):
+                return {}
+
+            def license_status(self, _tokens):
+                return LicenseStatus(
+                    active=True,
+                    permanent=True,
+                    expires_at=None,
+                    status_text="组织授权",
+                    remaining_days=999999,
+                    max_devices=10,
+                    device_bound=True,
+                    server_time="2026-11-11T10:00:00+00:00",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = AuthService(
+                CapabilityFailureClient(),
+                AuthSessionStore(Path(tmp)),
+            )
+            context = service.login(
+                "capability-user",
+                "password123",
+                False,
+            )
+        self.assertEqual(context.entitlements, {})
 
     def test_login_fails_closed_when_organization_check_fails(self) -> None:
         class OrganizationFailureClient:
@@ -480,6 +547,47 @@ class AuthClientTests(unittest.TestCase):
             fake.calls[1][2]["json"]["data"]["username"],
             "qqwww",
         )
+
+    def test_my_ops_capabilities_reads_only_authenticated_rpc(self) -> None:
+        fake = _Session(
+            [
+                _Response(
+                    200,
+                    [
+                        {
+                            "capability": "module.finance",
+                            "enabled": True,
+                        },
+                        {
+                            "capability": "module.team",
+                            "enabled": False,
+                        },
+                    ],
+                )
+            ]
+        )
+        client = SupabaseAuthClient(self.config, fake)
+
+        result = client.my_ops_capabilities("jwt-token")
+
+        self.assertEqual(
+            result,
+            {
+                "module.finance": True,
+                "module.team": False,
+            },
+        )
+        method, url, options = fake.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url,
+            f"{self.config.base_url}/rest/v1/rpc/my_ops_capabilities",
+        )
+        self.assertEqual(
+            options["headers"]["Authorization"],
+            "Bearer jwt-token",
+        )
+        self.assertEqual(options["json"], {})
 
     def test_email_otp_can_be_sent_before_account_fields(self) -> None:
         fake = _Session(
@@ -1066,12 +1174,15 @@ class AuthWindowTests(unittest.TestCase):
                         window.update()
                     except tk.TclError:
                         break
-                self.assertEqual(window._register_countdown, 60)
+                # Tk may process the first one-second tick while the test is
+                # waiting for the async registration callback.
+                self.assertGreater(window._register_countdown, 0)
+                self.assertLessEqual(window._register_countdown, 60)
                 self.assertEqual(
                     str(window.register_send_button["state"]),
                     "disabled",
                 )
-                self.assertIn("60s", window.register_send_button["text"])
+                self.assertIn("重新发送 (", window.register_send_button["text"])
             finally:
                 window._close()
 

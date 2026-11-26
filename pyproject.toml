@@ -1,6 +1,6 @@
 [project]
 name = "weimi-manager"
-version = "1.8.56"
+version = "1.8.99.3"
 description = "澜琅微信小店多店铺运营工作台（1.6.63 原界面重构版）"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -26,6 +26,7 @@ langlang = "weimi_manager.pyside.main:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--ignore=tests/isolated_dongxiao"
 
 [tool.ruff]
 line-length = 100

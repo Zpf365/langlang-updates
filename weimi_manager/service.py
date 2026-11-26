@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from .db import PRODUCT_STATUS, Database, order_status_text
+from .db import PRODUCT_STATUS, SHANGHAI_TZ, Database, order_status_text
 from .mock import MockShopClient, ProgressCallback
 from .models import (
     Order,
@@ -22,13 +22,22 @@ from .models import (
     ShippingTemplate,
     Store,
     SyncResult,
+    is_unclaimed_gift_order,
     order_counts_as_transaction,
     product_matches_tab,
 )
-from .procurement import ProcurementAdapter, ProcurementWebSession
+from .procurement import (
+    ControlledPurchaseWindow,
+    ProcurementAdapter,
+    ProcurementWebSession,
+)
 from .shop_private import ShopPrivateClient, ShopPrivateError
+from .source_1688 import rank_category_candidates
+from .upload_violations import build_upload_violation_titles
 from .wechat_api import (
+    WechatApiError,
     WechatShopClient,
+    normalize_sku_sale_attrs,
     parse_shipping_account,
     parse_shipping_template,
 )
@@ -47,6 +56,211 @@ _CLOSED_VIOLATION_STATUSES = {
     "预警结束",
     "审核中",
 }
+GIFT_UNCLAIMED_MAX_AGE_SECONDS = 24 * 60 * 60
+AFTER_SALE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+AFTER_SALE_FULL_SYNC_MAX_AGE_SECONDS = 24 * 60 * 60
+AFTER_SALE_FULL_SYNC_DAYS = 30
+
+
+def _gift_exclusion_for_period(
+    orders: list[dict[str, Any]],
+    *,
+    now_ts: int,
+    start_ts: int,
+    end_ts: int,
+) -> dict[str, Any]:
+    """Build the unclaimed-gift deduction for one sale period."""
+    pending_ids: list[str] = []
+    deducted_amount = 0
+    unconfirmed_ids: list[str] = []
+    expired_ids: list[str] = []
+    for row in orders:
+        try:
+            created_at = int(row.get("create_time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not (start_ts <= created_at < end_ts):
+            continue
+        if not is_unclaimed_gift_order(row):
+            continue
+        order_id = str(row.get("order_id") or "").strip()
+        if created_at <= now_ts - GIFT_UNCLAIMED_MAX_AGE_SECONDS:
+            expired_ids.append(order_id)
+            continue
+        pending_ids.append(order_id)
+        deducted_amount += max(0, int(row.get("total_amount") or 0))
+        raw_value = row.get("raw_json")
+        if isinstance(raw_value, dict):
+            raw = raw_value
+        else:
+            try:
+                raw = json.loads(raw_value or "{}")
+            except (TypeError, ValueError):
+                raw = {}
+        if not isinstance(raw, dict) or raw.get("is_present") is not True:
+            unconfirmed_ids.append(order_id)
+    return {
+        "deducted_amount": deducted_amount,
+        "deducted_orders": len(pending_ids),
+        "applied_amount": 0,
+        "applied_orders": 0,
+        "pending_order_ids": pending_ids,
+        "pending_order_count": len(pending_ids),
+        "gated_count": len(unconfirmed_ids),
+        "gated_order_ids": unconfirmed_ids,
+        "unconfirmed_count": len(unconfirmed_ids),
+        "unconfirmed_order_ids": unconfirmed_ids,
+        "expired_status12_count": len(expired_ids),
+        "expired_status12_order_ids": expired_ids,
+        "source": (
+            "官方成交统计 - 未领取礼物"
+            "（本地订单 status=12，创建时间 24 小时内）"
+        ),
+        "buyer_deduction": "未扣减买家数（官方 pay_uv 无订单明细重叠信息）",
+    }
+
+
+def _after_sale_counts_as_refund_request(row: dict[str, Any]) -> bool:
+    after_sale_id = str(row.get("after_sale_order_id") or "").strip()
+    if not after_sale_id:
+        return False
+    status = str(row.get("status") or "").strip().upper()
+    status_text = str(row.get("status_text") or "").strip()
+    if status in {"USER_CANCELD", "USER_CANCELED"}:
+        return False
+    if any(
+        marker in status_text
+        for marker in ("用户已取消", "未提交", "无效")
+    ):
+        return False
+    return True
+
+
+def _refund_order_counts_for_periods(
+    order_rows: list[dict[str, Any]],
+    after_sale_rows: list[dict[str, Any]],
+    ranges: dict[str, tuple[int, int]],
+) -> tuple[dict[str, int | None], dict[str, Any]]:
+    """Count completed refunds from the same official after-sale timeline."""
+    events: dict[str, dict[str, Any]] = {}
+
+    def add_event(
+        dedupe_key: str,
+        event_time: int,
+        source: str,
+    ) -> None:
+        key = str(dedupe_key or "").strip()
+        if not key or event_time <= 0:
+            return
+        current = events.get(key)
+        if current is None:
+            events[key] = {
+                "event_time": event_time,
+                "sources": {source},
+            }
+            return
+        current["sources"].add(source)
+        if event_time < int(current["event_time"]):
+            current["event_time"] = event_time
+
+    completed_statuses = {
+        "MERCHANT_REFUND_SUCCESS",
+        "MERCHANT_RETURN_SUCCESS",
+    }
+    for row in after_sale_rows:
+        if not _after_sale_counts_as_refund_request(row):
+            continue
+        status = str(row.get("status") or "").strip().upper()
+        if status not in completed_statuses:
+            continue
+        raw = {}
+        try:
+            parsed_raw = json.loads(row.get("raw_json") or "{}")
+            raw = parsed_raw if isinstance(parsed_raw, dict) else {}
+        except (TypeError, ValueError):
+            raw = {}
+        candidates = [
+            raw.get("complete_time"),
+            (raw.get("refund_info") or {}).get("refund_time")
+            if isinstance(raw.get("refund_info"), dict)
+            else None,
+            row.get("update_time"),
+        ]
+        event_time = 0
+        for candidate in candidates:
+            try:
+                event_time = int(candidate or 0)
+            except (TypeError, ValueError):
+                continue
+            if event_time > 0:
+                break
+        try:
+            if event_time <= 0:
+                continue
+        except TypeError:
+            continue
+        order_id = str(row.get("order_id") or "").strip()
+        after_sale_id = str(row.get("after_sale_order_id") or "").strip()
+        dedupe_key = order_id or after_sale_id
+        add_event(
+            dedupe_key,
+            event_time,
+            "官方售后完成时间（complete_time/update_time）",
+        )
+
+    order_evidence = {
+        period: set()
+        for period in ranges
+    }
+    for row in order_rows:
+        if str(row.get("status") or "").strip() != "200":
+            continue
+        try:
+            event_time = int(row.get("update_time") or 0)
+        except (TypeError, ValueError):
+            continue
+        order_id = str(row.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        for period, (start_ts, end_ts) in ranges.items():
+            if start_ts <= event_time < end_ts:
+                order_evidence[period].add(order_id)
+
+    keys_by_period = {period: set() for period in ranges}
+    sources_by_period: dict[str, set[str]] = {
+        period: set() for period in ranges
+    }
+    for key, event in events.items():
+        event_time = int(event["event_time"])
+        for period, (start_ts, end_ts) in ranges.items():
+            if start_ts <= event_time < end_ts:
+                keys_by_period[period].add(key)
+                sources_by_period[period].update(event["sources"])
+    has_source_data = bool(after_sale_rows)
+    counts = {
+        period: (
+            len(values)
+            if has_source_data
+            else None
+        )
+        for period, values in keys_by_period.items()
+    }
+    metadata = {
+        "record_count": len(events),
+        "sources": {
+            period: sorted(values)
+            for period, values in sources_by_period.items()
+        },
+        "source": (
+            "仅使用已完成官方售后记录及 complete_time/update_time；"
+            "按 order_id 去重；订单 status=200 仅作覆盖证据，不参与单量"
+        ),
+        "order_status_evidence": {
+            period: len(values)
+            for period, values in order_evidence.items()
+        },
+    }
+    return counts, metadata
 
 
 def _discount_price_cents(
@@ -87,15 +301,32 @@ def is_explicit_violation_record(record: dict[str, Any]) -> bool:
     )
 
 
+class ProductDeleteUncertainError(RuntimeError):
+    """The remote delete request may have reached the platform."""
+
+    verification_pending = True
+
+
 class SyncService:
-    def __init__(self, db: Database, sleep: Callable[[float], None] | None = None):
+    def __init__(
+        self,
+        db: Database,
+        sleep: Callable[[float], None] | None = None,
+        now_provider: Callable[[], datetime] | None = None,
+    ):
         self.db = db
         self.sleep = sleep
+        self.now_provider = now_provider or datetime.now
         self.platform_write_authorizer: (
             Callable[[str, str], None] | None
         ) = None
         self._product_payload_defaults_cache: dict[int, dict[str, Any]] = {}
         self._category_rule_cache: dict[tuple[int, str, str], dict[str, Any]] = {}
+        self._category_catalog_cache: dict[int, list[dict[str, Any]]] = {}
+        self._store_freight_template_ids_cache: dict[int, set[str]] = {}
+        self._store_merchant_address_ids_cache: dict[int, set[str]] = {}
+        self._procurement_windows: dict[int, ControlledPurchaseWindow] = {}
+        self._procurement_windows_lock = threading.RLock()
 
     def client_for(self, store: Store) -> WechatShopClient | MockShopClient:
         if store.app_id == "demo-store":
@@ -129,6 +360,26 @@ class SyncService:
         client = self.client_for(store)
         message = client.test_connection()
         self.db.set_store_status(store.id, message)
+
+    def validate_store_credential(
+        self,
+        store: Store,
+        secret: str,
+    ) -> str:
+        if store.app_id == "demo-store":
+            return "连接成功"
+        if not str(secret or "").strip():
+            raise ValueError("AppSecret 为空")
+        kwargs: dict[str, Any] = {"sleeper": self.sleep} if self.sleep else {}
+        observer = getattr(self, "call_observer", None)
+        if callable(observer):
+            kwargs["call_observer"] = observer
+        client = WechatShopClient(
+            store.app_id,
+            str(secret).strip(),
+            **kwargs,
+        )
+        return client.test_connection()
 
     def sync_orders(
         self,
@@ -167,6 +418,98 @@ class SyncService:
             self.db.finish_sync_run(run_id, "failed", 0, str(exc))
             raise
 
+    def refresh_orders_recent(
+        self,
+        store: Store,
+        start_time: int,
+        end_time: int,
+        current_order_ids: list[str] | tuple[str, ...] | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> SyncResult:
+        """Refresh update-time changes and every currently displayed order."""
+        if end_time <= start_time:
+            raise ValueError("订单刷新结束时间必须晚于开始时间")
+        if end_time - start_time > 7 * 86400:
+            raise ValueError("订单刷新时间范围不能超过 7 天")
+        run_id = self.db.start_sync_run(store.id, "orders")
+        try:
+            client = self.client_for(store)
+            if isinstance(client, MockShopClient):
+                orders = client.fetch_orders(start_time, end_time, progress)
+                ids = [order.order_id for order in orders]
+            else:
+                fetch_updates = getattr(
+                    client,
+                    "fetch_order_ids_by_update",
+                    None,
+                )
+                if not callable(fetch_updates):
+                    raise RuntimeError(
+                        "当前客户端不支持按 update_time 刷新订单"
+                    )
+                update_ids = fetch_updates(start_time, end_time)
+                tracked_ids = [
+                    str(value).strip()
+                    for value in (current_order_ids or [])
+                    if str(value).strip()
+                ]
+                ids = list(dict.fromkeys([*update_ids, *tracked_ids]))
+                failures: list[str] = []
+                fetched = 0
+                for index, order_id in enumerate(ids, start=1):
+                    if progress:
+                        progress(
+                            f"正在核验订单状态 {index}/{len(ids)}",
+                            index,
+                            len(ids),
+                        )
+                    try:
+                        order = client.fetch_order(store, order_id)
+                        self.db.upsert_order(order)
+                        fetched += 1
+                    except Exception as exc:
+                        failures.append(f"{order_id}: {exc}")
+                if failures and not fetched:
+                    raise RuntimeError(
+                        "订单刷新全部失败：" + "；".join(failures[:5])
+                    )
+                self.db.touch_store_sync(store.id)
+                message = (
+                    f"按更新时间核验 {len(ids)} 个订单，"
+                    f"成功 {fetched}"
+                )
+                if failures:
+                    message += f"，失败 {len(failures)}"
+                self.db.finish_sync_run(
+                    run_id,
+                    "success" if not failures else "partial",
+                    fetched,
+                    message,
+                )
+                return SyncResult(
+                    "orders",
+                    fetched,
+                    message,
+                    success=fetched,
+                    failed=len(failures),
+                    errors=failures[:20],
+                )
+            for index, order in enumerate(orders, start=1):
+                self.db.upsert_order(order)
+                if progress:
+                    progress(
+                        f"正在保存订单 {index}/{len(orders)}",
+                        index,
+                        len(orders),
+                    )
+            self.db.touch_store_sync(store.id)
+            message = f"订单刷新完成，共核验 {len(ids)} 个订单"
+            self.db.finish_sync_run(run_id, "success", len(ids), message)
+            return SyncResult("orders", len(ids), message, success=len(ids))
+        except Exception as exc:
+            self.db.finish_sync_run(run_id, "failed", 0, str(exc))
+            raise
+
     def _ensure_today_orders_cached(
         self,
         store: Store,
@@ -174,7 +517,10 @@ class SyncService:
         end_time: int,
     ) -> bool:
         """Backfill today's order states once so sales metrics use real status."""
-        business_day = datetime.fromtimestamp(start_time).date().isoformat()
+        business_day = datetime.fromtimestamp(
+            start_time,
+            SHANGHAI_TZ,
+        ).date().isoformat()
         setting_key = f"orders_day_backfill_{store.id}"
         if self.db.get_setting(setting_key, "") == business_day:
             return False
@@ -194,12 +540,122 @@ class SyncService:
         order_id: str,
         notes: str,
         color: int = 0,
-    ) -> None:
+    ) -> dict[str, Any]:
         self._require_platform_write(store, "order_notes_update")
-        client = self.client_for(store)
-        if not isinstance(client, MockShopClient):
+        if str(store.app_id) == "demo-store":
+            self.db.update_order_note(store.id, order_id, notes)
+            return {
+                "merchant_notes": str(notes),
+                "merchant_notes_tag_color": int(color),
+                "verified": True,
+            }
+
+        private_error: Exception | None = None
+        try:
+            private = ShopPrivateClient(self.db, store)
+            private.update_order_notes_private(order_id, notes, color)
+            official = private.order_detail(order_id)
+        except ShopPrivateError as exc:
+            private_error = exc
+            private = None
+            official = {}
+        else:
+            private_error = None
+
+        if private is None:
+            client = self.client_for(store)
+            if isinstance(client, MockShopClient):
+                raise RuntimeError("演示店铺不支持真实备注回读")
             client.update_order_notes(order_id, notes, color)
-        self.db.update_order_note(store.id, order_id, notes)
+            updated_order = client.fetch_order(store, order_id)
+            raw_detail = updated_order.raw.get("order_detail")
+            raw_detail = (
+                raw_detail if isinstance(raw_detail, dict) else {}
+            )
+            ext_info = raw_detail.get("ext_info")
+            ext_info = ext_info if isinstance(ext_info, dict) else {}
+            official = {
+                "order_id": order_id,
+                "merchant_notes": str(
+                    ext_info.get("merchant_notes")
+                    or updated_order.merchant_notes
+                    or ""
+                ),
+                "merchant_notes_tag_color": int(
+                    ext_info.get("merchant_notes_tag_color") or 0
+                ),
+                "packages": [],
+            }
+
+        actual_notes = str(official.get("merchant_notes") or "")
+        try:
+            actual_color = int(
+                official.get("merchant_notes_tag_color") or 0
+            )
+        except (TypeError, ValueError):
+            actual_color = 0
+        if actual_notes != str(notes) or actual_color != int(color):
+            detail = (
+                f"备注：{actual_notes!r}，旗帜：{actual_color}"
+            )
+            if private_error is not None:
+                detail += f"；网页登录写入错误：{private_error}"
+            raise RuntimeError(
+                "官方订单备注回读不一致，未确认保存成功（"
+                + detail
+                + "）"
+            )
+        self.db.update_order_platform_detail(
+            store.id,
+            order_id,
+            merchant_notes=actual_notes,
+            merchant_notes_tag_color=actual_color,
+            packages=official.get("packages") or None,
+        )
+        return official
+
+    def official_order_detail(
+        self,
+        store: Store,
+        order_id: str,
+    ) -> dict[str, Any]:
+        """Read order notes, flag and package traces from the official backend."""
+        private = ShopPrivateClient(self.db, store)
+        detail = private.order_detail(order_id)
+        self.db.update_order_platform_detail(
+            store.id,
+            order_id,
+            merchant_notes=str(detail.get("merchant_notes") or ""),
+            merchant_notes_tag_color=int(
+                detail.get("merchant_notes_tag_color") or 0
+            ),
+            packages=detail.get("packages") or None,
+        )
+        return detail
+
+    def refresh_order_official(
+        self,
+        store: Store,
+        order_id: str,
+    ) -> dict[str, Any]:
+        """Refresh one order and merge official notes/package state."""
+        public_error: Exception | None = None
+        try:
+            client = self.client_for(store)
+            if not isinstance(client, MockShopClient):
+                self.db.upsert_order(client.fetch_order(store, order_id))
+        except Exception as exc:
+            public_error = exc
+        try:
+            detail = self.official_order_detail(store, order_id)
+        except Exception:
+            if public_error is not None:
+                raise public_error
+            raise
+        detail["public_refresh_error"] = (
+            str(public_error) if public_error is not None else ""
+        )
+        return detail
 
     def update_order_price(
         self,
@@ -220,8 +676,13 @@ class SyncService:
                     "express_fee": express_fee if change_express else 0,
                 }
             )
-            order = client.fetch_order(store, order_id)
-            self.db.upsert_order(order)
+            try:
+                order = client.fetch_order(store, order_id)
+                self.db.upsert_order(order)
+            except Exception:
+                # The write already returned success. A follow-up read failure
+                # must not be reported as a failed write and trigger a retry.
+                pass
 
     def request_order_address_change(
         self,
@@ -515,6 +976,75 @@ class SyncService:
             defaults["deliver_acct_type"] = []
         self._product_payload_defaults_cache[store.id] = defaults
         return defaults
+
+    def _validate_store_delivery_config(
+        self,
+        store: Store,
+        client: WechatShopClient,
+        payload: dict[str, Any],
+    ) -> None:
+        template_id = str(
+            (payload.get("express_info") or {}).get("template_id") or ""
+        ).strip()
+        fetch_template_ids = getattr(
+            client,
+            "fetch_freight_template_ids",
+            None,
+        )
+        if template_id and callable(fetch_template_ids):
+            template_ids = self._store_freight_template_ids_cache.get(store.id)
+            if template_ids is None:
+                try:
+                    template_ids = {
+                        str(value).strip()
+                        for value in fetch_template_ids()
+                        if str(value).strip()
+                    }
+                except Exception as exc:
+                    raise ValueError(
+                        f"{store.name}无法从官方读取运费模板，"
+                        "已停止提交以避免模板失效："
+                        f"{exc}"
+                    ) from exc
+                self._store_freight_template_ids_cache[store.id] = template_ids
+            if template_id not in template_ids:
+                raise ValueError(
+                    f"{store.name}所选运费模板 {template_id} "
+                    "不属于当前店铺或已失效，请重新选择官方模板"
+                )
+
+        address_id = str(
+            (payload.get("after_sale_info") or {}).get(
+                "after_sale_address_id"
+            )
+            or ""
+        ).strip()
+        fetch_address_ids = getattr(
+            client,
+            "fetch_merchant_address_ids",
+            None,
+        )
+        if address_id and callable(fetch_address_ids):
+            address_ids = self._store_merchant_address_ids_cache.get(store.id)
+            if address_ids is None:
+                try:
+                    address_ids = {
+                        str(value).strip()
+                        for value in fetch_address_ids()
+                        if str(value).strip()
+                    }
+                except Exception as exc:
+                    raise ValueError(
+                        f"{store.name}无法从官方读取售后地址，"
+                        "已停止提交以避免地址失效："
+                        f"{exc}"
+                    ) from exc
+                self._store_merchant_address_ids_cache[store.id] = address_ids
+            if address_id not in address_ids:
+                raise ValueError(
+                    f"{store.name}所选售后地址 {address_id} "
+                    "不属于当前店铺或已失效，请重新选择官方地址"
+                )
 
     @staticmethod
     def _category_leaf_id(payload: dict[str, Any]) -> str:
@@ -893,7 +1423,7 @@ class SyncService:
         client: WechatShopClient,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        prepared = deepcopy(payload)
+        prepared = normalize_sku_sale_attrs(payload)
         defaults = self._product_payload_defaults(store, client)
         if not self._valid_express_info(prepared.get("express_info")):
             prepared["express_info"] = deepcopy(defaults.get("express_info") or {})
@@ -920,6 +1450,11 @@ class SyncService:
             raise ValueError(f"{store.name}未获取到运费模板ID，请先在微信小店后台配置默认运费模板")
         if not self._valid_after_sale_info(prepared.get("after_sale_info")):
             raise ValueError(f"{store.name}未获取到售后地址ID，请先在微信小店后台配置默认收货地址")
+        self._validate_store_delivery_config(
+            store,
+            client,
+            prepared,
+        )
         self._apply_required_category_attributes(
             store,
             client,
@@ -974,6 +1509,316 @@ class SyncService:
         prepared["desc_info"] = desc_info
         return prepared
 
+    def _ensure_product_category(
+        self,
+        store: Store,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        prepared = deepcopy(payload)
+        if any(
+            prepared.get(key)
+            for key in ("cats", "cats_v2", "category_path")
+        ):
+            return prepared
+        catalog = self._category_catalog_cache.get(store.id)
+        private: ShopPrivateClient | Any | None = None
+        if not catalog:
+            private = ShopPrivateClient(self.db, store)
+            catalog = private.category_catalog()
+            self._category_catalog_cache[store.id] = catalog
+        source_text = " ".join(
+            str(prepared.get(key) or "")
+            for key in ("category_hint", "category_name", "title")
+        )
+        ranked = rank_category_candidates(
+            source_text,
+            catalog,
+            limit=25,
+        )
+        if not ranked or float(ranked[0].get("match_score") or 0) < 2:
+            raise ValueError(
+                f"{store.name} 未匹配到可信的微信小店商品类目；"
+                "请检查商品标题或配置模板兜底类目"
+            )
+        candidates = [
+            item
+            for item in ranked
+            if float(item.get("match_score") or 0) >= 2
+        ]
+        best = candidates[0]
+        checker = (
+            getattr(private, "category_application_checks", None)
+            if private is not None
+            else None
+        )
+        if callable(checker):
+            top_candidates = candidates[:12]
+            checks = checker(
+                [
+                    str(item.get("category_id") or "")
+                    for item in top_candidates
+                    if str(item.get("category_id") or "")
+                ]
+            )
+            compliant: list[dict[str, Any]] = []
+            recommended: list[dict[str, Any]] = []
+            for item in top_candidates:
+                category_id = str(
+                    item.get("category_id") or ""
+                )
+                check = checks.get(category_id)
+                if not isinstance(check, dict):
+                    continue
+                candidate = {
+                    **item,
+                    "application_state": str(
+                        check.get("state") or "unknown"
+                    ),
+                    "application_label": str(
+                        check.get("label") or ""
+                    ),
+                    "application_reason": str(
+                        check.get("reason") or ""
+                    ),
+                    "deposit_amount": check.get("deposit_amount"),
+                    "required_deposit": check.get(
+                        "required_deposit"
+                    ),
+                    "amount_to_pay": check.get("amount_to_pay"),
+                    "operation_required_deposit": check.get(
+                        "operation_required_deposit"
+                    ),
+                    "deposit_balance": check.get(
+                        "deposit_balance"
+                    ),
+                    "real_deposit_balance": check.get(
+                        "real_deposit_balance"
+                    ),
+                    "deposit_shortfall": check.get(
+                        "deposit_shortfall"
+                    ),
+                    "deposit_free_trial": check.get(
+                        "deposit_free_trial"
+                    ),
+                    "business_type": check.get("business_type"),
+                }
+                recommended.append(candidate)
+                state = str(check.get("state") or "")
+                if state in {
+                    "effective",
+                    "not_applied",
+                    "pending",
+                }:
+                    compliant.append(candidate)
+            if compliant:
+                # Semantic confidence remains the primary key. Deposit is
+                # only used to choose among candidates with comparable,
+                # compliant category meaning.
+                top_score = float(
+                    compliant[0].get("match_score") or 0
+                )
+                best = max(
+                    (
+                        item
+                        for item in compliant
+                        if float(item.get("match_score") or 0)
+                        >= max(2.0, top_score * 0.85)
+                    ),
+                    key=lambda item: (
+                        float(item.get("match_score") or 0),
+                        -int(item.get("deposit_amount") or 0),
+                    ),
+                )
+            elif recommended:
+                best = recommended[0]
+            prepared["_category_candidates"] = recommended[:8]
+            prepared["_category_selected"] = {
+                "category_id": str(best.get("category_id") or ""),
+                "path": str(best.get("path") or ""),
+                "match_score": float(
+                    best.get("match_score") or 0
+                ),
+                "application_state": str(
+                    best.get("application_state") or "unknown"
+                ),
+                "deposit_amount": best.get("deposit_amount"),
+                "required_deposit": best.get(
+                    "required_deposit"
+                ),
+                "amount_to_pay": best.get("amount_to_pay"),
+                "operation_required_deposit": best.get(
+                    "operation_required_deposit"
+                ),
+                "deposit_balance": best.get("deposit_balance"),
+                "real_deposit_balance": best.get(
+                    "real_deposit_balance"
+                ),
+                "deposit_shortfall": best.get(
+                    "deposit_shortfall"
+                ),
+                "deposit_free_trial": best.get(
+                    "deposit_free_trial"
+                ),
+                "business_type": best.get("business_type"),
+            }
+        path_ids = [
+            str(value)
+            for value in best.get("id_path") or []
+            if str(value)
+        ]
+        if not path_ids:
+            path_ids = [str(best.get("category_id") or "")]
+        prepared["cats_v2"] = [
+            {"cat_id": category_id}
+            for category_id in path_ids
+            if category_id
+        ]
+        prepared.pop("cats", None)
+        prepared["category_path"] = str(best.get("path") or "")
+        prepared["category_apply_ids"] = [
+            str(best.get("category_id") or "")
+        ]
+        prepared["_auto_category_required"] = False
+        return prepared
+
+    def _remote_recycle_presence(
+        self,
+        store: Store,
+        product_id: str,
+        official_client: WechatShopClient | MockShopClient | None,
+    ) -> tuple[bool | None, str]:
+        errors: list[str] = []
+        try:
+            private = ShopPrivateClient(self.db, store)
+            products = private.scan_products(
+                "recycle",
+                max_pages=None,
+                page_size=50,
+            )
+            return (
+                str(product_id)
+                in {
+                    str(product.product_id)
+                    for product in products
+                    if product.product_id
+                },
+                "微信小店回收站完整列表",
+            )
+        except Exception as exc:
+            errors.append(f"网页回收站：{exc}")
+        if (
+            official_client is not None
+            and not isinstance(official_client, MockShopClient)
+        ):
+            fetch_ids = getattr(
+                official_client,
+                "fetch_product_ids",
+                None,
+            )
+            if callable(fetch_ids):
+                try:
+                    return (
+                        str(product_id) in {
+                            str(value)
+                            for value in fetch_ids(6)
+                        },
+                        "微信商品接口 status=6",
+                    )
+                except Exception as exc:
+                    errors.append(f"官方回收站：{exc}")
+        return None, "；".join(errors)
+
+    def _delete_product_remote(
+        self,
+        store: Store,
+        product_id: str,
+        official_client: WechatShopClient | MockShopClient | None,
+    ) -> dict[str, Any]:
+        row = self.db.get_product(store.id, product_id)
+        current_status = int(row["status"]) if row else -1
+        delete_mode = "real" if current_status == 6 else "recycle"
+        if (
+            store.app_id == "demo-store"
+            or isinstance(official_client, MockShopClient)
+        ):
+            self.db.remove_product_cache(store.id, product_id)
+            return {
+                "errcode": 0,
+                "demo": True,
+                "delete_mode": delete_mode,
+                "remote_verified": True,
+            }
+
+        result: dict[str, Any]
+        if delete_mode == "real":
+            try:
+                result = self.private_batch_product_action(
+                    store,
+                    [product_id],
+                    "real",
+                )
+            except Exception as exc:
+                raise ProductDeleteUncertainError(
+                    "彻底删除请求结果未确认：" + str(exc)
+                ) from exc
+        else:
+            client = official_client or (
+                self.client_for(store)
+                if self.db.get_store_secret(store.id)[1]
+                else None
+            )
+            if client is not None and not isinstance(client, MockShopClient):
+                try:
+                    result = client.delete_product(product_id)
+                except Exception as exc:
+                    raise ProductDeleteUncertainError(
+                        "移入回收站请求结果未确认：" + str(exc)
+                    ) from exc
+            else:
+                try:
+                    result = self.private_batch_product_action(
+                        store,
+                        [product_id],
+                        "recycle",
+                    )
+                except Exception as exc:
+                    raise ProductDeleteUncertainError(
+                        "移入回收站请求结果未确认：" + str(exc)
+                    ) from exc
+        if int(result.get("errcode") or 0) != 0:
+            raise RuntimeError(
+                str(result.get("errmsg") or "微信商品删除接口返回失败")
+            )
+
+        still_in_recycle, source = self._remote_recycle_presence(
+            store,
+            product_id,
+            official_client,
+        )
+        if still_in_recycle is None:
+            raise ProductDeleteUncertainError(
+                "删除请求已返回，但无法重新读取平台回收站确认结果："
+                + source
+            )
+        if delete_mode == "real" and still_in_recycle:
+            raise RuntimeError(
+                f"平台回收站仍存在商品 {product_id}，彻底删除未生效"
+            )
+        if delete_mode == "recycle" and not still_in_recycle:
+            raise RuntimeError(
+                f"平台回收站未找到商品 {product_id}，移入回收站未确认成功"
+            )
+        self.db.remove_product_cache(store.id, product_id)
+        result = dict(result)
+        result.update(
+            {
+                "delete_mode": delete_mode,
+                "remote_verified": True,
+                "verification_source": source,
+            }
+        )
+        return result
+
     def product_write(
         self,
         store: Store,
@@ -984,25 +1829,24 @@ class SyncService:
         listing_mode: str = "",
     ) -> dict[str, Any]:
         self._require_platform_write(store, "product_write")
-        if (
-            client is None
-            and action == "delete"
-            and store.app_id != "demo-store"
-            and not self.db.get_store_secret(store.id)[1]
-        ):
-            row = self.db.get_product(store.id, product_id)
-            way = "real" if row and int(row["status"]) == 6 else "recycle"
-            result = self.private_batch_product_action(store, [product_id], way)
-            self.db.remove_product_cache(store.id, product_id)
-            return result
+        if action == "delete":
+            return self._delete_product_remote(
+                store,
+                product_id,
+                client,
+            )
         client = client or self.client_for(store)
         if isinstance(client, MockShopClient):
             return {"errcode": 0, "demo": True}
         if action == "add":
+            payload = self._ensure_product_category(
+                store,
+                payload or {},
+            )
             prepared = self._prepare_product_payload(
                 store,
                 client,
-                payload or {},
+                payload,
             )
             if listing_mode == "draft":
                 prepared["listing"] = 0
@@ -1011,8 +1855,6 @@ class SyncService:
             result = client.add_product(prepared)
         elif action == "update":
             result = client.update_product(payload or {})
-        elif action == "delete":
-            result = client.delete_product(product_id)
         elif action == "cancel_audit":
             result = client.cancel_product_audit(product_id)
         else:
@@ -1025,9 +1867,7 @@ class SyncService:
                 product_delta=1,
                 quota_delta=(0 if listing_mode == "draft" else -1),
             )
-        if action == "delete":
-            self.db.remove_product_cache(store.id, product_id)
-        elif action in {"add", "update"}:
+        if action in {"add", "update"}:
             result_data = result.get("data")
             result_data = result_data if isinstance(result_data, dict) else {}
             result_product_id = str(
@@ -1382,7 +2222,30 @@ class SyncService:
         )
 
     def refresh_store_metrics(self, store: Store) -> dict[str, Any]:
-        now = datetime.now()
+        now = self.now_provider()
+        try:
+            existing_metrics = json.loads(
+                self.db.get_setting(f"store_metrics_{store.id}", "{}")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing_metrics = {}
+        if not isinstance(existing_metrics, dict):
+            existing_metrics = {}
+        cached_store_id = existing_metrics.get("_cache_store_id")
+        cached_app_id = existing_metrics.get("_cache_store_app_id")
+        cache_owner_mismatch = False
+        if cached_store_id is not None:
+            try:
+                cache_owner_mismatch = int(cached_store_id) != int(store.id)
+            except (TypeError, ValueError):
+                cache_owner_mismatch = True
+        if (
+            cached_app_id is not None
+            and str(cached_app_id) != str(store.app_id)
+        ):
+            cache_owner_mismatch = True
+        if cache_owner_mismatch:
+            existing_metrics = {}
         today = now.date()
         today_start = int(
             now.replace(
@@ -1393,12 +2256,42 @@ class SyncService:
             ).timestamp()
         )
         month_start = int(
-            (now - timedelta(days=29))
+            (now - timedelta(days=30))
             .replace(hour=0, minute=0, second=0, microsecond=0)
             .timestamp()
         )
         quota_error = ""
         errors: list[str] = []
+        credential_checked = False
+        credential_probe_ok = False
+        credential_error_code = ""
+        credential_error_message = ""
+        after_sale_incremental = {
+            "status": "skipped",
+            "updated_at": "",
+            "error": "",
+        }
+        try:
+            _current_store, current_secret = self.db.get_store_secret(store.id)
+            if current_secret:
+                credential_checked = True
+                self.validate_store_credential(store, current_secret)
+                credential_probe_ok = True
+        except WechatApiError as exc:
+            if exc.category == "authentication":
+                credential_error_code = str(exc.code or "authentication")
+                credential_error_message = str(exc)[:500]
+                errors.append(
+                    f"凭据验证失败（{credential_error_code}）："
+                    f"{credential_error_message}"
+                )
+        except Exception as exc:
+            errors.append(f"凭据验证：{exc}")
+        if credential_probe_ok and str(store.name).strip() == str(store.app_id).strip():
+            try:
+                self.sync_store_profile(store)
+            except Exception as exc:
+                errors.append(f"店铺名称获取：{exc}")
         try:
             self._ensure_today_orders_cached(
                 store,
@@ -1407,6 +2300,13 @@ class SyncService:
             )
         except Exception as exc:
             errors.append(f"今日订单同步：{exc}")
+        if credential_probe_ok:
+            after_sale_incremental = (
+                self._sync_recent_after_sales_for_metrics(
+                    store,
+                    int(now.timestamp()),
+                )
+            )
         try:
             quota = self.fetch_product_audit_quota(store)
             self.db.set_setting(
@@ -1462,7 +2362,7 @@ class SyncService:
             for business_date, row in analytics_by_date.items()
             if business_date < today.isoformat()
         ]
-        week_start_date = today - timedelta(days=6)
+        week_start_date = today - timedelta(days=7)
         week_start_ts = int(
             datetime.combine(
                 week_start_date,
@@ -1475,6 +2375,96 @@ class SyncService:
                 datetime.min.time(),
             ).timestamp()
         )
+        now_ts = int(now.timestamp())
+        period_ranges = {
+            "today": (today_start, now_ts + 1),
+            "yesterday": (yesterday_start_ts, today_start),
+            "seven_days": (week_start_ts, today_start),
+            "thirty_days": (month_start, today_start),
+        }
+        gift_exclusions = {
+            "today": _gift_exclusion_for_period(
+                orders,
+                now_ts=now_ts,
+                start_ts=period_ranges["today"][0],
+                end_ts=period_ranges["today"][1],
+            ),
+            "yesterday": _gift_exclusion_for_period(
+                orders,
+                now_ts=now_ts,
+                start_ts=period_ranges["yesterday"][0],
+                end_ts=period_ranges["yesterday"][1],
+            ),
+            "seven_days": _gift_exclusion_for_period(
+                orders,
+                now_ts=now_ts,
+                start_ts=period_ranges["seven_days"][0],
+                end_ts=period_ranges["seven_days"][1],
+            ),
+            "thirty_days": _gift_exclusion_for_period(
+                orders,
+                now_ts=now_ts,
+                start_ts=period_ranges["thirty_days"][0],
+                end_ts=period_ranges["thirty_days"][1],
+            ),
+        }
+        after_sale_rows = self.db.list_after_sales(store.id)
+        refund_order_rows = self.db.list_refund_orders_by_update_time(
+            store.id,
+            period_ranges["thirty_days"][0],
+            period_ranges["thirty_days"][1],
+        )
+        refund_order_counts, refund_order_meta = (
+            _refund_order_counts_for_periods(
+                refund_order_rows,
+                after_sale_rows,
+                period_ranges,
+            )
+        )
+        after_sale_sync_raw = str(
+            self.db.get_setting(
+                f"after_sales_last_sync_{store.id}",
+                "",
+            )
+            or ""
+        )
+        after_sale_sync_ts = 0
+        if after_sale_sync_raw.isdigit():
+            after_sale_sync_ts = int(after_sale_sync_raw)
+        else:
+            for row in after_sale_rows:
+                try:
+                    synced_at = datetime.fromisoformat(
+                        str(row.get("synced_at") or "")
+                    ).timestamp()
+                except (TypeError, ValueError):
+                    continue
+                after_sale_sync_ts = max(after_sale_sync_ts, int(synced_at))
+        after_sale_has_cache = bool(after_sale_rows or after_sale_sync_ts)
+        after_sale_stale = bool(
+            after_sale_has_cache
+            and (
+                not after_sale_sync_ts
+                or now_ts - after_sale_sync_ts
+                > AFTER_SALE_CACHE_MAX_AGE_SECONDS
+            )
+        )
+        after_sale_updated_at = (
+            datetime.fromtimestamp(
+                after_sale_sync_ts,
+                SHANGHAI_TZ,
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            if after_sale_sync_ts
+            else ""
+        )
+        refund_order_counts = {
+            period: (
+                int(value) if value is not None else None
+            )
+            for period, value in refund_order_counts.items()
+        }
 
         def history_sum(field: str) -> int:
             total = 0
@@ -1507,15 +2497,31 @@ class SyncService:
             int(row.get("total_amount") or 0) for row in valid
         )
         metrics: dict[str, Any] = {
-            "in_sale": summary["in_sale"],
+            "in_sale": None,
             "warehouse": summary["warehouse"],
-            "product_total": summary["in_sale"] + summary["warehouse"],
+            "product_total": None,
             "buyers_today": len(
                 {buyer_identity(row) for row in today_orders if buyer_identity(row)}
             ),
             "buyer_30d": len(buyer_ids),
+            "buyers_yesterday": len(
+                {
+                    buyer_identity(row)
+                    for row in yesterday_orders
+                    if buyer_identity(row)
+                }
+            ),
+            "buyers_7d": len(
+                {
+                    buyer_identity(row)
+                    for row in week_orders
+                    if buyer_identity(row)
+                }
+            ),
             "today_orders": len(today_orders),
             "orders_yesterday": len(yesterday_orders),
+            "orders_7d": len(week_orders),
+            "orders_30d": len(valid),
             "product_click_today": sum(
                 int(row.get("product_click_uv") or 0)
                 for row in analytics_by_date.values()
@@ -1535,6 +2541,14 @@ class SyncService:
             ),
             "gmv_7d": transaction_gmv_week,
             "gmv_30d": transaction_gmv_month,
+            "refund_gmv_today": None,
+            "refund_gmv_yesterday": None,
+            "refund_gmv_7d": None,
+            "refund_gmv_30d": None,
+            "refund_orders_today": refund_order_counts["today"],
+            "refund_orders_yesterday": refund_order_counts["yesterday"],
+            "refund_orders_7d": refund_order_counts["seven_days"],
+            "refund_orders_30d": refund_order_counts["thirty_days"],
             "aftersale": sum(
                 "完成" not in str(row.get("status_text") or "")
                 for row in self.db.list_after_sales(store.id)
@@ -1544,26 +2558,327 @@ class SyncService:
             "cash": 0,
             "frozen": 0,
             "settle": 0,
-            "deposit": 0,
+            "deposit": None,
             "dsr": None,
             "score_product": None,
             "score_deliver": None,
             "score_service": None,
-            "good_eval_ratio": 0.0,
+            "good_eval_ratio": None,
             "quality_refund_ratio": None,
             "wait_send": 0,
             "wait_receive": sum(int(row.get("status") or 0) == 30 for row in valid),
-            "recommend_exposure": 0,
-            "recommend_exposure_yesterday": 0,
-            "search_exposure_yesterday": 0,
+            "recommend_exposure": None,
+            "recommend_exposure_yesterday": None,
+            "recommend_exposure_7d": None,
+            "recommend_exposure_count": None,
+            "recommend_exposure_yesterday_count": None,
+            "recommend_exposure_7d_count": None,
+            "recommend_exposure_people": None,
+            "recommend_exposure_yesterday_people": None,
+            "recommend_exposure_7d_people": None,
+            "search_exposure_yesterday": None,
             "today_success": 0,
             "stats_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        score_fields = (
+            "dsr",
+            "score_product",
+            "score_deliver",
+            "score_service",
+        )
+        score_attempt_status = {
+            key: "failed"
+            for key in score_fields
+        }
+        score_updated_at = ""
+        score_daily_values = (
+            existing_metrics.get("_score_daily_values")
+            if isinstance(
+                existing_metrics.get("_score_daily_values"),
+                dict,
+            )
+            else {}
+        )
+        deposit_error = ""
+        deposit_status = "failed"
+        deposit_updated_at = ""
         private_account_ok = False
+        private_client: ShopPrivateClient | None = None
+        exposure_attempt_status = {
+            "today": "failed",
+            "yesterday": "failed",
+            "seven_days": "failed",
+        }
+        exposure_count_attempt_status = {
+            "today": "failed",
+            "yesterday": "failed",
+            "seven_days": "failed",
+        }
+        exposure_people_attempt_status = {
+            "today": "failed",
+            "yesterday": "failed",
+            "seven_days": "failed",
+        }
+        exposure_updated_at = ""
+        exposure_error = ""
+        online_product_status = "failed"
+        online_product_source = ""
+        online_product_updated_at = ""
+        online_product_error = ""
+        sales_attempt_status = {
+            "today": "failed",
+            "yesterday": "failed",
+            "seven_days": "failed",
+            "thirty_days": "failed",
+        }
+        sales_period_sources: dict[str, str] = {}
+        sales_updated_at = ""
+        sales_error = ""
+        sales_is_stale = False
+        refund_attempt_status = {
+            "today": "missing",
+            "yesterday": "missing",
+            "seven_days": "missing",
+            "thirty_days": "missing",
+        }
+        refund_period_sources: dict[str, str] = {}
+        official_refund_order_counts: dict[str, int] = {}
+        official_refund_order_sources: dict[str, str] = {}
+        refund_updated_at = ""
+        refund_error = ""
+        sales_period_fields = {
+            "today": (
+                ("gmv_today", "pay_gmv"),
+                ("today_orders", "pay_order_cnt"),
+                ("buyers_today", "pay_uv"),
+            ),
+            "yesterday": (
+                ("gmv_yesterday", "pay_gmv"),
+                ("orders_yesterday", "pay_order_cnt"),
+                ("buyers_yesterday", "pay_uv"),
+            ),
+            "seven_days": (
+                ("gmv_7d", "pay_gmv"),
+                ("orders_7d", "pay_order_cnt"),
+                ("buyers_7d", "pay_uv"),
+            ),
+            "thirty_days": (
+                ("gmv_30d", "pay_gmv"),
+                ("orders_30d", "pay_order_cnt"),
+                ("buyers_30d", "pay_uv"),
+            ),
+        }
+        refund_period_fields = {
+            "today": ("refund_gmv_today", "pay_refund_gmv"),
+            "yesterday": (
+                "refund_gmv_yesterday",
+                "pay_refund_gmv",
+            ),
+            "seven_days": ("refund_gmv_7d", "pay_refund_gmv"),
+            "thirty_days": ("refund_gmv_30d", "pay_refund_gmv"),
+        }
+        previous_sales_sources = existing_metrics.get(
+            "_sales_period_sources"
+        )
+        if not isinstance(previous_sales_sources, dict):
+            previous_sales_sources = {}
+        previous_refund_sources = existing_metrics.get(
+            "_refund_period_sources"
+        )
+        if not isinstance(previous_refund_sources, dict):
+            previous_refund_sources = {}
+        sales_cache_snapshot_date = str(
+            existing_metrics.get("_sales_snapshot_date") or ""
+        )
+        sales_cache_is_current_day = (
+            sales_cache_snapshot_date == today.isoformat()
+        )
+
+        def optional_sales_int(value: Any) -> int | None:
+            if value is None or value == "":
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        def apply_official_sales(
+            period: str,
+            values: dict[str, Any],
+            source: str,
+            *,
+            error: str = "",
+        ) -> None:
+            nonlocal sales_updated_at
+            nonlocal sales_is_stale
+            nonlocal sales_error
+            nonlocal refund_updated_at
+            nonlocal refund_error
+            found = 0
+            for metric_key, source_key in sales_period_fields[period]:
+                value = optional_sales_int(values.get(source_key))
+                if value is not None:
+                    gift = gift_exclusions[period]
+                    if source_key == "pay_gmv":
+                        available = int(gift["deducted_amount"])
+                        applied = min(max(0, value), available)
+                        value = max(0, value - available)
+                        gift["applied_amount"] = applied
+                    elif source_key == "pay_order_cnt":
+                        available = int(gift["deducted_orders"])
+                        applied = min(max(0, value), available)
+                        value = max(0, value - available)
+                        gift["applied_orders"] = applied
+                    metrics[metric_key] = value
+                    found += 1
+                    continue
+                if (
+                    previous_sales_sources.get(period)
+                    and sales_cache_is_current_day
+                ):
+                    previous = optional_sales_int(
+                        existing_metrics.get(metric_key)
+                    )
+                    if previous is not None:
+                        metrics[metric_key] = previous
+                        sales_is_stale = True
+            if found == len(sales_period_fields[period]):
+                sales_attempt_status[period] = "updated"
+            elif found:
+                sales_attempt_status[period] = "partial"
+                sales_is_stale = True
+            else:
+                sales_attempt_status[period] = (
+                    "failed" if error else "missing"
+                )
+                sales_is_stale = True
+            if found:
+                sales_period_sources[period] = source
+                sales_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+            elif (
+                previous_sales_sources.get(period)
+                and sales_cache_is_current_day
+            ):
+                sales_period_sources[period] = str(
+                    previous_sales_sources[period]
+                )
+            refund_metric_key, refund_source_key = refund_period_fields[
+                period
+            ]
+            refund_value = optional_sales_int(
+                values.get(refund_source_key)
+            )
+            if refund_value is not None:
+                metrics[refund_metric_key] = max(0, refund_value)
+                refund_attempt_status[period] = "updated"
+                refund_period_sources[period] = source
+                refund_updated_at = now.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            elif previous_refund_sources.get(period):
+                previous_refund = optional_sales_int(
+                    existing_metrics.get(refund_metric_key)
+                )
+                if previous_refund is not None:
+                    metrics[refund_metric_key] = previous_refund
+                    refund_period_sources[period] = str(
+                        previous_refund_sources[period]
+                    )
+                    refund_attempt_status[period] = "stale"
+            else:
+                refund_attempt_status[period] = (
+                    "failed" if error else "missing"
+                )
+            for count_source_key in (
+                "pay_refund_order_cnt",
+                "refund_order_cnt",
+                "pay_refund_cnt",
+                "refund_success_order_cnt",
+            ):
+                count_value = optional_sales_int(
+                    values.get(count_source_key)
+                )
+                if count_value is None:
+                    continue
+                official_refund_order_counts[period] = max(
+                    0,
+                    count_value,
+                )
+                official_refund_order_sources[period] = (
+                    f"{source}（官方字段 {count_source_key}）"
+                )
+                break
+            if error:
+                sales_error = (
+                    f"{sales_error}；{period}: {error}"[:1000]
+                    if sales_error
+                    else f"{period}: {error}"[:1000]
+                )
+                refund_error = (
+                    f"{refund_error}；{period}: {error}"[:1000]
+                    if refund_error
+                    else f"{period}: {error}"[:1000]
+                )
         try:
             private = ShopPrivateClient(self.db, store)
+            private_client = private
             realtime = private.realtime_overview()
+            apply_official_sales(
+                "today",
+                realtime,
+                "微信小店实时成交统计",
+            )
+            for (
+                period,
+                days,
+                offset_days,
+                source,
+            ) in (
+                (
+                    "yesterday",
+                    1,
+                    1,
+                    "微信小店后台昨日成交统计",
+                ),
+                (
+                    "seven_days",
+                    7,
+                    1,
+                    "微信小店后台近7天成交统计",
+                ),
+                (
+                    "thirty_days",
+                    30,
+                    1,
+                    "微信小店后台近30天成交统计",
+                ),
+            ):
+                try:
+                    period_values = private.period_overview(
+                        days,
+                        offset_days=offset_days,
+                    )
+                except Exception as exc:
+                    errors.append(f"成交周期（{period}）：{exc}")
+                    apply_official_sales(
+                        period,
+                        {},
+                        source,
+                        error=str(exc),
+                    )
+                else:
+                    apply_official_sales(
+                        period,
+                        period_values,
+                        source,
+                    )
+            for period, gift in gift_exclusions.items():
+                if (
+                    gift["applied_amount"] > 0
+                    or gift["applied_orders"] > 0
+                ) and sales_period_sources.get(period):
+                    sales_period_sources[period] += " - 未领取礼物"
             today_click = int(float(realtime.get("product_click_uv") or 0))
             today_refund = int(float(realtime.get("pay_refund_gmv") or 0))
             metrics.update(
@@ -1575,15 +2890,115 @@ class SyncService:
                 }
             )
             metrics.update(private.todo_overview())
-            metrics.update(private.score_overview())
+            score_values = private.score_overview()
+            official_score_daily = score_values.get("_score_daily_values")
+            if isinstance(official_score_daily, dict) and official_score_daily:
+                score_daily_values = official_score_daily
+            for key in score_fields:
+                try:
+                    value = float(score_values.get(key))
+                except (TypeError, ValueError):
+                    score_attempt_status[key] = "missing"
+                    continue
+                metrics[key] = value
+                score_attempt_status[key] = "updated"
+                score_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
             metrics.update(private.evaluation_overview())
             metrics.update(private.account_balance())
             private_account_ok = True
-            metrics["deposit"] = private.deposit_balance()
-            recommend_today = private.recommend_overview(False)
-            recommend_yesterday = private.recommend_overview(True)
-            metrics["recommend_exposure"] = recommend_today["exposure"]
-            metrics["recommend_exposure_yesterday"] = recommend_yesterday["exposure"]
+            try:
+                deposit_value = private.deposit_balance()
+            except Exception as exc:
+                deposit_status = "failed"
+                deposit_error = str(exc)
+                errors.append(f"保证金：{exc}")
+            else:
+                if deposit_value is None:
+                    deposit_status = "missing"
+                else:
+                    metrics["deposit"] = int(deposit_value)
+                    deposit_status = "updated"
+                    deposit_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+            exposure_jobs = (
+                (
+                    "today",
+                    "recommend_exposure",
+                    "recommend_exposure_count",
+                    "recommend_exposure_people",
+                    lambda: private.recommend_overview(False),
+                ),
+                (
+                    "yesterday",
+                    "recommend_exposure_yesterday",
+                    "recommend_exposure_yesterday_count",
+                    "recommend_exposure_yesterday_people",
+                    lambda: private.recommend_overview(True),
+                ),
+                (
+                    "seven_days",
+                    "recommend_exposure_7d",
+                    "recommend_exposure_7d_count",
+                    "recommend_exposure_7d_people",
+                    lambda: private.recommend_overview(days=7),
+                ),
+            )
+            for (
+                exposure_key,
+                metric_key,
+                count_metric_key,
+                people_metric_key,
+                loader,
+            ) in exposure_jobs:
+                try:
+                    overview = loader()
+                except Exception as exc:
+                    errors.append(f"商品曝光（{exposure_key}）：{exc}")
+                    exposure_error = str(exc)
+                    exposure_count_attempt_status[exposure_key] = "failed"
+                    exposure_people_attempt_status[exposure_key] = "failed"
+                    continue
+                exposure = overview.get("exposure")
+                exposure_count = overview.get("exposure_count")
+                exposure_people = overview.get("exposure_people")
+                if (
+                    exposure_count is None
+                    and exposure_people is None
+                    and exposure is not None
+                ):
+                    # Legacy private clients only expose the people count as
+                    # "exposure"; never relabel it as view count.
+                    exposure_people = exposure
+                if exposure_count is not None:
+                    metrics[count_metric_key] = int(exposure_count)
+                    exposure_count_attempt_status[exposure_key] = "updated"
+                else:
+                    exposure_count_attempt_status[exposure_key] = "missing"
+                if exposure_people is not None:
+                    metrics[people_metric_key] = int(exposure_people)
+                    exposure_people_attempt_status[exposure_key] = "updated"
+                else:
+                    exposure_people_attempt_status[exposure_key] = "missing"
+                if exposure is None:
+                    exposure = (
+                        exposure_people
+                        if exposure_people is not None
+                        else exposure_count
+                    )
+                if exposure is not None:
+                    metrics[metric_key] = int(exposure)
+                if (
+                    exposure_count is not None
+                    or exposure_people is not None
+                ):
+                    exposure_attempt_status[exposure_key] = (
+                        "updated"
+                        if exposure_count is not None
+                        and exposure_people is not None
+                        else "partial"
+                    )
+                    exposure_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    exposure_attempt_status[exposure_key] = "missing"
             search = private.search_overview(30)
             metrics["search_exposure_yesterday"] = search["search_exposure_yesterday"]
             try:
@@ -1591,12 +3006,15 @@ class SyncService:
             except Exception as exc:
                 errors.append(f"今日审核：{exc}")
         except ShopPrivateError as exc:
+            deposit_error = str(exc) if not deposit_error else deposit_error
+            sales_error = str(exc) if not sales_error else sales_error
             errors.append(f"商家后台：{exc}")
             if any(marker in str(exc) for marker in ("登录已失效", "请重新扫码", "拒绝请求")):
                 self.db.update_web_status(store.id, "已掉线", str(exc))
         try:
             client = self.client_for(store)
             if not isinstance(client, MockShopClient):
+                count_errors: list[str] = []
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     count_jobs = {
                         "product_total": executor.submit(client.fetch_product_total, None),
@@ -1606,31 +3024,500 @@ class SyncService:
                     for key, future in count_jobs.items():
                         try:
                             metrics[key] = int(future.result())
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            count_errors.append(f"{key}: {exc}")
+                if metrics.get("in_sale") is not None:
+                    online_product_status = "updated"
+                    online_product_source = (
+                        "微信开放平台商品列表 total_num（status=5）"
+                    )
+                    online_product_updated_at = now.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                elif count_errors:
+                    online_product_error = "；".join(count_errors)
                 if not private_account_ok:
                     balance = client.fetch_fund_balance()
                     metrics["cash"] = int(float(balance.get("available_amount") or 0))
                     metrics["settle"] = int(float(balance.get("pending_amount") or 0))
         except Exception as exc:
             errors.append(f"资金余额：{exc}")
+            online_product_error = str(exc)
+        if online_product_status != "updated" and private_client is not None:
+            try:
+                private_counts = private_client.status_counts()
+            except Exception as exc:
+                online_product_error = (
+                    f"{online_product_error}；{exc}".strip("；")
+                )
+            else:
+                private_sales = private_counts.get("sales")
+                if private_sales is None:
+                    online_product_status = "missing"
+                else:
+                    metrics["in_sale"] = int(private_sales)
+                    online_product_status = "updated"
+                    online_product_source = (
+                        "微信小店商家后台商品状态 totalNum（销售中）"
+                    )
+                    online_product_updated_at = now.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
         if quota_error:
             errors.append(f"提审额度：{quota_error}")
+        for key in score_fields:
+            if score_attempt_status[key] == "updated":
+                continue
+            try:
+                previous_value = float(existing_metrics.get(key))
+            except (TypeError, ValueError):
+                previous_value = None
+            if previous_value is not None:
+                metrics[key] = previous_value
+        if deposit_status != "updated":
+            existing_deposit_source = str(
+                existing_metrics.get("_deposit_source") or ""
+            )
+            try:
+                previous_deposit = int(existing_metrics.get("deposit"))
+            except (TypeError, ValueError):
+                previous_deposit = None
+            if existing_deposit_source and previous_deposit is not None:
+                metrics["deposit"] = previous_deposit
+                deposit_updated_at = str(
+                    existing_metrics.get("_deposit_updated_at") or ""
+                )
         metrics["quota_remaining"] = int(quota.get("remaining") or 0)
         metrics["quota_total"] = int(quota.get("total") or 0)
         metrics["quota_error"] = quota_error
-        metrics["product_total"] = max(
-            int(metrics.get("product_total") or 0),
-            int(metrics.get("in_sale") or 0) + int(metrics.get("warehouse") or 0),
-        )
+        if metrics.get("product_total") is not None:
+            metrics["product_total"] = max(0, int(metrics["product_total"]))
+        elif (
+            metrics.get("in_sale") is not None
+            and metrics.get("warehouse") is not None
+        ):
+            metrics["product_total"] = (
+                int(metrics["in_sale"]) + int(metrics["warehouse"])
+            )
         metrics["orders_today"] = int(metrics.get("today_orders") or 0)
+        if metrics.get("refund_gmv_today") is not None:
+            metrics["today_refund"] = int(metrics["refund_gmv_today"])
+        else:
+            metrics["today_refund"] = int(
+                metrics.get("today_refund") or 0
+            )
         metrics["refund_today"] = int(metrics.get("today_refund") or 0)
+        if metrics.get("refund_gmv_30d") is not None:
+            metrics["refund_30d"] = int(metrics["refund_gmv_30d"])
         metrics["_errors"] = errors
+        metrics["_credential_checked"] = credential_checked
+        metrics["_credential_probe_ok"] = credential_probe_ok
+        metrics["_credential_error_code"] = credential_error_code
+        metrics["_credential_error_message"] = credential_error_message
+        metrics["_score_attempt_status"] = score_attempt_status
+        metrics["_score_updated_at"] = score_updated_at or str(
+            existing_metrics.get("_score_updated_at") or ""
+        )
+        metrics["_score_source"] = "微信小店统计接口 scoreTypeList 11/12/13/14"
+        metrics["_score_daily_values"] = score_daily_values
+        metrics["_exposure_attempt_status"] = exposure_attempt_status
+        metrics["_exposure_count_attempt_status"] = (
+            exposure_count_attempt_status
+        )
+        metrics["_exposure_people_attempt_status"] = (
+            exposure_people_attempt_status
+        )
+        metrics["_exposure_updated_at"] = exposure_updated_at
+        metrics["_exposure_error"] = exposure_error[:500]
+        metrics["_exposure_source"] = (
+            "微信小店 getShopRecommendProductsStat（today/yesterday/7d）"
+        )
+        metrics["_online_product_attempt_status"] = online_product_status
+        metrics["_online_product_updated_at"] = online_product_updated_at
+        metrics["_online_product_error"] = online_product_error[:500]
+        metrics["_online_product_source"] = online_product_source
+        metrics["_cache_store_id"] = int(store.id)
+        metrics["_cache_store_app_id"] = str(store.app_id)
+        metrics["_cache_schema_version"] = 2
+        refund_count_fields = {
+            "today": "refund_gmv_today",
+            "yesterday": "refund_gmv_yesterday",
+            "seven_days": "refund_gmv_7d",
+            "thirty_days": "refund_gmv_30d",
+        }
+        refund_count_keys = {
+            "today": "refund_orders_today",
+            "yesterday": "refund_orders_yesterday",
+            "seven_days": "refund_orders_7d",
+            "thirty_days": "refund_orders_30d",
+        }
+        gated_refund_periods: list[str] = []
+        for period, amount_key in refund_count_fields.items():
+            amount = metrics.get(amount_key)
+            count_key = refund_count_keys[period]
+            if (
+                amount is not None
+                and int(amount) > 0
+                and metrics.get(count_key) in {None, 0}
+            ):
+                metrics[count_key] = None
+                refund_order_counts[period] = None
+                gated_refund_periods.append(period)
+        for period, fields in sales_period_fields.items():
+            if (
+                sales_attempt_status[period] == "updated"
+                or not previous_sales_sources.get(period)
+                or not sales_cache_is_current_day
+            ):
+                continue
+            for metric_key, _source_key in fields:
+                previous = optional_sales_int(
+                    existing_metrics.get(metric_key)
+                )
+                if previous is not None:
+                    metrics[metric_key] = previous
+            sales_period_sources.setdefault(
+                period,
+                str(previous_sales_sources[period]),
+            )
+            sales_is_stale = True
+        if metrics.get("buyers_30d") is not None:
+            metrics["buyer_30d"] = int(metrics["buyers_30d"])
+        source_values = list(
+            dict.fromkeys(
+                value
+                for value in sales_period_sources.values()
+                if value
+            )
+        )
+        metrics["_sales_attempt_status"] = sales_attempt_status
+        metrics["_sales_period_sources"] = sales_period_sources
+        metrics["_sales_source"] = (
+            "；".join(source_values)
+            if source_values
+            else "本地订单缓存降级"
+        )
+        metrics["_sales_updated_at"] = (
+            sales_updated_at
+            or str(existing_metrics.get("_sales_updated_at") or "")
+        )
+        metrics["_sales_error"] = sales_error[:1000]
+        metrics["_sales_is_stale"] = bool(
+            sales_is_stale or not source_values
+        )
+        metrics["_sales_snapshot_date"] = today.isoformat()
+        metrics["_refund_attempt_status"] = refund_attempt_status
+        metrics["_refund_period_sources"] = refund_period_sources
+        metrics["_refund_updated_at"] = (
+            refund_updated_at
+            or str(existing_metrics.get("_refund_updated_at") or "")
+        )
+        metrics["_refund_error"] = refund_error[:1000]
+        metrics["_after_sale_incremental"] = after_sale_incremental
+        try:
+            after_sale_coverage_start_ts = int(
+                self.db.get_setting(
+                    f"after_sales_coverage_start_{store.id}",
+                    "0",
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            after_sale_coverage_start_ts = 0
+        try:
+            after_sale_coverage_end_ts = int(
+                self.db.get_setting(
+                    f"after_sales_coverage_end_{store.id}",
+                    "0",
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            after_sale_coverage_end_ts = 0
+
+        refund_coverage_complete: dict[str, bool] = {}
+        refund_conflict_periods: list[str] = []
+        for period, (start_ts, end_ts) in period_ranges.items():
+            required_end_ts = min(now_ts, end_ts - 1)
+            refund_coverage_complete[period] = bool(
+                after_sale_coverage_start_ts
+                and after_sale_coverage_end_ts
+                and after_sale_coverage_start_ts <= start_ts
+                and after_sale_coverage_end_ts >= required_end_ts
+            )
+
+        for period in period_ranges:
+            amount = metrics.get(refund_count_fields[period])
+            official_count_available = (
+                period in official_refund_order_counts
+            )
+            candidate = (
+                official_refund_order_counts[period]
+                if official_count_available
+                else refund_order_counts.get(period)
+            )
+            if (
+                not official_count_available
+                and not refund_coverage_complete[period]
+            ):
+                refund_order_counts[period] = None
+                continue
+            if (
+                not official_count_available
+                and candidate is None
+            ):
+                candidate = 0
+            if amount is None:
+                refund_order_counts[period] = candidate
+                continue
+            amount_value = max(0, int(amount))
+            count_value = (
+                int(candidate)
+                if candidate is not None
+                else None
+            )
+            if amount_value == 0 and (count_value or 0) > 0:
+                refund_order_counts[period] = None
+                refund_conflict_periods.append(period)
+            elif amount_value > 0 and not count_value:
+                refund_order_counts[period] = None
+                refund_conflict_periods.append(period)
+            else:
+                refund_order_counts[period] = count_value
+
+        metrics["_refund_order_counts"] = refund_order_counts
+        for period, count_key in refund_count_keys.items():
+            metrics[count_key] = refund_order_counts.get(period)
+        refund_order_available = bool(
+            official_refund_order_counts
+            or (
+                after_sale_has_cache
+                and all(refund_coverage_complete.values())
+            )
+        )
+        refund_order_status = "missing"
+        if official_refund_order_counts:
+            refund_order_status = "fresh"
+        elif after_sale_has_cache:
+            if not all(refund_coverage_complete.values()):
+                refund_order_status = "partial"
+            elif after_sale_stale:
+                refund_order_status = "stale"
+            else:
+                refund_order_status = "fresh"
+        metrics["_refund_order_cache"] = {
+            "available": refund_order_available,
+            "stale": bool(
+                after_sale_stale
+                and not official_refund_order_counts
+            ),
+            "updated_at": after_sale_updated_at or now.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "status": refund_order_status,
+            "source": refund_order_meta["source"],
+            "sources": {
+                period: (
+                    [official_refund_order_sources[period]]
+                    if period in official_refund_order_sources
+                    else refund_order_meta["sources"].get(period, [])
+                )
+                for period in period_ranges
+            },
+            "record_count": refund_order_meta["record_count"],
+            "official_count_fields": official_refund_order_sources,
+            "order_status_evidence": refund_order_meta[
+                "order_status_evidence"
+            ],
+            "coverage": {
+                period: {
+                    "start": datetime.fromtimestamp(
+                        start_ts,
+                        SHANGHAI_TZ,
+                    ).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "end": datetime.fromtimestamp(
+                        end_ts,
+                        SHANGHAI_TZ,
+                    ).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                }
+                for period, (start_ts, end_ts) in period_ranges.items()
+            },
+            "covered": refund_coverage_complete,
+            "gated_periods": gated_refund_periods,
+            "conflict_periods": refund_conflict_periods,
+            "hint": (
+                "退款金额与退款完成明细口径冲突，单量显示待同步"
+                if refund_conflict_periods
+                else (
+                    "官方退款金额大于 0，但本地售后明细覆盖不足，单量显示待同步"
+                    if gated_refund_periods
+                    else (
+                        "售后明细未完整覆盖近30天，单量显示待同步"
+                        if not all(refund_coverage_complete.values())
+                        else (
+                            "售后单量缓存待刷新"
+                            if after_sale_stale
+                            else ""
+                        )
+                    )
+                )
+            ),
+        }
+        metrics["_gift_exclusion"] = gift_exclusions
+        metrics["_deposit_attempt_status"] = deposit_status
+        metrics["_deposit_updated_at"] = deposit_updated_at
+        metrics["_deposit_error"] = deposit_error[:500]
+        metrics["_deposit_source"] = (
+            "微信小店 getDepositMPayState"
+            if deposit_status == "updated"
+            or (
+                metrics.get("deposit") is not None
+                and existing_metrics.get("_deposit_source")
+            )
+            else ""
+        )
         self.db.set_setting(
             f"store_metrics_{store.id}",
             json.dumps(metrics, ensure_ascii=False),
         )
         return metrics
+
+    def _sync_recent_after_sales_for_metrics(
+        self,
+        store: Store,
+        now_ts: int,
+    ) -> dict[str, Any]:
+        """Refresh a full refund window once, then keep the last two days current."""
+        now_ts = int(now_ts)
+        local_today = datetime.fromtimestamp(
+            now_ts,
+            SHANGHAI_TZ,
+        ).date()
+        full_start = int(
+            datetime.combine(
+                local_today - timedelta(days=AFTER_SALE_FULL_SYNC_DAYS),
+                datetime.min.time(),
+                tzinfo=SHANGHAI_TZ,
+            ).timestamp()
+        )
+        try:
+            full_sync_at = int(
+                self.db.get_setting(
+                    f"after_sales_full_sync_at_{store.id}",
+                    "0",
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            full_sync_at = 0
+        errors: list[str] = []
+        full_checked = False
+        full_complete = False
+        incremental_complete = False
+
+        if (
+            not full_sync_at
+            or now_ts - full_sync_at
+            >= AFTER_SALE_FULL_SYNC_MAX_AGE_SECONDS
+        ):
+            full_checked = True
+            try:
+                full_result = self.sync_after_sales(
+                    store,
+                    full_start,
+                    now_ts,
+                    time_field="update",
+                )
+            except Exception as exc:
+                errors.append(f"近30天售后同步：{exc}")
+            else:
+                if getattr(full_result, "failed", 0):
+                    errors.extend(
+                        str(value)
+                        for value in (
+                            getattr(full_result, "errors", None)
+                            or []
+                        )
+                    )
+                else:
+                    full_complete = True
+                    incremental_complete = True
+                    self.db.set_setting(
+                        f"after_sales_full_sync_at_{store.id}",
+                        str(now_ts),
+                    )
+                    self.db.set_setting(
+                        f"after_sales_coverage_start_{store.id}",
+                        str(full_start),
+                    )
+                    self.db.set_setting(
+                        f"after_sales_coverage_end_{store.id}",
+                        str(now_ts),
+                    )
+
+        if not incremental_complete:
+            try:
+                incremental_result = self.sync_after_sales(
+                    store,
+                    now_ts - 2 * 86400,
+                    now_ts,
+                    time_field="update",
+                )
+            except Exception as exc:
+                errors.append(f"近2天售后同步：{exc}")
+            else:
+                if getattr(incremental_result, "failed", 0):
+                    errors.extend(
+                        str(value)
+                        for value in (
+                            getattr(
+                                incremental_result,
+                                "errors",
+                                None,
+                            )
+                            or []
+                        )
+                    )
+                else:
+                    incremental_complete = True
+                    self.db.set_setting(
+                        f"after_sales_coverage_end_{store.id}",
+                        str(now_ts),
+                    )
+
+        updated_at = datetime.fromtimestamp(
+            now_ts,
+            SHANGHAI_TZ,
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        if incremental_complete:
+            self.db.set_setting(
+                f"after_sales_last_sync_{store.id}",
+                str(now_ts),
+            )
+        return {
+            "status": (
+                "updated"
+                if incremental_complete and not errors
+                else ("partial" if incremental_complete else "failed")
+            ),
+            "updated_at": updated_at if incremental_complete else "",
+            "error": "；".join(errors)[:500],
+            "full_checked": full_checked,
+            "full_complete": full_complete,
+            "incremental_complete": incremental_complete,
+            "coverage_start": (
+                datetime.fromtimestamp(full_start).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                if full_complete
+                else ""
+            ),
+            "coverage_end": updated_at if incremental_complete else "",
+        }
 
     def _analytics_days_for_metrics(self, store: Store) -> list[dict[str, Any]]:
         rows = self.db.list_analytics_days(store.id, 30)
@@ -1707,6 +3594,35 @@ class SyncService:
                     return str(value)
         return json.dumps(result, ensure_ascii=False)
 
+    def fetch_product_detail(
+        self,
+        store: Store,
+        product_id: str,
+    ) -> Product:
+        """Read and cache the current upstream product detail.
+
+        The web UI must not open the stock editor from the local SQLite
+        snapshot because SKU IDs and stock can change after the last list
+        refresh.
+        """
+        client = self.client_for(store)
+        if isinstance(client, MockShopClient):
+            product = next(
+                (
+                    row
+                    for row in client.fetch_products()
+                    if str(row.product_id) == str(product_id)
+                ),
+                None,
+            )
+            if product is None:
+                raise ValueError(f"演示店铺没有商品 {product_id}")
+        else:
+            product = client.fetch_product(store, str(product_id))
+        self.db.upsert_product(product)
+        self.db.mark_product_catalog_done(store.id, str(product_id))
+        return product
+
     def fetch_product_audit_quota(self, store: Store) -> dict[str, int]:
         client = self.client_for(store)
         if isinstance(client, MockShopClient):
@@ -1756,14 +3672,49 @@ class SyncService:
             products = client.fetch_products(progress)
         else:
             product_ids = client.fetch_product_ids()
-            for index, product_id in enumerate(product_ids, start=1):
-                if cancel_event is not None and cancel_event.is_set():
-                    return SyncResult("product_query", 0, "已取消商品查询", cancelled=True)
-                products.append(client.fetch_product(store, product_id))
-                if progress:
-                    progress(
-                        f"正在读取商品详情 {index}/{len(product_ids)}", index, len(product_ids)
-                    )
+            if progress:
+                progress(
+                    f"已获取商品目录，准备读取 0/{len(product_ids)}",
+                    0,
+                    len(product_ids),
+                )
+            errors: list[str] = []
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(6, len(product_ids) or 1)),
+                thread_name_prefix="product-refresh",
+            ) as executor:
+                futures = {
+                    executor.submit(client.fetch_product, store, product_id): product_id
+                    for product_id in product_ids
+                }
+                completed = 0
+                for future in as_completed(futures):
+                    if cancel_event is not None and cancel_event.is_set():
+                        for pending in futures:
+                            pending.cancel()
+                        return SyncResult(
+                            "product_query",
+                            len(products),
+                            "已取消商品查询",
+                            cancelled=True,
+                        )
+                    product_id = futures[future]
+                    completed += 1
+                    try:
+                        products.append(future.result())
+                    except Exception as exc:
+                        errors.append(f"{product_id}: {exc}")
+                    if progress:
+                        progress(
+                            f"正在读取商品详情 {completed}/{len(product_ids)}",
+                            completed,
+                            len(product_ids),
+                        )
+            products.sort(
+                key=lambda product: product_ids.index(product.product_id)
+                if product.product_id in product_ids
+                else len(product_ids)
+            )
         selected = [
             product
             for product in products
@@ -1778,6 +3729,16 @@ class SyncService:
         ]
         if cancel_event is not None and cancel_event.is_set():
             return SyncResult("product_query", 0, "已取消商品查询", cancelled=True)
+        if errors:
+            self.db.upsert_products(selected)
+            return SyncResult(
+                "product_query",
+                len(selected),
+                f"商品已部分更新，{len(errors)} 件读取失败",
+                success=len(selected),
+                failed=len(errors),
+                errors=errors,
+            )
         self.db.replace_product_tab(store.id, tab_key, selected)
         return SyncResult("product_query", len(selected), "商品已从微信读取", success=len(selected))
 
@@ -1838,13 +3799,14 @@ class SyncService:
             self.db.upsert_product_metrics(
                 store.id,
                 product_id,
-                views30=values.get("views30", 0),
-                sold30=values.get("sold30", 0),
+                views30=values.get("views30"),
+                sold30=values.get("sold30"),
+                recommend_views30=values.get("recommend_views30"),
             )
         return SyncResult(
             "private_product_metrics",
             len(metrics),
-            f"已更新 {len(metrics)} 个商品的30天浏览数据",
+            f"已更新 {len(metrics)} 个商品的30天经营指标",
             success=len(metrics),
         )
 
@@ -1874,8 +3836,9 @@ class SyncService:
                 self.db.upsert_product_metrics(
                     store.id,
                     product_id,
-                    views30=values.get("views30", 0),
-                    sold30=values.get("sold30", 0),
+                    views30=values.get("views30"),
+                    sold30=values.get("sold30"),
+                    recommend_views30=values.get("recommend_views30"),
                 )
                 updated += 1
         except ShopPrivateError:
@@ -1958,6 +3921,21 @@ class SyncService:
         ratio_percent: float,
     ) -> dict[str, Any]:
         self._require_platform_write(store, "league_items_add")
+        try:
+            ratio_percent = float(ratio_percent)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("联盟佣金比例必须是 0–90 之间的数字") from exc
+        if not 0 <= ratio_percent <= 90:
+            raise ValueError("联盟佣金比例必须在 0–90% 之间")
+        normalized_ids = list(
+            dict.fromkeys(
+                str(product_id).strip()
+                for product_id in product_ids
+                if str(product_id or "").strip()
+            )
+        )
+        if not normalized_ids:
+            raise ValueError("店铺没有可开通联盟佣金的商品")
         client = self.client_for(store)
         method = getattr(client, "batch_add_league_items", None)
         if not callable(method):
@@ -1966,12 +3944,24 @@ class SyncService:
             [
                 {
                     "product_id": str(product_id),
-                    "ratio": float(ratio_percent),
+                    "ratio": ratio_percent,
                 }
-                for product_id in product_ids
-                if str(product_id or "").strip()
+                for product_id in normalized_ids
             ]
         )
+        result = dict(result)
+        result_info_list = result.get("result_info_list") or []
+        failed_count = sum(
+            1
+            for row in result_info_list
+            if isinstance(row, dict) and int(row.get("errcode") or 0) != 0
+        )
+        result.setdefault("requested_count", len(normalized_ids))
+        result.setdefault(
+            "success_count",
+            max(0, len(normalized_ids) - failed_count),
+        )
+        result.setdefault("failed_count", failed_count)
         self.db.log_product_operation(
             store.id,
             "",
@@ -1980,12 +3970,66 @@ class SyncService:
         )
         return result
 
+    def fetch_active_product_ids(self, store: Store) -> list[str]:
+        """Read the complete official in-sale product ID list for one store."""
+        client = self.client_for(store)
+        method = getattr(client, "fetch_product_ids", None)
+        if not callable(method):
+            raise RuntimeError("当前客户端不支持读取全店在售商品")
+        return list(
+            dict.fromkeys(
+                str(product_id)
+                for product_id in method(status=5)
+                if str(product_id or "").strip()
+            )
+        )
+
     def fetch_league_products(self, store: Store) -> dict[str, Any]:
         client = self.client_for(store)
         method = getattr(client, "fetch_league_items", None)
         if not callable(method):
             raise RuntimeError("当前客户端不支持读取联盟商品")
-        return method()
+        page_size = 100
+        page_index = 1
+        items: list[dict[str, Any]] = []
+        first_result: dict[str, Any] | None = None
+        seen: set[str] = set()
+        while True:
+            result = method(page_size=page_size, page_index=page_index)
+            if first_result is None:
+                first_result = dict(result)
+            page_items = result.get("items") or []
+            if not isinstance(page_items, list):
+                page_items = []
+            added = 0
+            for item in page_items:
+                if not isinstance(item, dict):
+                    continue
+                product_id = str(item.get("product_id") or "")
+                if product_id and product_id in seen:
+                    continue
+                if product_id:
+                    seen.add(product_id)
+                items.append(item)
+                added += 1
+            total = int(
+                result.get("total_num")
+                or result.get("total")
+                or result.get("total_count")
+                or 0
+            )
+            if (
+                not page_items
+                or len(page_items) < page_size
+                or (total > 0 and len(items) >= total)
+                or (page_index > 1 and added == 0)
+            ):
+                break
+            page_index += 1
+        merged = dict(first_result or {})
+        merged["items"] = items
+        merged.setdefault("total_num", len(items))
+        return merged
 
     def update_league_ratio(
         self,
@@ -2048,6 +4092,8 @@ class SyncService:
         start_time: int | None = None,
         end_time: int | None = None,
         min_discount_cents: int = 100,
+        limit_purchase_num: int = 0,
+        stock_limit_per_sku: int = 0,
         create_all: bool = False,
     ) -> dict[str, Any]:
         self._require_platform_write(store, "activity_create")
@@ -2060,6 +4106,13 @@ class SyncService:
         min_discount_cents = int(min_discount_cents)
         if min_discount_cents < 100:
             raise ValueError("平台规则要求最低优惠不能低于 1 元")
+        limit_purchase_num = max(0, int(limit_purchase_num))
+        stock_limit_per_sku = max(0, int(stock_limit_per_sku))
+        if stock_limit_per_sku > 0:
+            raise ValueError(
+                "当前官方限时抢购接口禁止设置抢购库存，"
+                "请将商品库存上限设为 0，沿用 SKU 当前库存"
+            )
         now = int(time.time())
         start = int(start_time or (now + 300))
         end = int(end_time or (start + 7 * 86400))
@@ -2188,9 +4241,6 @@ class SyncService:
                     {
                         "skuId": sku_id,
                         "snapupPrice": str(activity_price),
-                        # snapupType=1 is a time-limited price activity.
-                        # The merchant backend rejects a custom snap-up stock
-                        # for this type; stock remains governed by the SKU.
                         "snapupStock": "0",
                     }
                 )
@@ -2258,7 +4308,7 @@ class SyncService:
 
         batches_to_create = batches if create_all else batches[:1]
         activities: list[dict[str, Any]] = []
-        start_dt = datetime.fromtimestamp(start)
+        start_dt = datetime.fromtimestamp(start, SHANGHAI_TZ)
         for batch_index, batch in enumerate(batches_to_create, start=1):
             snapup_products = [
                 {
@@ -2278,7 +4328,7 @@ class SyncService:
                 "startTime": start,
                 "endTime": end,
                 "snapupType": 1,
-                "limitPurchaseNum": 0,
+                "limitPurchaseNum": limit_purchase_num,
             }
             try:
                 response = private.create_snapup_activity(payload)
@@ -2658,9 +4708,14 @@ class SyncService:
             )
             raise
         self.db.log_product_operation(store.id, product_id, "stock", "success")
-        product = client.fetch_product(store, product_id)
-        self.db.upsert_product(product)
-        return product
+        try:
+            product = client.fetch_product(store, product_id)
+            self.db.upsert_product(product)
+            return product
+        except Exception:
+            # Stock write succeeded; keep the accepted result even if the
+            # best-effort cache refresh fails.
+            return None
 
     def refresh_shipping_options(
         self,
@@ -3028,10 +5083,17 @@ class SyncService:
         client = self.client_for(store)
         info = client.fetch_store_info()
         self.db.upsert_store_profile(store.id, info)
+        profile_name = str(info.get("nickname") or "").strip()
+        if profile_name:
+            self.db.replace_placeholder_store_name(
+                store.id,
+                store.app_id,
+                profile_name,
+            )
         return SyncResult(
             "store_profile",
             1,
-            f"店铺资料已更新：{info.get('nickname') or store.name}",
+            f"店铺资料已更新：{profile_name or store.name}",
             success=1,
         )
 
@@ -3044,7 +5106,33 @@ class SyncService:
         time_field: str = "create",
     ) -> SyncResult:
         if end_time - start_time > 86400:
-            raise ValueError("售后单单次查询不能超过 24 小时")
+            total = 0
+            success = 0
+            failed = 0
+            errors: list[str] = []
+            chunk_start = int(start_time)
+            while chunk_start < int(end_time):
+                chunk_end = min(int(end_time), chunk_start + 86400)
+                result = self.sync_after_sales(
+                    store,
+                    chunk_start,
+                    chunk_end,
+                    progress=progress,
+                    time_field=time_field,
+                )
+                total += result.count
+                success += result.success
+                failed += result.failed
+                errors.extend(result.errors)
+                chunk_start = chunk_end
+            return SyncResult(
+                "after_sales",
+                total,
+                f"售后同步完成：成功 {success}，失败 {failed}",
+                success=success,
+                failed=failed,
+                errors=errors[:20],
+            )
         client = self.client_for(store)
         ids = client.fetch_after_sale_ids(
             start_time,
@@ -3197,13 +5285,14 @@ class SyncService:
                         "raw": product,
                     }
                 )
-            except Exception:
+            except Exception as exc:
                 result.append(
                     {
                         "product_id": product_id,
                         "title": "(详情读取失败)",
                         "status_text": "—",
                         "raw": None,
+                        "_detail_error": str(exc),
                     }
                 )
         return result
@@ -3228,14 +5317,19 @@ class SyncService:
         else:
             raise ValueError("不支持的主页操作")
 
-    def procurement_login(self, account_id: int) -> dict[str, Any]:
+    def procurement_login(
+        self,
+        account_id: int,
+        *,
+        auto_fill: bool = True,
+    ) -> dict[str, Any]:
         account = self.db.get_procurement_account(account_id)
         if account is None:
             raise ValueError("采购账号不存在")
         return ProcurementWebSession(
             self.db,
             self.db.path.parent,
-        ).login(account)
+        ).login(account, auto_fill=auto_fill)
 
     def procurement_check_status(self, account_id: int) -> str:
         account = self.db.get_procurement_account(account_id)
@@ -3245,6 +5339,17 @@ class SyncService:
             self.db,
             self.db.path.parent,
         ).check_status(account)
+
+    def procurement_delete_account(self, account_id: int) -> list[str]:
+        account = self.db.get_procurement_account(account_id)
+        if account is None:
+            raise ValueError("采购账号不存在")
+        errors = ProcurementWebSession(
+            self.db,
+            self.db.path.parent,
+        ).cleanup_profile(account)
+        self.db.delete_procurement_account(account_id)
+        return errors
 
     def procurement_bind_alipay(self, account_id: int) -> dict[str, Any]:
         account = self.db.get_procurement_account(account_id)
@@ -3267,10 +5372,30 @@ class SyncService:
         try:
             count = adapter.sync(account, progress)
         except Exception as exc:
+            message = str(exc)[:1000]
+            current = self.db.get_procurement_account(account_id) or account
+            has_session = bool(
+                self.db.get_procurement_session(account_id)
+            )
+            identity_mismatch = any(
+                marker in message
+                for marker in ("账号不匹配", "不是目标账号")
+            )
+            # Order sync can fail because of an expired MTOP token, a
+            # temporary challenge, or a page timeout.  None of those is proof
+            # that the browser profile itself is logged out.  Only an
+            # explicit identity mismatch invalidates the saved account here;
+            # explicit login redirects are handled by check_status/open_backend.
+            status = (
+                "账号不匹配"
+                if identity_mismatch
+                else str(current.get("status") or "")
+                or ("已登录" if has_session else "异常")
+            )
             self.db.update_procurement_account(
                 account_id,
-                status="已掉线" if "登录" in str(exc) else "异常",
-                last_error=str(exc)[:1000],
+                status=status,
+                last_error=message,
             )
             raise
         return SyncResult(
@@ -3310,6 +5435,114 @@ class SyncService:
             f"采购网页已关闭，保存 {len(records)} 条采购记录",
             success=len(records),
         )
+
+    def procurement_open_backend(
+        self,
+        account_id: int,
+    ) -> dict[str, Any]:
+        account = self.db.get_procurement_account(account_id)
+        if account is None:
+            raise ValueError("采购账号不存在")
+        return ProcurementWebSession(
+            self.db,
+            self.db.path.parent,
+        ).open_backend(account)
+
+    def inspect_procurement_product(
+        self,
+        account_id: int,
+        url: str,
+    ) -> dict[str, Any]:
+        account = self.db.get_procurement_account(account_id)
+        if account is None:
+            raise ValueError("采购账号不存在")
+        return ProcurementWebSession(
+            self.db,
+            self.db.path.parent,
+        ).inspect_product(account, url)
+
+    def open_procurement_product(
+        self,
+        account_id: int,
+        url: str,
+        attrs: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        account = self.db.get_procurement_account(account_id)
+        if account is None:
+            raise ValueError("采购账号不存在")
+        return ProcurementWebSession(
+            self.db,
+            self.db.path.parent,
+        ).open_product(account, url, attrs)
+
+    def open_procurement_window(
+        self,
+        account_id: int,
+        url: str,
+        address: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        account = self.db.get_procurement_account(account_id)
+        if account is None:
+            raise ValueError("采购账号不存在")
+        from .procurement import normalize_purchase_product_url
+
+        target_url = normalize_purchase_product_url(url)
+        with self._procurement_windows_lock:
+            current = self._procurement_windows.get(account_id)
+            if (
+                current is not None
+                and not current.closed.is_set()
+                and current.url == target_url
+            ):
+                return {
+                    "status": "opened",
+                    "reused": True,
+                    "page_url": target_url,
+                }
+            if current is not None:
+                current.close()
+                self._procurement_windows.pop(account_id, None)
+            window = ControlledPurchaseWindow(
+                self.db,
+                self.db.path.parent,
+                account,
+                target_url,
+                address,
+                details,
+            )
+            window.start()
+            self._procurement_windows[account_id] = window
+        return {
+            "status": "opened",
+            "reused": False,
+            "page_url": target_url,
+        }
+
+    def verify_procurement_purchase(
+        self,
+        account_id: int,
+        expected: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._procurement_windows_lock:
+            window = self._procurement_windows.get(account_id)
+        if window is None or window.closed.is_set():
+            return {
+                "status": "open_required",
+                "reason": "请先打开对应的官方采购商品页",
+                "read_attempts": 0,
+            }
+        result = window.verify_once(expected)
+        result["read_attempts"] = 1
+        return result
+
+    def close_procurement_window(self, account_id: int) -> bool:
+        with self._procurement_windows_lock:
+            window = self._procurement_windows.pop(account_id, None)
+        if window is None:
+            return False
+        window.close()
+        return True
 
     def match_procurement_orders(self, store: Store) -> int:
         return ProcurementAdapter(
@@ -3914,9 +6147,19 @@ class SyncService:
             )
         ]
         for record in records:
+            enriched = dict(record)
+            if not enriched.get("head_img"):
+                product_id = str(enriched.get("product_id") or "")
+                get_product = getattr(self.db, "get_product", None)
+                if product_id and callable(get_product):
+                    product = get_product(store.id, product_id)
+                    if isinstance(product, dict):
+                        enriched["head_img"] = str(
+                            product.get("head_img") or ""
+                        )
             rows.append(
                 {
-                    **record,
+                    **enriched,
                     "store_id": store.id,
                     "store_app_id": store.app_id,
                     "store_name": store.name,
@@ -3926,6 +6169,13 @@ class SyncService:
         self.db.set_setting(
             "violation_library",
             json.dumps(rows, ensure_ascii=False),
+        )
+        self.db.set_setting(
+            "upload_violation_titles",
+            json.dumps(
+                build_upload_violation_titles(rows),
+                ensure_ascii=False,
+            ),
         )
         try:
             blacklist = json.loads(self.db.get_setting("violation_blacklist", "[]"))

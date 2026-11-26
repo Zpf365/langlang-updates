@@ -295,7 +295,12 @@ class AuthWindow(QWidget):
         card_center.addWidget(self.card)
         card_center.addStretch(1)
         right_layout.addLayout(card_center)
-        self.footer_label = QLabel("继续使用即表示同意《服务条款》与《隐私政策》")
+        self.footer_label = QLabel(
+            "继续使用即表示同意《服务条款》与《隐私政策》。"
+            "为提供经营分析，会同步去标识化的店铺、商品、订单和任务统计；"
+            "不上传账号密钥、Cookie、支付凭据或买家联系方式。"
+        )
+        self.footer_label.setWordWrap(True)
         self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.footer_label.setStyleSheet("color:#98A3AF;font-size:8pt;")
         right_layout.addWidget(self.footer_label)

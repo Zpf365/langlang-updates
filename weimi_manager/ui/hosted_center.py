@@ -1089,7 +1089,9 @@ class HostedCenterPage(BasePage):
                     for row in self.db.list_products(store_id=store.id)
                     if str(row.get("product_id")) not in blacklist
                 ]
-                active_products = [row for row in products if int(row.get("status") or 0) == 5][:20]
+                active_products = [
+                    row for row in products if int(row.get("status") or 0) == 5
+                ]
                 action_errors: list[str] = []
                 if config.get("add_affiliate"):
                     promoted = self.window.service.promote_products_to_league(
@@ -1108,7 +1110,8 @@ class HostedCenterPage(BasePage):
                             "添加联盟推广：" + str(promoted.get("errmsg") or "失败")
                         )
                     actions.append(
-                        f"添加联盟推广 {len(result_rows) - failed}"
+                        f"添加联盟推广 "
+                        f"{int(promoted.get('success_count') or max(0, len(active_products) - failed))}"
                         + (f"，失败 {failed}" if failed else "")
                     )
                 if config.get("latest_affiliate"):
@@ -1125,7 +1128,7 @@ class HostedCenterPage(BasePage):
                         str(row.get("product_id") or "")
                         for row in league.get("items") or []
                         if isinstance(row, dict) and row.get("product_id")
-                    ][:20]
+                    ]
                     commission_errors = self.window.service.update_league_ratio(
                         store,
                         league_ids,

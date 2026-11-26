@@ -239,7 +239,10 @@ class DiagnosticManager:
                 },
             )
         self._write_runtime_state(clean_exit=False)
-        if self._monitor_thread is None:
+        if (
+            os.environ.get("LANGLANG_DISABLE_UI_WATCHDOG") != "1"
+            and self._monitor_thread is None
+        ):
             self._monitor_thread = threading.Thread(
                 target=self._monitor_ui,
                 daemon=True,

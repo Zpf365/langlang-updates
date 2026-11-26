@@ -126,6 +126,67 @@ def _response_id_list(
     return ids
 
 
+def normalize_sku_sale_attrs(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize SKU attribute aliases and reject conflicting duplicates."""
+    normalized_payload = copy.deepcopy(payload)
+    skus = normalized_payload.get("skus")
+    if not isinstance(skus, list):
+        return normalized_payload
+    for sku_index, sku in enumerate(skus, start=1):
+        if not isinstance(sku, dict):
+            continue
+        raw_attrs = (
+            sku.get("sku_attrs")
+            or sku.get("sale_attrs")
+            or sku.get("attributes")
+            or []
+        )
+        if not isinstance(raw_attrs, list):
+            continue
+        by_key: dict[str, str] = {}
+        clean_attrs: list[dict[str, str]] = []
+        for item in raw_attrs:
+            if not isinstance(item, dict):
+                continue
+            key = str(
+                item.get("attr_key")
+                or item.get("item_key")
+                or item.get("key")
+                or item.get("name")
+                or ""
+            ).strip()
+            value = str(
+                item.get("attr_value")
+                or item.get("item_value")
+                or item.get("value")
+                or ""
+            ).strip()
+            if not key or not value:
+                continue
+            current = by_key.get(key)
+            if current is not None:
+                if current == value:
+                    continue
+                sku_id = str(
+                    sku.get("out_sku_id")
+                    or sku.get("sku_code")
+                    or sku.get("sku_id")
+                    or sku_index
+                )
+                raise ValueError(
+                    f"SKU {sku_id} 的销售属性“{key}”包含重复冲突值："
+                    f"{current} / {value}"
+                )
+            by_key[key] = value
+            clean_attrs.append(
+                {"attr_key": key, "attr_value": value}
+            )
+        sku["sku_attrs"] = clean_attrs
+        for alias in ("sale_attrs", "attributes"):
+            sku.pop(alias, None)
+    return normalized_payload
+
+
 class WechatApiError(RuntimeError):
     def __init__(
         self,
@@ -141,7 +202,7 @@ class WechatApiError(RuntimeError):
 
     @property
     def category(self) -> str:
-        if self.code in {40001, 40013, 40014, 42001}:
+        if self.code in {40001, 40013, 40014, 40125, 41004, 42001}:
             return "authentication"
         if self.code in {-1, 45011}:
             return "rate_limit"
@@ -661,7 +722,16 @@ class WechatShopClient:
         if status is not None:
             payload["status"] = int(status)
         result = self._post_api(PRODUCT_LIST_PATH, payload)
-        return int(result.get("total_num") or 0)
+        data = result.get("data")
+        raw_total = result.get("total_num")
+        if raw_total in (None, "") and isinstance(data, dict):
+            raw_total = data.get("total_num")
+        if raw_total in (None, ""):
+            raise WechatApiError("商品列表响应缺少 total_num，无法确认商品数量")
+        try:
+            return int(raw_total)
+        except (TypeError, ValueError) as exc:
+            raise WechatApiError("商品列表 total_num 不是有效整数") from exc
 
     def fetch_product(self, store: Store, product_id: str) -> Product:
         result = self._post_api(
@@ -873,7 +943,7 @@ class WechatShopClient:
     def add_product(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post_write_api(
             PRODUCT_ADD_PATH,
-            payload,
+            normalize_sku_sale_attrs(payload),
             action="product_add",
         )
 
@@ -966,30 +1036,70 @@ class WechatShopClient:
         forever: bool = True,
     ) -> dict[str, Any]:
         clean = []
-        for item in items[:20]:
+        seen: set[str] = set()
+        for item in items:
             product_id = str(item.get("product_id") or "").strip()
             ratio = float(item.get("ratio") or 0)
-            if not product_id or not 0 <= ratio <= 90:
+            if (
+                not product_id
+                or product_id in seen
+                or not 0 <= ratio <= 90
+            ):
                 continue
+            try:
+                numeric_product_id = int(product_id)
+            except ValueError:
+                continue
+            seen.add(product_id)
             clean.append(
                 {
-                    "product_id": int(product_id),
+                    "product_id": numeric_product_id,
                     "ratio": ratio,
                 }
             )
         if not clean:
             raise WechatApiError("没有可新增的联盟商品")
-        return self._post_write_api(
-            LEAGUE_ITEM_BATCH_ADD_PATH,
+        batch_results = []
+        for start in range(0, len(clean), 20):
+            batch_results.append(
+                self._post_write_api(
+                    LEAGUE_ITEM_BATCH_ADD_PATH,
+                    {
+                        "type": int(plan_type),
+                        "list": clean[start : start + 20],
+                        "begin_time": int(begin_time),
+                        "end_time": int(end_time),
+                        "is_forerver": bool(forever),
+                    },
+                    action="league_items_add",
+                )
+            )
+        result = dict(batch_results[0])
+        result_info_list: list[dict[str, Any]] = []
+        error_messages: list[str] = []
+        error_codes: list[int] = []
+        for batch_result in batch_results:
+            rows = batch_result.get("result_info_list")
+            if isinstance(rows, list):
+                result_info_list.extend(
+                    row for row in rows if isinstance(row, dict)
+                )
+            code = int(batch_result.get("errcode") or 0)
+            if code:
+                error_codes.append(code)
+                error_messages.append(
+                    str(batch_result.get("errmsg") or f"errno {code}")
+                )
+        result.update(
             {
-                "type": int(plan_type),
-                "list": clean,
-                "begin_time": int(begin_time),
-                "end_time": int(end_time),
-                "is_forerver": bool(forever),
-            },
-            action="league_items_add",
+                "errcode": error_codes[0] if error_codes else 0,
+                "errmsg": "；".join(dict.fromkeys(error_messages)),
+                "result_info_list": result_info_list,
+                "requested_count": len(clean),
+                "batch_count": len(batch_results),
+            }
         )
+        return result
 
     def fetch_league_items(
         self,

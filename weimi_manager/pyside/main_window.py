@@ -35,7 +35,6 @@ from .pages.order_extract import OrderExtractPage, ParsedOrdersPage
 from .pages.orders import OrdersPage
 from .pages.procurement import ProcurementPage
 from .pages.products import ProductsPage
-from .pages.sales_related import SalesRelatedPage
 from .pages.settings import SettingsPage
 from .pages.store_groups import StoreGroupsPage
 from .pages.storefront import StorefrontPage
@@ -67,7 +66,6 @@ PAGE_DEFINITIONS: dict[str, tuple[str, str]] = {
     "account": ("账号中心", "数据备份、恢复和会话"),
     "store_groups": ("店铺分组管理", "分组和批量店铺归属"),
     "activity_center": ("活动中心", "平台活动、限时限量购、优惠券和续期"),
-    "sales_related": ("动销相关", "采购任务、SKU 规则、订单核验与售后协同"),
     "team": ("团队账号", "管理子账号、角色和店铺授权"),
     "violation_blacklist": ("违规商品库", "违规抓取、比对和安全处理"),
     "dynamic": ("动销建议", "曝光、点击和成交分析"),
@@ -84,7 +82,6 @@ PRIMARY_ROUTES = (
     "violation_blacklist",
     "hosted",
     "activity_center",
-    "sales_related",
 )
 
 MORE_ROUTES = (
@@ -123,7 +120,6 @@ PAGE_PERMISSIONS = {
     "account": "",
     "store_groups": "stores_edit",
     "activity_center": "activities",
-    "sales_related": "",
     "team": "team_manage",
     "violation_blacklist": "products_view",
     "dynamic": "products_view",
@@ -409,10 +405,6 @@ class MainWindow(QMainWindow):
             page = ActivityCenterPage(self.workspace)
             page.notify.connect(self._show_notification)
             return page
-        if route == "sales_related":
-            page = SalesRelatedPage(self.workspace)
-            page.notify.connect(self._show_notification)
-            return page
         if route == "team":
             page = TeamPage(self.workspace)
             page.notify.connect(self._show_notification)
@@ -454,12 +446,6 @@ class MainWindow(QMainWindow):
         route = {"double11": "activity_center"}.get(route, route)
         if route not in PAGE_DEFINITIONS:
             self.statusBar().showMessage(f"未知页面：{route}", 8000)
-            return
-        if route == "sales_related" and not (
-            self._can_permission("procurement")
-            or self._can_permission("after_sales")
-        ):
-            self.statusBar().showMessage("当前账号没有采购或售后相关权限", 8000)
             return
         if not self._can_permission(PAGE_PERMISSIONS.get(route, "")):
             self.statusBar().showMessage("当前子账号没有此功能权限", 8000)

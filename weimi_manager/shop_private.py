@@ -88,6 +88,10 @@ REALTIME_STATS_PATH = (
     "/shop-faas/mmecnodelinercgi/cgi/liner_query/3/"
     "home-overview-shop-realtime?token=&lang=zh_CN"
 )
+PERIOD_STATS_PATH = (
+    "/shop-faas/mmecnodelinercgi/cgi/liner_query/3/"
+    "home-overview-shop-offline?token=&lang=zh_CN"
+)
 TODO_STATS_PATH = (
     "/shop-faas/mmchannelstradehome/home/todo?token=&lang=zh_CN"
 )
@@ -127,6 +131,12 @@ CATEGORY_REQUIREMENT_PATH = (
 CATEGORY_ADD_PATH = (
     "/shop-faas/mmchannelstradecategory/cgi/category/"
     "batchAddCategory"
+)
+ORDER_DETAIL_PATH = (
+    "/shop-faas/mmchannelstradeorder/detail/cgi/orderDetail"
+)
+ORDER_BATCH_NOTES_PATH = (
+    "/shop-faas/mmchannelstradeorder/common/cgi/batchMerchantNotes"
 )
 
 TAB_STATUSES: dict[str, tuple[int, ...]] = {
@@ -174,12 +184,266 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _first(item: dict[str, Any], *keys: str, default: Any = "") -> Any:
     for key in keys:
         value = item.get(key)
         if value is not None and value != "":
             return value
     return default
+
+
+_PRODUCT_IMAGE_KEYS = (
+    "productImg",
+    "productImage",
+    "product_img",
+    "product_img_url",
+    "productImageUrl",
+    "headImg",
+    "head_img",
+    "headImgUrl",
+    "head_img_url",
+    "imgUrl",
+    "imageUrl",
+    "coverUrl",
+    "picUrl",
+    "thumbnail",
+    "image",
+    "img",
+)
+
+
+def _image_url(value: Any) -> str:
+    if isinstance(value, dict):
+        value = _first(value, *_PRODUCT_IMAGE_KEYS)
+    if isinstance(value, list):
+        for item in value:
+            candidate = _image_url(item)
+            if candidate:
+                return candidate
+        return ""
+    text = str(value or "").strip()
+    if text.startswith("//"):
+        return f"https:{text}"
+    if text.startswith(("http://", "https://")):
+        return text
+    return ""
+
+
+def _violation_head_image(*containers: Any) -> str:
+    nested_keys = (
+        "product",
+        "productInfo",
+        "product_info",
+        "spu",
+        "spuInfo",
+        "goods",
+        "goodsInfo",
+        "warnObjectInfo",
+        "objectInfo",
+        "punishObject",
+        "objects",
+    )
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        direct = _image_url(_first(container, *_PRODUCT_IMAGE_KEYS))
+        if direct:
+            return direct
+        for key in nested_keys:
+            nested = container.get(key)
+            candidate = _image_url(nested)
+            if candidate:
+                return candidate
+            if isinstance(nested, list):
+                for item in nested:
+                    candidate = _image_url(item)
+                    if candidate:
+                        return candidate
+    return ""
+
+
+def normalize_order_private_detail(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the official merchant-backend order detail response."""
+    code = _as_int(result.get("code"), 0)
+    if code != 0:
+        raise ShopPrivateError(
+            str(
+                result.get("errmsg")
+                or result.get("title")
+                or f"订单详情接口返回 code={code}"
+            )
+        )
+    common = result.get("commonInfo")
+    common = common if isinstance(common, dict) else {}
+    order_info = result.get("orderInfo")
+    order_info = order_info if isinstance(order_info, dict) else {}
+    accept_info = result.get("acceptInfo")
+    accept_info = accept_info if isinstance(accept_info, dict) else {}
+    flag_info = result.get("flagInfo")
+    flag_info = flag_info if isinstance(flag_info, dict) else {}
+    express_info = result.get("expressInfo")
+    express_info = express_info if isinstance(express_info, dict) else {}
+    express_data = result.get("expressData")
+    express_data = express_data if isinstance(express_data, dict) else {}
+
+    merchant_notes = str(
+        flag_info.get("flagNotes")
+        or order_info.get("merchantNotes")
+        or accept_info.get("merchantNotes")
+        or ""
+    )
+    flag_color = _as_int(flag_info.get("flagColor"), 0)
+
+    package_rows: list[dict[str, Any]] = []
+    package_meta = {
+        str(item.get("waybillId") or ""): item
+        for item in express_info.get("deliveryProductInfo") or []
+        if isinstance(item, dict)
+        and str(item.get("waybillId") or "").strip()
+    }
+    delivery_rows = express_data.get("deliveryList")
+    if not isinstance(delivery_rows, list):
+        delivery_rows = []
+    for row in delivery_rows:
+        if not isinstance(row, dict):
+            continue
+        traces = []
+        for trace in row.get("traces") or []:
+            if not isinstance(trace, dict):
+                continue
+            traces.append(
+                {
+                    "time": str(trace.get("acceptTime") or ""),
+                    "description": str(
+                        trace.get("acceptAddress")
+                        or trace.get("content")
+                        or ""
+                    ),
+                }
+            )
+        waybill_id = str(row.get("waybillId") or "")
+        meta = package_meta.get(waybill_id, {})
+        product_infos = meta.get("productInfos")
+        if not isinstance(product_infos, list):
+            product_infos = row.get("productInfos")
+        package_rows.append(
+            {
+                "waybill_id": waybill_id,
+                "delivery_id": str(
+                    row.get("deliveryId")
+                    or meta.get("deliveryId")
+                    or ""
+                ),
+                "delivery_name": str(
+                    row.get("deliveryName")
+                    or row.get("deliveryId")
+                    or ""
+                ),
+                "status": str(row.get("title") or ""),
+                "content": str(row.get("content") or ""),
+                "error": str(row.get("errMsg") or ""),
+                "traces": traces,
+                "product_infos": [
+                    {
+                        "product_id": str(product.get("productId") or ""),
+                        "sku_id": str(product.get("skuId") or ""),
+                        "quantity": _as_int(
+                            product.get("productCnt"),
+                            0,
+                        ),
+                    }
+                    for product in (
+                        product_infos
+                        if isinstance(product_infos, list)
+                        else []
+                    )
+                    if isinstance(product, dict)
+                ],
+            }
+        )
+
+    if not package_rows:
+        for row in express_info.get("deliveryProductInfo") or []:
+            if not isinstance(row, dict):
+                continue
+            package_rows.append(
+                {
+                    "waybill_id": str(row.get("waybillId") or ""),
+                    "delivery_id": str(row.get("deliveryId") or ""),
+                    "delivery_name": str(
+                        row.get("deliveryId") or ""
+                    ),
+                    "status": str(common.get("statusStr") or ""),
+                    "content": "",
+                    "error": "",
+                    "traces": [],
+                    "product_infos": [
+                        {
+                            "product_id": str(
+                                product.get("productId") or ""
+                            ),
+                            "sku_id": str(product.get("skuId") or ""),
+                            "quantity": _as_int(
+                                product.get("productCnt"),
+                                0,
+                            ),
+                        }
+                        for product in (
+                            row.get("productInfos")
+                            if isinstance(row.get("productInfos"), list)
+                            else []
+                        )
+                        if isinstance(product, dict)
+                    ],
+                }
+            )
+
+    products = []
+    product_block = result.get("orderProducts")
+    product_block = (
+        product_block if isinstance(product_block, dict) else {}
+    )
+    product_rows = product_block.get("orderProductInfo")
+    if not isinstance(product_rows, list):
+        product_rows = []
+    for row in product_rows:
+        if not isinstance(row, dict):
+            continue
+        products.append(
+            {
+                "product_id": str(row.get("productId") or ""),
+                "sku_id": str(row.get("skuId") or ""),
+                "title": str(row.get("title") or ""),
+                "thumb_url": str(row.get("thumbImg") or ""),
+                "price": _as_int(row.get("salePrice"), 0),
+                "real_price": _as_int(row.get("realPrice"), 0),
+                "quantity": _as_int(row.get("productCnt"), 0),
+            }
+        )
+
+    return {
+        "order_id": str(
+            common.get("orderId") or order_info.get("orderId") or ""
+        ),
+        "status": _as_int(common.get("status"), 0),
+        "status_text": str(common.get("statusStr") or ""),
+        "update_time": _as_int(order_info.get("updateTime"), 0),
+        "merchant_notes": merchant_notes,
+        "merchant_notes_tag_color": flag_color,
+        "packages": package_rows,
+        "products": products,
+        "source": "微信小店商家后台订单详情",
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 class ShopPrivateClient:
@@ -352,6 +616,21 @@ class ShopPrivateClient:
             counts[key] = _as_int(data.get("totalNum"))
         return counts
 
+    def online_product_count(self) -> dict[str, Any]:
+        """Return the current official in-sale count without using caches."""
+        data = self.scan_page("sales", page=1, page_size=1)
+        count = _optional_int(data.get("totalNum"))
+        if count is None or count < 0:
+            raise ShopPrivateError("商品接口未返回有效的出售中商品总数")
+        return {
+            "count": count,
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "source": (
+                "微信小店商家后台商品列表 status=5 "
+                "（productStatus sales / totalNum）"
+            ),
+        }
+
     def audit_success_today(self, max_pages: int = 5) -> int:
         start = int(
             datetime.combine(date.today(), datetime_time.min).timestamp()
@@ -514,9 +793,9 @@ class ShopPrivateClient:
         product_ids: list[str],
         page_size: int = 200,
         stop: Callable[[], bool] | None = None,
-    ) -> dict[str, dict[str, int]]:
+    ) -> dict[str, dict[str, int | None]]:
         remaining = list(dict.fromkeys(str(value) for value in product_ids if value))
-        output: dict[str, dict[str, int]] = {}
+        output: dict[str, dict[str, int | None]] = {}
         while remaining:
             if stop and stop():
                 break
@@ -546,20 +825,36 @@ class ShopPrivateClient:
                     continue
                 metrics = output.setdefault(
                     product_id,
-                    {"views30": 0, "sold30": 0},
+                    {
+                        "views30": None,
+                        "sold30": None,
+                        "recommend_views30": None,
+                    },
                 )
-                metrics["views30"] = max(
-                    metrics["views30"],
-                    _as_int(
-                        value.get("shopxspu_growth_product_view_cnt_30d_2")
+                metric_fields = (
+                    (
+                        "views30",
+                        "shopxspu_growth_product_view_cnt_30d_2",
+                    ),
+                    (
+                        "sold30",
+                        "shopxspu_growth_pay_product_cnt_30d_2",
+                    ),
+                    (
+                        "recommend_views30",
+                        "shopxspu_growth_rec_product_view_cnt_30d_2",
                     ),
                 )
-                metrics["sold30"] = max(
-                    metrics["sold30"],
-                    _as_int(
-                        value.get("shopxspu_growth_pay_product_cnt_30d_2")
-                    ),
-                )
+                for metric_key, source_key in metric_fields:
+                    parsed = _optional_int(value.get(source_key))
+                    if parsed is None:
+                        continue
+                    current = metrics.get(metric_key)
+                    metrics[metric_key] = (
+                        parsed
+                        if current is None
+                        else max(int(current), parsed)
+                    )
         return output
 
     def activity_products(
@@ -968,6 +1263,7 @@ class ShopPrivateClient:
                             "product_id": product_id,
                             "title": title,
                             "reason": reason or "平台违规/预警",
+                            "head_img": _violation_head_image(row),
                             "raw": row,
                         }
                     )
@@ -1118,6 +1414,7 @@ class ShopPrivateClient:
                                 default="",
                             )
                         ),
+                        "head_img": _violation_head_image(row, first_object),
                         "raw": row,
                     }
                 )
@@ -1200,10 +1497,51 @@ class ShopPrivateClient:
                         ),
                         "fix": fix,
                         "time": str(row.get("preWarnTime") or ""),
+                        "head_img": _violation_head_image(
+                            row,
+                            object_info,
+                            item,
+                        ),
                         "raw": row,
                     }
                 )
         return output
+
+    def order_detail(self, order_id: str) -> dict[str, Any]:
+        """Read the official merchant-backend order detail snapshot."""
+        return normalize_order_private_detail(
+            self._post(ORDER_DETAIL_PATH, {"id": str(order_id)})
+        )
+
+    def update_order_notes_private(
+        self,
+        order_id: str,
+        notes: str,
+        color: int,
+    ) -> dict[str, Any]:
+        """Write merchant notes and flag through the official web backend."""
+        result = self._post(
+            ORDER_BATCH_NOTES_PATH,
+            {
+                "items": [
+                    {
+                        "orderId": str(order_id),
+                        "merchantNotes": str(notes),
+                        "merchantNotesTagColor": int(color),
+                    }
+                ]
+            },
+        )
+        code = _as_int(result.get("code"), 0)
+        if code != 0:
+            raise ShopPrivateError(
+                str(
+                    result.get("errmsg")
+                    or result.get("errorMsg")
+                    or f"订单备注保存接口返回 code={code}"
+                )
+            )
+        return result
 
     def batch_product_action(
         self,
@@ -1233,7 +1571,23 @@ class ShopPrivateClient:
         return result
 
     def realtime_overview(self) -> dict[str, Any]:
-        return self.period_overview(1, offset_days=0)
+        today = date.today()
+        start = int(
+            datetime.combine(today, datetime_time.min).timestamp() * 1000
+        )
+        result = self._post(
+            REALTIME_STATS_PATH,
+            {
+                "time_query": {
+                    "dateFormat": 1,
+                    "dateType": 0,
+                    "dateRange": 1,
+                    "startMs": start,
+                    "endMs": int(time.time() * 1000),
+                }
+            },
+        )
+        return dict(result.get("total") or {})
 
     def period_overview(
         self,
@@ -1241,23 +1595,21 @@ class ShopPrivateClient:
         offset_days: int = 1,
     ) -> dict[str, Any]:
         span = max(1, int(days))
-        last = date.today() - timedelta(days=max(0, int(offset_days)))
+        last = date.today() - timedelta(
+            days=max(1, int(offset_days))
+        )
         first = last - timedelta(days=span - 1)
         start = int(
             datetime.combine(first, datetime_time.min).timestamp() * 1000
         )
-        end = (
-            int(time.time() * 1000)
-            if offset_days == 0
-            else int(
-                datetime.combine(last, datetime_time.max).timestamp() * 1000
-            )
+        end = int(
+            datetime.combine(last, datetime_time.max).timestamp() * 1000
         )
         result = self._post(
-            REALTIME_STATS_PATH,
+            PERIOD_STATS_PATH,
             {
                 "time_query": {
-                    "dateFormat": 1,
+                    "dateFormat": 2,
                     "dateType": 0,
                     "dateRange": span,
                     "startMs": start,
@@ -1287,7 +1639,7 @@ class ShopPrivateClient:
                 output[key] = _as_int(item.get("num"))
         return output
 
-    def score_overview(self) -> dict[str, float | None]:
+    def score_overview(self) -> dict[str, Any]:
         result = self._post(
             SCORE_STATS_PATH,
             {
@@ -1295,7 +1647,8 @@ class ShopPrivateClient:
                 "scoreTypeList": [11, 12, 13, 14, 1000],
             },
         )
-        output: dict[str, float | None] = {}
+        output: dict[str, Any] = {}
+        daily_values: dict[str, list[dict[str, float | str]]] = {}
         for key, target in (
             ("dsrScore", "dsr"),
             ("productScore", "score_product"),
@@ -1308,8 +1661,39 @@ class ShopPrivateClient:
                     output[target] = float(block.get("curValue"))
                 except (TypeError, ValueError):
                     output[target] = None
+                history: list[dict[str, float | str]] = []
+                for row in block.get("valueList") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    raw_date = str(row.get("date") or "").strip()
+                    if len(raw_date) == 8 and raw_date.isdigit():
+                        raw_date = (
+                            f"{raw_date[:4]}-"
+                            f"{raw_date[4:6]}-"
+                            f"{raw_date[6:]}"
+                        )
+                    try:
+                        normalized_date = datetime.fromisoformat(
+                            raw_date
+                        ).date().isoformat()
+                        value = float(row.get("value"))
+                    except (TypeError, ValueError):
+                        continue
+                    history.append(
+                        {
+                            "date": normalized_date,
+                            "value": value,
+                        }
+                    )
+                if history:
+                    daily_values[target] = sorted(
+                        history,
+                        key=lambda item: str(item["date"]),
+                        reverse=True,
+                    )
             else:
                 output[target] = None
+        output["_score_daily_values"] = daily_values
         return output
 
     def evaluation_overview(self) -> dict[str, float | None]:
@@ -1334,8 +1718,8 @@ class ShopPrivateClient:
                 return None
 
         return {
-            "good_eval_ratio": value(good) or 0.0,
-            "quality_refund_ratio": value(quality) or 0.0,
+            "good_eval_ratio": value(good),
+            "quality_refund_ratio": value(quality),
         }
 
     def account_balance(self) -> dict[str, int]:
@@ -1347,9 +1731,18 @@ class ShopPrivateClient:
             "settle": _as_int(data.get("pendingAmount")),
         }
 
-    def deposit_balance(self) -> int:
+    def deposit_balance(self) -> int | None:
         result = self._get(DEPOSIT_STATE_PATH)
-        return _as_int(result.get("depositBalance"))
+        data = self._data(result)
+        raw_value = data.get("depositBalance")
+        if raw_value in (None, ""):
+            raw_value = result.get("depositBalance")
+        if raw_value in (None, ""):
+            return None
+        try:
+            return int(float(raw_value))
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _category_leaves(
@@ -1433,6 +1826,9 @@ class ShopPrivateClient:
         ids = [item["category_id"] for item in candidates]
         deposit_by_id: dict[str, dict[str, Any]] = {}
         requirement_by_id: dict[str, dict[str, Any]] = {}
+        deposit_balance = 0
+        real_deposit_balance = 0
+        operation_required_deposit: int | None = None
         for start in range(0, len(ids), 200):
             chunk = ids[start : start + 200]
             deposit_result = self._post(
@@ -1443,6 +1839,17 @@ class ShopPrivateClient:
                         for category_id in chunk
                     ]
                 },
+            )
+            deposit_balance = _as_int(
+                deposit_result.get("depositBalance")
+            )
+            real_deposit_balance = _as_int(
+                deposit_result.get("realDepositBalance"),
+                deposit_balance,
+            )
+            operation_required_deposit = _as_int(
+                deposit_result.get("operationRequiredDeposit"),
+                None,
             )
             for item in deposit_result.get("categoryDepositList") or []:
                 if not isinstance(item, dict):
@@ -1475,7 +1882,15 @@ class ShopPrivateClient:
                     "required_deposit": required,
                     "amount_to_pay": _as_int(deposit.get("amountToPay")),
                     "deposit_balance": _as_int(
-                        deposit.get("depositBalance")
+                        deposit.get("depositBalance"),
+                        deposit_balance,
+                    ),
+                    "real_deposit_balance": real_deposit_balance,
+                    "operation_required_deposit": (
+                        operation_required_deposit
+                    ),
+                    "deposit_free_trial": bool(
+                        deposit.get("isSupportDepositFreeTrial")
                     ),
                     "status": (
                         "需资质"
@@ -1496,6 +1911,240 @@ class ShopPrivateClient:
         return self._data(
             self._post(CATEGORY_ADD_PATH, {"categoryIdList": ids})
         )
+
+    def category_application_checks(
+        self,
+        category_ids: list[str],
+        business_type: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        business_type = (
+            business_type
+            or getattr(self, "category_business_type", "")
+            or "individual"
+        )
+        normalized_business_type = (
+            business_type
+            if business_type in {"individual", "enterprise"}
+            else "individual"
+        )
+        requested = list(
+            dict.fromkeys(
+                str(category_id)
+                for category_id in category_ids
+                if str(category_id).strip()
+            )
+        )
+        checks = {
+            category_id: {
+                "state": "unknown",
+                "label": "状态未知",
+                "reason": "",
+                "eligible": False,
+            }
+            for category_id in requested
+        }
+        if not requested:
+            return checks
+        try:
+            relation_rows: dict[str, tuple[int, dict[str, Any]]] = {}
+            for relation_status in (1, 2):
+                result = self._post(
+                    CATEGORY_RELATION_PATH,
+                    {"status": relation_status},
+                )
+                for item in result.get("categoryRelationList") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    category_id = str(
+                        item.get("id")
+                        or item.get("categoryId")
+                        or (item.get("category") or {}).get("categoryId")
+                        or ""
+                    )
+                    if category_id in checks:
+                        relation_rows[category_id] = (
+                            relation_status,
+                            item,
+                        )
+            catalog = {
+                str(item.get("category_id") or ""): item
+                for item in self.category_catalog()
+                if str(item.get("category_id") or "")
+            }
+            deposit_by_id: dict[str, dict[str, Any]] = {}
+            deposit_result = self._post(
+                CATEGORY_DEPOSIT_PATH,
+                {
+                    "categoryList": [
+                        {"categoryId": category_id}
+                        for category_id in requested
+                    ],
+                    "businessType": normalized_business_type,
+                },
+            )
+            for item in deposit_result.get("categoryDepositList") or []:
+                if not isinstance(item, dict):
+                    continue
+                category_id = str(
+                    (item.get("category") or {}).get("categoryId") or ""
+                )
+                if category_id:
+                    deposit_by_id[category_id] = item
+            deposit_balance = _as_int(
+                deposit_result.get("depositBalance")
+            )
+            real_deposit_balance = _as_int(
+                deposit_result.get("realDepositBalance"),
+                deposit_balance,
+            )
+            operation_required_deposit = _as_int(
+                deposit_result.get("operationRequiredDeposit"),
+                None,
+            )
+            requirement_result = self._post(
+                CATEGORY_REQUIREMENT_PATH,
+                {"categoryIds": [int(value) for value in requested]},
+            )
+            requirement_data = self._data(requirement_result)
+            qualification_ids = {
+                str(value)
+                for value in requirement_data.get(
+                    "needQualificationIdList"
+                ) or []
+            }
+        except Exception as exc:
+            for check in checks.values():
+                check["reason"] = str(exc)[:500]
+            return checks
+        for category_id, check in checks.items():
+            relation = relation_rows.get(category_id)
+            deposit = deposit_by_id.get(category_id) or {}
+            required_deposit = _as_int(
+                deposit.get("requiredDeposit")
+            )
+            amount_to_pay = _as_int(
+                deposit.get("amountToPay")
+            )
+            category_deposit_balance = _as_int(
+                deposit.get("depositBalance"),
+                deposit_balance,
+            )
+            deposit_fields = {
+                "deposit_amount": required_deposit,
+                "required_deposit": required_deposit,
+                "amount_to_pay": amount_to_pay,
+                "deposit_balance": category_deposit_balance,
+                "real_deposit_balance": real_deposit_balance,
+                "operation_required_deposit": (
+                    operation_required_deposit
+                ),
+                "deposit_free_trial": bool(
+                    deposit.get("isSupportDepositFreeTrial")
+                ),
+                "business_type": (
+                    normalized_business_type
+                ),
+            }
+            deposit_fields["deposit_shortfall"] = max(
+                0,
+                (
+                    operation_required_deposit
+                    if operation_required_deposit is not None
+                    else (
+                        0
+                        if deposit_fields["deposit_free_trial"]
+                        else amount_to_pay
+                    )
+                )
+                - category_deposit_balance,
+            )
+            if relation and relation[0] == 1:
+                check.update(
+                    state="effective",
+                    label="已生效",
+                    reason="",
+                    **deposit_fields,
+                )
+                continue
+            if relation and relation[0] == 2:
+                reason = str(
+                    relation[1].get("uneffectiveReason")
+                    or relation[1].get("reason")
+                    or ""
+                ).strip()
+                reason_text = reason.casefold()
+                if not reason:
+                    state = "pending"
+                    label = "审核中"
+                elif any(
+                    word in reason_text
+                    for word in ("拒绝", "驳回", "不通过", "未通过")
+                ):
+                    state = "rejected"
+                    label = "平台已拒绝"
+                elif any(
+                    word in reason_text
+                    for word in ("资质", "许可证", "证明")
+                ):
+                    state = "qualification_required"
+                    label = "缺资质"
+                elif any(
+                    word in reason_text
+                    for word in ("保证金", "押金", "补缴")
+                ):
+                    state = "deposit_required"
+                    label = "保证金不足"
+                else:
+                    state = "unavailable"
+                    label = "不可申请"
+                check.update(
+                    state=state,
+                    label=label,
+                    reason=reason[:500],
+                    **deposit_fields,
+                )
+                continue
+            leaf = catalog.get(category_id)
+            if leaf is None or leaf.get("forbidden"):
+                check.update(
+                    state="unavailable",
+                    label="不可申请",
+                    reason=(
+                        "平台目录中未找到该叶子类目"
+                        if leaf is None
+                        else "该类目被平台禁止申请"
+                    ),
+                    **deposit_fields,
+                )
+                continue
+            if category_id in qualification_ids:
+                check.update(
+                    state="qualification_required",
+                    label="缺资质",
+                    reason="该叶子类目要求补充平台资质",
+                    **deposit_fields,
+                )
+                continue
+            if not deposit:
+                check.update(
+                    state="unknown",
+                    label="状态未知",
+                    reason="保证金接口未返回该类目信息",
+                )
+                continue
+            check.update(
+                state="not_applied",
+                label="未申请",
+                reason=(
+                    f"保证金门槛 {required_deposit} 分，"
+                    "由平台申请响应确认是否需补缴"
+                    if required_deposit > 0
+                    else ""
+                ),
+                eligible=True,
+                **deposit_fields,
+            )
+        return checks
 
     def category_relation_statuses(
         self,
@@ -1528,25 +2177,48 @@ class ShopPrivateClient:
             for category_id in requested
         }
 
-    def recommend_overview(self, yesterday: bool = False) -> dict[str, int]:
-        day = date.today() - timedelta(days=1 if yesterday else 0)
-        start = datetime.combine(day, datetime_time.min)
-        end = (
-            datetime.combine(day, datetime_time(23, 59, 59))
-            if yesterday
-            else datetime.now()
-        )
+    def recommend_overview(
+        self,
+        yesterday: bool = False,
+        *,
+        days: int | None = None,
+    ) -> dict[str, int | None]:
+        if days is None:
+            day = date.today() - timedelta(days=1 if yesterday else 0)
+            start = datetime.combine(day, datetime_time.min)
+            end = (
+                datetime.combine(day, datetime_time(23, 59, 59))
+                if yesterday
+                else datetime.now()
+            )
+            time_query = {
+                "dateFormat": 1,
+                "dateType": 1,
+                "startMs": int(start.timestamp() * 1000),
+                "endMs": int(end.timestamp() * 1000),
+            }
+            is_today = not yesterday
+            is_yesterday = yesterday
+        else:
+            span = max(1, min(int(days), 90))
+            first_day = date.today() - timedelta(days=span - 1)
+            start = datetime.combine(first_day, datetime_time.min)
+            end = datetime.now()
+            time_query = {
+                "dateFormat": 2,
+                "dateType": 0,
+                "dateRange": span,
+                "startMs": int(start.timestamp() * 1000),
+                "endMs": int(end.timestamp() * 1000),
+            }
+            is_today = False
+            is_yesterday = False
         result = self._post(
             RECOMMEND_STATS_PATH,
             {
-                "isToday": not yesterday,
-                "isYesterday": yesterday,
-                "time_query": {
-                    "dateFormat": 1,
-                    "dateType": 1,
-                    "startMs": int(start.timestamp() * 1000),
-                    "endMs": int(end.timestamp() * 1000),
-                },
+                "isToday": is_today,
+                "isYesterday": is_yesterday,
+                "time_query": time_query,
             },
         )
         data = result.get("data")
@@ -1558,11 +2230,17 @@ class ShopPrivateClient:
             and isinstance(data.get("total"), dict)
             else {}
         )
+        exposure_count = _optional_int(total.get("product_view_cnt"))
+        exposure_people = _optional_int(total.get("product_view_uv"))
         return {
-            "exposure": _as_int(total.get("product_view_uv")),
-            "click": _as_int(total.get("product_click_uv")),
-            "orders": _as_int(total.get("pay_order_cnt")),
-            "gmv": _as_int(total.get("pay_gmv")),
+            "exposure": exposure_people
+            if exposure_people is not None
+            else exposure_count,
+            "exposure_count": exposure_count,
+            "exposure_people": exposure_people,
+            "click": _optional_int(total.get("product_click_uv")),
+            "orders": _optional_int(total.get("pay_order_cnt")),
+            "gmv": _optional_int(total.get("pay_gmv")),
         }
 
     def search_overview(self, days: int = 30) -> dict[str, int]:

@@ -1,8 +1,45 @@
 {
-  "version": "1.8.56",
-  "download_url": "https://github.com/Zpf365/langlang-updates/releases/download/v1.8.56/LangLang-1.8.56-win64.zip",
-  "sha256": "96b833e680cb6fcaa5aea43b09e75402c8d4c37b78ce36000a801592e4f43810",
+  "version": "1.8.99",
+  "download_url": "https://github.com/Zpf365/langlang-updates/releases/download/v1.8.99/LangLang-1.8.99-win64.zip",
+  "sha256": "289f2ddcb29e9e663014efdfcfb64f4c8206b09f50410e321483810f3e8be00c",
+  "channel": "stable",
+  "prerelease": false,
   "mandatory": false,
-  "published_at": "2026-11-20T05:11:41+00:00",
-  "notes": "# 澜琅 1.8.56 SKU 起购兼容修复\n\n- 官方接口没有返回起购数量时，按默认起购 `1` 处理。\n- 修复 SKU 核验、任务中心、买家业务工作台的统一阻断。\n- 保留价格、库存、上下架和限购核验。\n- 官方未开放的自动购物车和买家自动下单能力仍不伪造。"
+  "published_at": "2026-11-26T04:17:33+00:00",
+  "notes": "# 澜琅 1.8.99 正式版\n\n## 启动与数据口径\n\n- 修复旧数据库升级后 `analytics_outbox` 缺少 `business_key` 导致的启动崩溃。\n- 旧数据库会先补齐索引依赖字段，再创建索引；不删除或重建历史数据。\n- 修复跨自然日后“今日销售”沿用昨天金额和单量的问题。\n- 销售缓存增加自然日快照，新一天不会把昨日销售继续算进今日。\n\n## 偏远地区中转\n\n- 中转订单页面新增真实店铺、官方服务状态、运费模板和商品数据工作区。\n- 支持开通微信小店“偏远地区中转”服务。\n- 支持选择并修改新建或已有运费模板。\n- 运费参数可在界面修改：直邮首件/续件、西藏青海首件/续件、中转首件/续件。\n- 默认规则：直邮 `0/0`，西藏青海 `10/8`，中转运费 `3/1`。\n- 新疆会从直邮指定地区和“不配送地区”移除，只使用中转运费。\n- 支持把当前店铺全部可中转商品从直邮改为中转。\n- 真实执行前需要人工确认，修改前保留旧模板快照，执行后回读官方结果。\n\n## 发布说明\n\n- 本版本包含启动修复、销售日期口径修复和偏远中转工作区。\n- 真实平台开通、模板写入和商品中转状态以用户点击执行后的官方回读为准。",
+  "summary": [
+    {
+      "title": "启动与数据口径",
+      "items": [
+        "修复旧数据库升级后 analytics_outbox 缺少 business_key 导致的启动崩溃。",
+        "旧数据库会先补齐索引依赖字段，再创建索引；不删除或重建历史数据。"
+      ]
+    },
+    {
+      "title": "偏远地区中转",
+      "items": [
+        "中转订单页面新增真实店铺、官方服务状态、运费模板和商品数据工作区。",
+        "支持开通微信小店“偏远地区中转”服务。"
+      ]
+    },
+    {
+      "title": "发布说明",
+      "items": [
+        "本版本包含启动修复、销售日期口径修复和偏远中转工作区。",
+        "真实平台开通、模板写入和商品中转状态以用户点击执行后的官方回读为准。"
+      ]
+    }
+  ],
+  "required_files": [
+    "LangLang.exe",
+    "_internal/update_manifest.json",
+    "_internal/webui/dist/index.html",
+    "_internal/webui/dist/assets/ActivityPage-*.js",
+    "_internal/webui/dist/assets/StoresPage-*.js",
+    "_internal/webui/dist/assets/OrdersParityPage-*.js",
+    "_internal/webui/dist/assets/ProductsPage-*.js",
+    "_internal/webui/dist/assets/autoRefresh-*.js",
+    "_internal/PySide6/Qt6WebEngineCore.dll",
+    "_internal/PySide6/Qt6WebEngineWidgets.dll"
+  ]
 }

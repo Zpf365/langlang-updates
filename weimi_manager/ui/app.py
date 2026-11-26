@@ -28,7 +28,6 @@ from ..cloud_commands import (
 from ..config import AppPaths
 from ..db import Database
 from ..diagnostics import DiagnosticManager
-from ..dongxiao.application.runtime import DongxiaoRuntime
 from ..service import SyncService
 from ..store_scope import logged_in_stores
 from ..tester_channel import load_tester_channel
@@ -44,7 +43,6 @@ from .activity_center import ActivityCenterPage
 from .business_tools import (
     StoreGroupsPage,
 )
-from .dongxiao_page import DongxiaoPage
 from .hosted_center import HostedCenterPage
 from .pages import (
     ExtractPage,
@@ -115,8 +113,6 @@ class MainWindow(tk.Tk):
         "settings": "team_manage",
         "account": "",
         "team": "team_manage",
-        # 新模块显示给具备采购或售后权限的账号；页面内部再按功能细分权限。
-        "sales_related": "",
     }
     _PAGE_ATTRIBUTES = {
         "workbench_page": "workbench",
@@ -145,7 +141,6 @@ class MainWindow(tk.Tk):
         "no_traffic_page": "no_traffic",
         "hosted_page": "hosted",
         "team_page": "team",
-        "sales_related_page": "sales_related",
     }
 
     def __getattr__(self, name: str):
@@ -153,10 +148,6 @@ class MainWindow(tk.Tk):
         if route is not None:
             return self._ensure_page(route)
         raise AttributeError(name)
-
-    def _can_sales_related(self) -> bool:
-        """采购或售后权限任一满足即可显示入口；页面内部再做细粒度控制。"""
-        return self._can_permission("procurement") or self._can_permission("after_sales")
 
     def _can_permission(self, permission: str) -> bool:
         context = getattr(self, "auth_context", None)
@@ -339,20 +330,6 @@ class MainWindow(tk.Tk):
         else:
             self.service = base_service
             self.web_session = base_web_session
-        self.dongxiao_runtime = None
-        self.dongxiao_runtime_error = ""
-        try:
-            self.dongxiao_runtime = DongxiaoRuntime(
-                self.base_db.path,
-                self.service,
-            )
-        except Exception as exc:
-            self.dongxiao_runtime_error = str(exc)
-            self.diagnostics.capture_exception(
-                exc,
-                category="dongxiao_runtime",
-                detail={"operation": "initialize"},
-            )
         self._task_queue: queue.Queue[tuple[Callable[..., Any], tuple[Any, ...]]] = queue.Queue()
         self._nav_buttons: dict[str, tk.Button] = {}
         self._page_icon_names: dict[str, str] = {}
@@ -399,7 +376,6 @@ class MainWindow(tk.Tk):
         self._build_sidebar()
         self._build_content()
         self.after(80, self._drain_task_queue)
-        self.after(500, self._start_dongxiao_runtime)
         self.after(1000, self._diagnostic_heartbeat)
         self.after(5 * 60 * 1000, self._diagnostic_upload_tick)
         self.diagnostics.flush_async()
@@ -660,14 +636,10 @@ class MainWindow(tk.Tk):
             ("double11", "活动中心", "marketing"),
             ("dashboard", "数据大屏", "analytics"),
         ]
-        # 用“动销中心”替换原团队账号侧边栏位置；团队账号本身仍保留，移入“更多”。
-        if self._can_sales_related():
-            nav.append(("sales_related", "动销中心", "procurement"))
         nav = [
             item
             for item in nav
-            if item[0] == "sales_related"
-            or not self._PAGE_PERMISSIONS.get(item[0])
+            if not self._PAGE_PERMISSIONS.get(item[0])
             or self._can_permission(self._PAGE_PERMISSIONS[item[0]])
         ]
         for index, (key, label, icon_name) in enumerate(nav, 1):
@@ -911,8 +883,6 @@ class MainWindow(tk.Tk):
             return HostedCenterPage(self.page_host, self)
         if key == "team":
             return TeamPage(self.page_host, self)
-        if key == "sales_related":
-            return DongxiaoPage(self.page_host, self)
         return None
 
     def _ensure_page(self, key: str) -> ttk.Frame | None:
@@ -929,13 +899,6 @@ class MainWindow(tk.Tk):
 
     def show_page(self, key: str) -> None:
         if key not in self._PAGE_PERMISSIONS or key == "dashboard":
-            return
-        if key == "sales_related" and not self._can_sales_related():
-            messagebox.showwarning(
-                "没有功能权限",
-                "当前账号没有采购或售后相关权限。",
-                parent=self,
-            )
             return
         permission = self._PAGE_PERMISSIONS.get(key)
         if permission and not self._can_permission(permission):
@@ -1834,12 +1797,6 @@ class MainWindow(tk.Tk):
             except Exception:
                 pass
         diagnostics = getattr(self, "diagnostics", None)
-        runtime = getattr(self, "dongxiao_runtime", None)
-        if runtime is not None:
-            try:
-                runtime.stop()
-            except Exception:
-                pass
         try:
             diagnostics.record(
                 "session_end",
@@ -1856,46 +1813,6 @@ class MainWindow(tk.Tk):
         except tk.TclError:
             pass
         self.destroy()
-
-    def _start_dongxiao_runtime(self) -> None:
-        runtime = self.ensure_dongxiao_runtime()
-        if runtime is None:
-            return
-        try:
-            runtime.start_if_needed()
-        except Exception as exc:
-            diagnostics = getattr(self, "diagnostics", None)
-            if diagnostics is not None:
-                diagnostics.capture_exception(
-                    exc,
-                    category="dongxiao_runtime",
-                    detail={"operation": "start"},
-                )
-
-    def ensure_dongxiao_runtime(self):
-        runtime = getattr(self, "dongxiao_runtime", None)
-        if runtime is not None:
-            return runtime
-        try:
-            runtime = DongxiaoRuntime(
-                self.base_db.path,
-                self.service,
-            )
-            runtime.start_if_needed()
-        except Exception as exc:
-            self.dongxiao_runtime = None
-            self.dongxiao_runtime_error = str(exc)
-            diagnostics = getattr(self, "diagnostics", None)
-            if diagnostics is not None:
-                diagnostics.capture_exception(
-                    exc,
-                    category="dongxiao_runtime",
-                    detail={"operation": "retry_initialize"},
-                )
-            return None
-        self.dongxiao_runtime = runtime
-        self.dongxiao_runtime_error = ""
-        return runtime
 
     def _toggle_auto_refresh(self) -> None:
         self.auto_refresh_enabled = bool(self.auto_refresh_var.get())

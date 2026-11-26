@@ -45,12 +45,17 @@ class ProductFreshnessTests(unittest.TestCase):
                 )
             self.assertIsNotNone(db.get_product(store_id, "one"))
             client.delete_product = lambda _id: {"errcode": 0}
-            service.product_write(
-                store,
-                "delete",
-                product_id="one",
-                client=client,
-            )
+            with patch.object(
+                service,
+                "_remote_recycle_presence",
+                return_value=(True, "test remote recycle confirmation"),
+            ):
+                service.product_write(
+                    store,
+                    "delete",
+                    product_id="one",
+                    client=client,
+                )
             self.assertIsNone(db.get_product(store_id, "one"))
 
     def test_snapshot_failure_rolls_back_without_clearing_previous_products(self):
@@ -235,12 +240,18 @@ class ProductFreshnessTests(unittest.TestCase):
             with patch("weimi_manager.service.ShopPrivateClient") as factory:
                 private = factory.return_value
                 private.batch_product_action.return_value = {"success": True}
+                private.scan_products.return_value = [product]
                 result = service.set_products_listing(store, ["one"], False)
                 self.assertEqual(result.success, 1)
                 private.batch_product_action.assert_called_with(["one"], "offshelf")
                 self.assertEqual(db.get_product(store_id, "one")["status"], 11)
                 service.product_write(store, "delete", product_id="one")
                 private.batch_product_action.assert_called_with(["one"], "recycle")
+                private.scan_products.assert_called_with(
+                    "recycle",
+                    max_pages=None,
+                    page_size=50,
+                )
                 self.assertIsNone(db.get_product(store_id, "one"))
 
     def test_cancelled_scan_keeps_previous_snapshot(self):

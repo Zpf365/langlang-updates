@@ -578,6 +578,27 @@ class SupabaseAuthClient:
         )
         return data if isinstance(data, dict) else {}
 
+    def my_ops_capabilities(
+        self,
+        access_token: str,
+    ) -> dict[str, bool]:
+        data = self._request(
+            "POST",
+            self.config.rest_url("rpc/my_ops_capabilities"),
+            access_token=access_token,
+            payload={},
+            expected=(200,),
+        )
+        rows = data if isinstance(data, list) else []
+        capabilities: dict[str, bool] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            capability = str(row.get("capability") or "").strip()
+            if capability:
+                capabilities[capability] = bool(row.get("enabled"))
+        return capabilities
+
     def list_team_members(self, access_token: str) -> list[dict[str, Any]]:
         data = self._request(
             "POST",
@@ -734,6 +755,39 @@ class SupabaseAuthClient:
         data = self._request(
             "POST",
             self.config.rest_url("rpc/pull_organization_settings"),
+            access_token=access_token,
+            payload={},
+            expected=(200,),
+        )
+        return [
+            item for item in data if isinstance(item, dict)
+        ] if isinstance(data, list) else []
+
+    def upsert_organization_counterfeit_violations(
+        self,
+        access_token: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        data = self._request(
+            "POST",
+            self.config.rest_url(
+                "rpc/upsert_organization_counterfeit_violations"
+            ),
+            access_token=access_token,
+            payload={"p_rows": rows},
+            expected=(200,),
+        )
+        return data if isinstance(data, dict) else {}
+
+    def pull_organization_counterfeit_violations(
+        self,
+        access_token: str,
+    ) -> list[dict[str, Any]]:
+        data = self._request(
+            "POST",
+            self.config.rest_url(
+                "rpc/pull_organization_counterfeit_violations"
+            ),
             access_token=access_token,
             payload={},
             expected=(200,),

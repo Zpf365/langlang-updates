@@ -16,7 +16,6 @@ from .order_extract import OrderExtractPage, ParsedOrdersPage
 from .orders import OrdersPage
 from .procurement import ProcurementPage
 from .products import ProductsPage
-from .sales_related import SalesRelatedPage
 from .settings import SettingsPage
 from .store_groups import StoreGroupsPage
 from .storefront import StorefrontPage
@@ -43,7 +42,6 @@ __all__ = [
     "ProcurementPage",
     "ParsedOrdersPage",
     "ProductsPage",
-    "SalesRelatedPage",
     "SalesSuggestionsPage",
     "SettingsPage",
     "StoreGroupsPage",

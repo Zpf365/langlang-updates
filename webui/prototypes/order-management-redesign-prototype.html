@@ -1,0 +1,463 @@
+<!doctype html>
+<!-- Question: should each order row keep high density while vertically centering its contents? Three switchable variants via ?variant=. -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>订单管理单页重构 · UI 原型</title>
+  <style>
+    :root {
+      --nav: #092333;
+      --nav-2: #103548;
+      --green: #0c9a63;
+      --blue: #2878d0;
+      --line: #dfe5ea;
+      --muted: #75838f;
+      --paper: #f2f5f7;
+      --ink: #20313d;
+      --red: #d9525e;
+      --orange: #d78617;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--paper); color: var(--ink); font: 13px/1.45 "Microsoft YaHei", "PingFang SC", sans-serif; }
+    button, input, select { font: inherit; }
+    .app { min-height: 100vh; display: grid; grid-template-columns: 184px minmax(0, 1fr); }
+    .sidebar { min-height: 100vh; padding: 18px 12px 92px; background: linear-gradient(180deg, var(--nav), #071721); color: white; }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 0 8px 22px; }
+    .brand-mark { width: 34px; height: 34px; border-radius: 50%; background: conic-gradient(from 210deg, #3ee493, #0f8fdf, #edca64, #3ee493); box-shadow: 0 0 0 4px #0b293a; }
+    .brand strong { display: block; font-size: 17px; letter-spacing: 1px; }
+    .brand small { color: #9eb5c5; font-size: 9px; }
+    .nav-item { width: 100%; height: 45px; padding: 0 15px; display: flex; align-items: center; gap: 12px; border: 0; border-radius: 5px; color: #c9d7e1; background: transparent; text-align: left; }
+    .nav-item.active { margin-bottom: 7px; color: white; background: linear-gradient(90deg, #173b50, #133045); box-shadow: inset 3px 0 #11bd77; }
+    .nav-item span:first-child { width: 20px; text-align: center; filter: saturate(.65); }
+    .side-note { margin: 22px 7px 0; padding: 12px; border: 1px solid rgba(255,255,255,.1); border-radius: 7px; color: #a8bdc9; background: rgba(255,255,255,.035); font-size: 10px; line-height: 1.65; }
+    .side-note b { display: block; margin-bottom: 4px; color: #e9f6f0; font-size: 11px; }
+    .workspace { min-width: 0; padding: 18px 18px 110px; }
+    .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+    .page-head h1 { margin: 0; font-size: 25px; letter-spacing: .2px; }
+    .page-head p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
+    .head-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .btn { height: 34px; padding: 0 13px; border: 1px solid #ccd6dd; border-radius: 4px; color: #3a4d5c; background: #fff; cursor: pointer; }
+    .btn:hover { border-color: #91afc4; background: #f7fbfd; }
+    .btn.primary { border-color: #119c65; color: white; background: var(--green); }
+    .btn.blue { border-color: #2a79d2; color: white; background: var(--blue); }
+    .btn.soft { border-color: #b9d5ef; color: #246b9d; background: #eef7ff; }
+    .btn.danger { border-color: #e6bfc3; color: #b5434e; background: #fff5f6; }
+    .btn.disabled, .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .prototype-banner { margin: 16px 0 12px; padding: 9px 12px; border: 1px solid #eed3a0; border-radius: 5px; color: #8b641e; background: #fff9e9; font-size: 11px; }
+    .prototype-banner b { color: #6d4b10; }
+    .tabs { display: flex; align-items: center; gap: 5px; padding: 9px 0 3px; overflow-x: auto; }
+    .tab { height: 30px; padding: 0 13px; border: 1px solid #d8e0e6; border-radius: 999px; color: #496072; background: white; white-space: nowrap; }
+    .tab.active { border-color: #14bb76; color: white; background: var(--green); }
+    .filters { margin-top: 6px; padding: 10px; display: grid; grid-template-columns: 128px 235px 235px minmax(240px, 1fr) auto; gap: 8px; border: 1px solid var(--line); border-radius: 5px; background: white; }
+    .field { height: 32px; padding: 0 9px; border: 1px solid #d6dfe6; border-radius: 3px; color: #536574; background: white; }
+    .field::placeholder { color: #9ba7b0; }
+    .filter-note { display: flex; align-items: center; justify-content: flex-end; color: #778691; font-size: 10px; white-space: nowrap; }
+    .variant-title { margin: 14px 0 7px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .variant-title h2 { margin: 0; font-size: 15px; }
+    .variant-title span { color: var(--muted); font-size: 10px; }
+    .table-shell { position: relative; border: 1px solid #d7e0e6; border-radius: 5px; background: white; }
+    .scroll-area { overflow: auto; scrollbar-width: thin; scrollbar-color: #9daab5 #eef2f5; }
+    .scroll-area::-webkit-scrollbar { height: 12px; width: 12px; }
+    .scroll-area::-webkit-scrollbar-thumb { border: 3px solid #eef2f5; border-radius: 999px; background: #8797a4; }
+    .scroll-area::-webkit-scrollbar-track { background: #eef2f5; }
+    .slider-bar { min-height: 40px; padding: 0 13px; display: grid; grid-template-columns: auto minmax(140px, 1fr) auto; align-items: center; gap: 12px; border-top: 1px solid #e1e7eb; color: #71808c; background: #f8fafb; font-size: 10px; }
+    .slider-bar input[type="range"] { width: 100%; accent-color: #168f64; }
+    .slider-bar strong { color: #3f586a; font-size: 10px; }
+    .table-base { width: 100%; border-collapse: separate; border-spacing: 0; }
+    .table-base th { position: sticky; top: 0; z-index: 8; height: 43px; padding: 0 10px; border-bottom: 1px solid #dce4e9; color: #334957; background: #eef7fb; font-size: 11px; text-align: left; white-space: nowrap; }
+    .table-base td { height: 82px; padding: 9px 10px; border-bottom: 1px solid #edf1f4; vertical-align: top; color: #506271; font-size: 11px; background: white; }
+    .table-base tr:hover td { background: #f8fcff; }
+    .small { display: block; margin-top: 3px; color: #8b98a2; font-size: 9px; }
+    .mono { font-family: "Cascadia Code", Consolas, monospace; }
+    .store-line { display: flex; align-items: center; gap: 6px; }
+    .store-line strong { color: #263b49; font-size: 12px; }
+    .chip { display: inline-flex; align-items: center; min-height: 19px; padding: 1px 6px; border-radius: 999px; color: #1c5d7c; background: #dff4fd; font-size: 9px; white-space: nowrap; }
+    .chip.paid { color: #8b5c0c; background: #fff1d4; }
+    .chip.sent { color: #7a4d9e; background: #f2e8ff; }
+    .chip.done { color: #126547; background: #def7ea; }
+    .chip.risk { color: #a43f49; background: #fde7ea; }
+    .order-link { padding: 0; border: 0; color: #078659; background: transparent; text-decoration: underline; cursor: pointer; }
+    .product { display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 8px; }
+    .thumb { width: 54px; height: 54px; border-radius: 4px; background: linear-gradient(135deg, #cbb49d, #ede4d8 60%, #a77f69); position: relative; overflow: hidden; }
+    .thumb:after { content: "商品"; position: absolute; inset: auto 4px 4px; color: rgba(69,45,30,.7); font-size: 8px; text-align: center; }
+    .product p { margin: 0; color: #354957; font-size: 11px; line-height: 1.5; }
+    .money strong { display: block; color: #172f40; font-size: 18px; }
+    .money em { display: block; margin-top: 3px; color: #98701f; font-style: normal; }
+    .recipient strong { color: #314958; }
+    .recipient span { display: block; margin-top: 5px; color: #768692; }
+    .mini-actions { margin-top: 5px; display: flex; gap: 5px; }
+    .mini-actions button, .text-link { padding: 0; border: 0; color: #2d6f9b; background: transparent; font-size: 9px; cursor: pointer; }
+    .procure-cell { min-width: 174px; }
+    .procure-state { display: flex; align-items: center; gap: 7px; color: #c07718; font-weight: 700; }
+    .procure-actions { width: max-content; margin-top: 8px; display: grid; gap: 4px; }
+    .procure-actions .btn { width: 112px; height: 27px; padding: 0 9px; text-align: left; }
+    .logistics-cell { min-width: 160px; }
+    .logistics-cell .empty { color: #87949e; }
+    .logistics-cell .btn { width: 112px; height: 27px; margin-top: 8px; }
+    .remark-list { min-width: 185px; display: grid; gap: 5px; }
+    .remark-list span { display: flex; gap: 7px; }
+    .remark-list b { width: 53px; flex: none; color: #7d8a94; font-weight: 400; }
+    .operations-cell { min-width: 145px; }
+    .operations-stack { display: grid; gap: 5px; }
+    .operations-stack .btn { width: 130px; }
+    .data-foot { padding: 10px 13px; display: flex; align-items: center; justify-content: space-between; color: #7f8c96; background: white; font-size: 10px; }
+    .pager { display: flex; gap: 6px; }
+    .pager button { min-width: 29px; height: 27px; border: 1px solid #d6dee4; background: white; }
+    .pager button.active { color: white; background: var(--green); border-color: var(--green); }
+    .switcher { position: fixed; z-index: 100; left: 50%; bottom: 15px; transform: translateX(-50%); display: flex; align-items: stretch; overflow: hidden; border-radius: 999px; color: white; background: #142c3c; box-shadow: 0 10px 28px rgba(10,31,45,.32); font-size: 11px; }
+    .switcher button { width: 39px; border: 0; color: white; background: transparent; font-size: 20px; cursor: pointer; }
+    .switcher button:hover { background: rgba(255,255,255,.12); }
+    .switch-label { min-width: 210px; padding: 9px 14px; text-align: center; border-right: 1px solid rgba(255,255,255,.12); border-left: 1px solid rgba(255,255,255,.12); }
+    .switch-label small { display: block; margin-top: 1px; color: #a7bac6; font-size: 8px; }
+    .toast { position: fixed; z-index: 120; right: 24px; bottom: 22px; max-width: 360px; padding: 10px 14px; border: 1px solid #b8d9c8; border-radius: 6px; color: #24624b; background: #f1fbf5; box-shadow: 0 8px 26px rgba(22,53,43,.16); font-size: 11px; }
+
+    /* Variant A: frozen wide table */
+    .variant-a .wide-table { min-width: 1920px; }
+    .variant-a .table-base td { vertical-align: middle; }
+    .variant-a th:nth-child(1), .variant-a td:nth-child(1) { position: sticky; left: 0; z-index: 9; width: 38px; min-width: 38px; text-align: center; }
+    .variant-a th:nth-child(2), .variant-a td:nth-child(2) { position: sticky; left: 38px; z-index: 9; width: 205px; min-width: 205px; box-shadow: 9px 0 15px -14px rgba(16,45,61,.55); }
+    .variant-a td:nth-child(1), .variant-a td:nth-child(2) { background: white; }
+    .variant-a tr:hover td:nth-child(1), .variant-a tr:hover td:nth-child(2) { background: #f8fcff; }
+    .variant-a .product { grid-template-columns: 72px minmax(0, 1fr); align-items: center; gap: 10px; }
+    .variant-a .thumb { width: 72px; height: 72px; }
+    .variant-a .thumb:after { inset: auto 6px 6px; font-size: 9px; }
+    .variant-a .money,
+    .variant-a .recipient,
+    .variant-a .procure-cell,
+    .variant-a .logistics-cell,
+    .variant-a .operations-cell,
+    .variant-a .remark-list { align-self: center; }
+    .variant-a .recipient > *,
+    .variant-a .money > *,
+    .variant-a .logistics-cell > * { line-height: 1.5; }
+    .group-row th { top: 0; height: 29px; color: #547083; background: #dceef7; font-size: 9px; text-align: center; }
+    .column-row th { top: 29px; }
+
+    /* Variant B: operational matrix */
+    .variant-b .matrix-table { min-width: 1770px; }
+    .variant-b .order-lane { position: sticky; left: 0; z-index: 9; width: 225px; min-width: 225px; box-shadow: 9px 0 15px -14px rgba(16,45,61,.55); background: #fff !important; }
+    .variant-b th { top: 0; color: white; background: #31576c; }
+    .variant-b th.order-lane { background: #17394d; }
+    .variant-b td:nth-child(4), .variant-b th:nth-child(4) { background: #fffaf0; }
+    .variant-b td:nth-child(5), .variant-b th:nth-child(5) { background: #f5faff; }
+    .variant-b td:nth-child(6), .variant-b th:nth-child(6) { background: #fbf8ff; }
+    .variant-b td:nth-child(7), .variant-b th:nth-child(7) { background: #f5fbf7; }
+    .variant-b .table-base th:nth-child(n+4) { border-left: 1px solid rgba(255,255,255,.18); }
+
+    /* Variant C: compact row with inline workspace */
+    .variant-c .compact-body { max-height: 640px; overflow: auto; }
+    .order-block { border-bottom: 1px solid #dfe6eb; background: white; }
+    .order-summary { min-height: 76px; padding: 9px 12px; display: grid; grid-template-columns: 28px 205px minmax(300px, 1.7fr) 130px 180px 180px 120px; gap: 10px; align-items: center; }
+    .order-summary:hover { background: #f8fcff; }
+    .order-toggle { width: 23px; height: 23px; border: 1px solid #cbd7df; border-radius: 4px; background: white; cursor: pointer; }
+    .inline-workspace { margin: 0 12px 12px 40px; padding: 10px; display: none; grid-template-columns: 1.1fr .9fr 1.25fr .8fr; gap: 9px; border: 1px solid #dce8ef; border-radius: 6px; background: #f5fafc; }
+    .order-block.open .inline-workspace { display: grid; }
+    .panel { padding: 10px; border: 1px solid #dce5ea; border-radius: 5px; background: white; }
+    .panel h4 { margin: 0 0 8px; color: #365363; font-size: 10px; }
+    .panel .btn { margin: 3px 3px 0 0; }
+    .summary-meta { color: #6e7f8b; font-size: 10px; }
+    .empty-note { padding: 18px; color: #8b98a2; text-align: center; }
+
+    @media (max-width: 1100px) {
+      .app { grid-template-columns: 64px minmax(0, 1fr); }
+      .brand strong, .brand small, .nav-item span:last-child, .side-note { display: none; }
+      .nav-item { justify-content: center; padding: 0; }
+      .filters { grid-template-columns: 1fr 1fr; }
+      .filter-note { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark"></span><div><strong>澜琅</strong><small>订单单页 UI 原型</small></div></div>
+      <button class="nav-item"><span>▦</span><span>店铺管理</span></button>
+      <button class="nav-item active"><span>▤</span><span>订单管理</span></button>
+      <button class="nav-item"><span>⇄</span><span>中转订单</span></button>
+      <button class="nav-item"><span>▱</span><span>物流监控</span></button>
+      <button class="nav-item"><span>◫</span><span>利润统计</span></button>
+      <button class="nav-item"><span>▧</span><span>商品管理</span></button>
+      <button class="nav-item"><span>⇧</span><span>上传商品</span></button>
+      <button class="nav-item"><span>⚠</span><span>违规中心</span></button>
+      <div class="side-note"><b>本次原型目标</b>所有订单业务都在当前页完成，不再跳订单工作台。</div>
+    </aside>
+    <main class="workspace">
+      <header class="page-head">
+        <div>
+          <h1>订单管理</h1>
+          <p>单页完成采购、物流、备注、售后和履约操作 · 无二级页面</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn">过滤订单</button>
+          <button class="btn">导出</button>
+          <button class="btn">导入地址</button>
+          <button class="btn">导入订单信息</button>
+          <button class="btn soft">快速刷新</button>
+          <button class="btn primary">同步订单</button>
+        </div>
+      </header>
+      <div class="prototype-banner"><b>可交互原型：</b>底部的 A/B/C 是三种布局，不连接真实订单，也不会修改任何业务数据。</div>
+      <div class="tabs">
+        <button class="tab active">全部 777</button>
+        <button class="tab">待付款</button>
+        <button class="tab">待发货</button>
+        <button class="tab">部分发货</button>
+        <button class="tab">待收货 7</button>
+        <button class="tab">已完成 13</button>
+        <button class="tab">售后订单 450</button>
+        <button class="tab">标记</button>
+      </div>
+      <div class="filters">
+        <select class="field"><option>全部店铺</option></select>
+        <input class="field" type="date">
+        <input class="field" type="date">
+        <input class="field" placeholder="订单号、采购号、物流单号；多个单号用空格分隔">
+        <div class="filter-note">共 777 单 · 当前显示 6 单</div>
+      </div>
+      <div class="variant-title"><div><h2 id="variantTitle"></h2><span id="variantSubtitle"></span></div><span>横向滑块位于表格底部</span></div>
+      <div id="prototypeRoot"></div>
+    </main>
+  </div>
+  <div class="switcher" aria-label="原型布局切换">
+    <button id="prevVariant" title="上一个布局">‹</button>
+    <div class="switch-label" id="switchLabel"></div>
+    <button id="nextVariant" title="下一个布局">›</button>
+  </div>
+  <div class="toast" id="toast" hidden></div>
+  <script>
+    const orders = [
+      {
+        store: "屋檐亮菜商行", status: "待发货", statusClass: "paid", time: "2026/11/21 17:22:52", countdown: "已超时 10小时24分",
+        orderId: "3740701236801222656", product: "冬季老北京棉鞋女保暖加绒厚底防滑软底棉鞋", itemId: "100019569572712",
+        sale: 21.60, received: 31.60, cost: null, buyer: "詹**", phone: "136*****7757", address: "广东省揭阳市普宁市***",
+        purchase: "未匹配采购账号", purchaseSub: "暂无采购单", logistics: "暂无物流", notes: ["客服备注：—", "店铺备注：待发货", "软件备注：—", "用户留言：—", "自动成单：—"]
+      },
+      {
+        store: "幸和冠旺商行", status: "待收货", statusClass: "sent", time: "2026/11/19 14:27:23", countdown: "",
+        orderId: "3740653174349783808", product: "A类精梳棉女士内裤10A抑菌包臀中腰高腰女士三角内裤", itemId: "100018468737290",
+        sale: 13.70, received: 13.70, cost: null, buyer: "老**", phone: "139*****3279", address: "广东省揭阳市普宁市***",
+        purchase: "未匹配采购账号", purchaseSub: "采购未关联", logistics: "YT7657*****620", notes: ["客服备注：—", "店铺备注：待收货", "软件备注：—", "用户留言：—", "自动成单：—"]
+      },
+      {
+        store: "掘澜宽菜商行", status: "待收货", statusClass: "sent", time: "2026/11/19 11:11:53", countdown: "",
+        orderId: "3740650097555980288", product: "鞋子厚底增高老爹鞋冬季新款百搭休闲运动鞋", itemId: "10001900718439",
+        sale: 47.43, received: 47.43, cost: 25.80, buyer: "廉**", phone: "176*****1602", address: "天津市蓟州区***",
+        purchase: "采购账号：淘宝采购1", purchaseSub: "TB-20261119-00128", logistics: "暂无物流",
+        notes: ["客服备注：—", "店铺备注：待收货", "软件备注：核对鞋码", "用户留言：尽快发", "自动成单：—"]
+      },
+      {
+        store: "言参冠旺商行", status: "待收货", statusClass: "sent", time: "2026/11/18 12:57:12", countdown: "",
+        orderId: "3740629109209221888", product: "冬季加绒妈妈鞋软底舒适保暖防滑中老年棉鞋", itemId: "10001900977566",
+        sale: 47.90, received: 51.00, cost: 24.80, buyer: "李**", phone: "158*****7088", address: "湖南省邵阳市***",
+        purchase: "采购账号：1688主账号", purchaseSub: "P-556921188", logistics: "77345*****785",
+        notes: ["客服备注：已确认颜色", "店铺备注：待收货", "软件备注：—", "用户留言：—", "自动成单：是"]
+      },
+      {
+        store: "掘澜宽菜商行", status: "待收货", statusClass: "sent", time: "2026/11/17 10:17:55", countdown: "",
+        orderId: "3740603954928187904", product: "老北京布鞋冬季加绒加厚软底防滑保暖鞋", itemId: "100019008673998",
+        sale: 55.90, received: 59.50, cost: 31.20, buyer: "黄**", phone: "186*****1831", address: "湖北省十堰市***",
+        purchase: "待补录采购订单", purchaseSub: "存在真实成交", logistics: "暂无物流",
+        notes: ["客服备注：—", "店铺备注：待收货", "软件备注：优先核验", "用户留言：—", "自动成单：—"]
+      },
+      {
+        store: "掘澜宽菜商行", status: "售后中", statusClass: "risk", time: "2026/11/17 09:56:12", countdown: "",
+        orderId: "3740602664770522112", product: "厚底防滑保暖奶奶鞋加绒一脚蹬休闲鞋", itemId: "100019006043005",
+        sale: 30.93, received: 35.53, cost: 18.60, buyer: "李**", phone: "188*****6889", address: "四川省达州市***",
+        purchase: "采购账号：1688主账号", purchaseSub: "P-556889120", logistics: "79046*****154",
+        notes: ["客服备注：已联系客户", "店铺备注：待收货", "软件备注：售后退款核对", "用户留言：鞋底偏硬", "自动成单：是"]
+      }
+    ];
+
+    const variants = {
+      A: { title: "A · 居中平衡冻结宽表", subtitle: "订单、商品和关键业务内容垂直居中，商品图片放大，右侧区域仍可横向滑动。" },
+      B: { title: "B · 采购物流分舱矩阵", subtitle: "按业务区域分色分舱，采购人员更容易横向扫视；视觉层级更强。" },
+      C: { title: "C · 紧凑列表 + 行内工作区", subtitle: "默认保持短列表，展开后所有操作在行内完成；不跳转但纵向密度较低。" }
+    };
+
+    function statusChip(order) {
+      return `<span class="chip ${order.statusClass}">${order.status}</span>`;
+    }
+
+    function orderInfo(order) {
+      return `<div class="store-line"><strong>${order.store}</strong>${statusChip(order)}</div>
+        <span class="small">${order.time}</span><span class="small">${order.countdown || "—"}</span>
+        <button class="order-link mono" data-action="打开官方订单">${order.orderId}</button>`;
+    }
+
+    function productInfo(order) {
+      return `<div class="product"><span class="thumb"></span><div><p>${order.product}</p><span class="small">商品 ID：${order.itemId}</span><span class="small">数量 ×1</span></div></div>`;
+    }
+
+    function moneyInfo(order) {
+      return `<div class="money"><small>销售额</small><strong>¥${order.sale.toFixed(2)}</strong><span class="small">实收 ¥${order.received.toFixed(2)}</span><em>${order.cost == null ? "待核算" : `成本 ¥${order.cost.toFixed(2)}`}</em></div>`;
+    }
+
+    function recipientInfo(order) {
+      return `<div class="recipient"><strong>${order.buyer}　${order.phone}</strong><span>${order.address}</span><div class="mini-actions"><button data-action="解密地址">解密</button><button data-action="复制地址">复制地址</button><button data-action="申请改址">申请改址</button></div></div>`;
+    }
+
+    function purchaseInfo(order) {
+      return `<div class="procure-cell"><div class="procure-state">${order.purchase}</div><span class="small">${order.purchaseSub}</span><div class="procure-actions"><button class="btn blue" data-action="下单">下单</button><button class="btn soft" data-action="极速下单">极速下单</button><button class="btn" data-action="补录采购订单">补录采购订单</button></div></div>`;
+    }
+
+    function logisticsInfo(order) {
+      return `<div class="logistics-cell"><span class="${order.logistics === "暂无物流" ? "empty" : "mono"}">${order.logistics}</span><span class="small">${order.logistics === "暂无物流" ? "等待物流单号" : "运输状态：待收货"}</span><button class="btn soft" data-action="手动发货">手动发货</button></div>`;
+    }
+
+    function remarksInfo(order) {
+      return `<div class="remark-list">${order.notes.map(note => `<span><b>${note.split("：")[0]}：</b>${note.split("：").slice(1).join("：")}</span>`).join("")}</div>`;
+    }
+
+    function operationsInfo(order) {
+      return `<div class="operations-cell"><div class="operations-stack"><button class="btn primary" data-action="处理订单">处理</button><button class="btn" data-action="同步采购备注">同步采购备注</button><button class="btn" data-action="查看全局日志">查看日志</button></div></div>`;
+    }
+
+    function rangeBar(id) {
+      return `<div class="slider-bar"><span>横向定位</span><input id="${id}" type="range" min="0" max="100" value="0"><strong>拖动查看右列</strong></div>`;
+    }
+
+    function renderA() {
+      return `<section class="variant-a" data-scroll-range="scrollA">
+        <div class="table-shell"><div class="scroll-area" id="scrollA">
+          <table class="table-base wide-table">
+            <thead>
+              <tr class="group-row"><th></th><th>订单 / 店铺</th><th>商品</th><th>结算 / 利润</th><th>收件人</th><th colspan="2">采购与履约</th><th>物流</th><th>备注与留言</th><th>操作</th></tr>
+              <tr class="column-row"><th>选</th><th>订单</th><th>商品</th><th>金额</th><th>收货信息</th><th>采购</th><th>履约</th><th>物流</th><th>全部备注</th><th>操作</th></tr>
+            </thead>
+            <tbody>${orders.map(order => `<tr>
+              <td><input type="checkbox"></td>
+              <td>${orderInfo(order)}</td>
+              <td>${productInfo(order)}</td>
+              <td>${moneyInfo(order)}</td>
+              <td>${recipientInfo(order)}</td>
+              <td>${purchaseInfo(order)}</td>
+              <td><strong>${order.status === "待发货" ? "等待发货" : "已发货"}</strong><span class="small">${order.purchaseSub}</span></td>
+              <td>${logisticsInfo(order)}</td>
+              <td>${remarksInfo(order)}</td>
+              <td>${operationsInfo(order)}</td>
+            </tr>`).join("")}</tbody>
+          </table>
+        </div>${rangeBar("rangeA")}
+        <div class="data-foot"><span>共 777 条 · 第 1 / 16 页</span><div class="pager"><button>上一页</button><button class="active">1</button><button>2</button><button>3</button><button>下一页</button></div></div>
+        </div>
+      </section>`;
+    }
+
+    function renderB() {
+      return `<section class="variant-b" data-scroll-range="scrollB">
+        <div class="table-shell"><div class="scroll-area" id="scrollB">
+          <table class="table-base matrix-table">
+            <thead><tr><th class="order-lane">订单 / 店铺</th><th>商品 / 金额</th><th>收货人</th><th>采购</th><th>物流履约</th><th>备注 / 留言</th><th>操作</th></tr></thead>
+            <tbody>${orders.map(order => `<tr>
+              <td class="order-lane">${orderInfo(order)}</td>
+              <td>${productInfo(order)}${moneyInfo(order)}</td>
+              <td>${recipientInfo(order)}</td>
+              <td>${purchaseInfo(order)}</td>
+              <td>${logisticsInfo(order)}</td>
+              <td>${remarksInfo(order)}</td>
+              <td>${operationsInfo(order)}</td>
+            </tr>`).join("")}</tbody>
+          </table>
+        </div>${rangeBar("rangeB")}
+        <div class="data-foot"><span>采购与物流是本版核心操作区</span><div class="pager"><button>上一页</button><button class="active">1</button><button>2</button><button>下一页</button></div></div>
+        </div>
+      </section>`;
+    }
+
+    function renderC() {
+      return `<section class="variant-c">
+        <div class="table-shell"><div class="compact-body">
+          ${orders.map((order, index) => `<article class="order-block ${index === 0 ? "open" : ""}">
+            <div class="order-summary">
+              <button class="order-toggle" data-inline-toggle>${index === 0 ? "−" : "+"}</button>
+              <div>${orderInfo(order)}</div>
+              <div>${productInfo(order)}</div>
+              <div>${moneyInfo(order)}</div>
+              <div class="summary-meta">${order.buyer} ${order.phone}<br>${order.address}</div>
+              <div class="summary-meta">${order.purchase}<br>${order.logistics}</div>
+              <button class="btn primary" data-action="处理订单">展开处理</button>
+            </div>
+            <div class="inline-workspace">
+              <div class="panel"><h4>采购</h4>${purchaseInfo(order)}</div>
+              <div class="panel"><h4>物流与履约</h4>${logisticsInfo(order)}<button class="btn" data-action="补录采购订单">补录采购订单</button></div>
+              <div class="panel"><h4>备注与留言</h4>${remarksInfo(order)}<button class="btn" data-action="编辑备注">编辑备注</button></div>
+              <div class="panel"><h4>操作</h4>${operationsInfo(order)}</div>
+            </div>
+          </article>`).join("")}
+        </div>
+        <div class="data-foot"><span>点击 + 展开或收起单条订单工作区</span><div class="pager"><button>上一页</button><button class="active">1</button><button>2</button><button>下一页</button></div></div>
+        </div>
+      </section>`;
+    }
+
+    const renderers = { A: renderA, B: renderB, C: renderC };
+
+    function currentVariant() {
+      const value = new URLSearchParams(location.search).get("variant");
+      return Object.hasOwn(variants, value) ? value : "A";
+    }
+
+    function wireScroller(section) {
+      const range = section.querySelector('input[type="range"]');
+      const area = section.querySelector(".scroll-area");
+      if (!range || !area) return;
+      const sync = () => {
+        const max = Math.max(0, area.scrollWidth - area.clientWidth);
+        range.max = String(max || 1);
+        range.value = String(Math.round(area.scrollLeft));
+      };
+      range.addEventListener("input", () => { area.scrollLeft = Number(range.value); });
+      area.addEventListener("scroll", sync, { passive: true });
+      sync();
+    }
+
+    function showToast(message) {
+      const toast = document.getElementById("toast");
+      toast.textContent = `原型交互：${message}。正式版本会在这里接入真实业务或明确禁用原因。`;
+      toast.hidden = false;
+      clearTimeout(showToast.timer);
+      showToast.timer = setTimeout(() => { toast.hidden = true; }, 2600);
+    }
+
+    function render() {
+      const key = currentVariant();
+      document.getElementById("variantTitle").textContent = variants[key].title;
+      document.getElementById("variantSubtitle").textContent = variants[key].subtitle;
+      document.getElementById("switchLabel").innerHTML = `${key} · ${variants[key].title.split(" · ")[1]}<small>← → 或点击两侧切换</small>`;
+      const root = document.getElementById("prototypeRoot");
+      root.innerHTML = renderers[key]();
+      root.querySelectorAll("[data-scroll-range]").forEach(wireScroller);
+      root.querySelectorAll("[data-action]").forEach(button => button.addEventListener("click", () => showToast(button.dataset.action)));
+      root.querySelectorAll("[data-inline-toggle]").forEach(button => button.addEventListener("click", () => {
+        const block = button.closest(".order-block");
+        block.classList.toggle("open");
+        button.textContent = block.classList.contains("open") ? "−" : "+";
+      }));
+    }
+
+    function selectVariant(key) {
+      const url = new URL(location.href);
+      url.searchParams.set("variant", key);
+      history.replaceState(null, "", url);
+      render();
+    }
+
+    function cycle(step) {
+      const keys = Object.keys(variants);
+      const index = keys.indexOf(currentVariant());
+      selectVariant(keys[(index + step + keys.length) % keys.length]);
+    }
+
+    document.getElementById("prevVariant").addEventListener("click", () => cycle(-1));
+    document.getElementById("nextVariant").addEventListener("click", () => cycle(1));
+    document.addEventListener("keydown", event => {
+      const target = event.target;
+      if (target.matches("input,textarea,select,[contenteditable='true']")) return;
+      if (event.key === "ArrowLeft") cycle(-1);
+      if (event.key === "ArrowRight") cycle(1);
+    });
+    render();
+  </script>
+</body>
+</html>

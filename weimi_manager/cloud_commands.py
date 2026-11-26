@@ -28,6 +28,11 @@ COMMANDS: dict[str, tuple[str, bool]] = {
     "orders.view": ("orders_view", True),
     "orders.edit": ("orders_edit", True),
     "orders.after_sales": ("after_sales", True),
+    "operations.view": ("operations_view", False),
+    "operations.export": ("operations_export", False),
+    "operations.task_manage": ("operations_task_manage", False),
+    "operations.rule_manage": ("operations_rule_manage", False),
+    "operations.open_backend": ("operations_open_backend", False),
     "procurement.manage": ("procurement", False),
     "activities.manage": ("activities", True),
     "finance.view": ("orders_view", True),
@@ -52,6 +57,10 @@ LOCAL_ONLY_SETTINGS = {
     "update_source",
     "violation_daily_attempt_at",
     "violation_daily_last_success",
+    "violation_blacklist",
+    "violation_library",
+    "upload_violation_titles",
+    "cloud_counterfeit_violation_titles",
 }
 LOCAL_ONLY_SETTING_PREFIXES = (
     "organization_synced_appids:",

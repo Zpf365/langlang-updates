@@ -29,6 +29,7 @@ class SavedAccount:
     organization_id: str = ""
     member_role: str = "owner"
     permissions: dict[str, bool] = field(default_factory=dict)
+    entitlements: dict[str, bool] = field(default_factory=dict)
     password: str = field(default="", repr=False, compare=False)
 
     @classmethod
@@ -61,6 +62,20 @@ class SavedAccount:
                         for key, value in payload.get("permissions", {}).items()
                     }
                     if isinstance(payload.get("permissions"), dict)
+                    else {}
+                ),
+                entitlements=(
+                    {
+                        str(key): bool(value)
+                        for key, value in payload.get(
+                            "entitlements",
+                            {},
+                        ).items()
+                    }
+                    if isinstance(
+                        payload.get("entitlements"),
+                        dict,
+                    )
                     else {}
                 ),
                 password=str(payload.get("password") or ""),

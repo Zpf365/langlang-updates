@@ -38,6 +38,7 @@ class AuthContext:
     member_id: str = ""
     member_role: str = "owner"
     permissions: dict[str, Any] = field(default_factory=dict)
+    entitlements: dict[str, bool] = field(default_factory=dict)
     vault_key: bytes | None = field(
         default=None,
         repr=False,
@@ -100,6 +101,7 @@ class AuthService:
         license_status: LicenseStatus | None = None,
         password: str = "",
         organization: dict[str, Any] | None = None,
+        entitlements: dict[str, bool] | None = None,
     ) -> None:
         existing = self.store.find(tokens.username)
         saved_password = password or (
@@ -157,6 +159,19 @@ class AuthService:
                         else {}
                     )
                 ),
+                entitlements=(
+                    {
+                        str(key): bool(value)
+                        for key, value in entitlements.items()
+                    }
+                    if isinstance(entitlements, dict)
+                    else (
+                        dict(existing.entitlements)
+                        if existing is not None
+                        and existing.account_id == tokens.account_id
+                        else {}
+                    )
+                ),
                 password=saved_password,
             )
         )
@@ -190,6 +205,19 @@ class AuthService:
                     "团队权限数据不完整，请稍后重试。",
                     503,
                 )
+        entitlements: dict[str, bool] = {}
+        capabilities_reader = getattr(
+            self.client,
+            "my_ops_capabilities",
+            None,
+        )
+        if callable(capabilities_reader):
+            try:
+                entitlements = capabilities_reader(tokens.access_token)
+            except AuthError:
+                # Capability lookup is fail-closed; core account functions
+                # remain available while all protected modules stay hidden.
+                entitlements = {}
         try:
             self.client.register_device(
                 tokens,
@@ -205,6 +233,7 @@ class AuthService:
                     license_status,
                     password,
                     organization,
+                    entitlements,
                 )
             raise
         if remember:
@@ -213,6 +242,7 @@ class AuthService:
                 license_status,
                 password,
                 organization,
+                entitlements,
             )
         return AuthContext(
             tokens=tokens,
@@ -233,6 +263,7 @@ class AuthService:
                 if isinstance(organization.get("permissions"), dict)
                 else {}
             ),
+            entitlements=dict(entitlements),
             vault_key=(
                 derive_vault_key(password, tokens.account_id)
                 if password and tokens.account_id
@@ -404,8 +435,26 @@ class AuthService:
             member_id=context.member_id,
             member_role=context.member_role,
             permissions=context.permissions,
+            entitlements=context.entitlements,
             vault_key=context.vault_key,
         )
+
+    def logout(
+        self,
+        context: AuthContext,
+        *,
+        forget_local: bool = False,
+    ) -> None:
+        error: Exception | None = None
+        try:
+            self.client.logout(context.tokens.access_token)
+        except Exception as exc:
+            error = exc
+        finally:
+            if forget_local:
+                self.store.remove(context.account_id)
+        if error is not None:
+            raise error
 
     def restore_account(self, account: SavedAccount) -> AuthContext:
         try:
@@ -491,6 +540,7 @@ class AuthService:
             organization_id=account.organization_id,
             member_role=account.member_role,
             permissions=dict(account.permissions),
+            entitlements=dict(account.entitlements),
         )
 
 

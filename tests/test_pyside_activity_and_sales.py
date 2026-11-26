@@ -8,7 +8,6 @@ from PySide6.QtWidgets import QApplication
 
 from weimi_manager.db import Database
 from weimi_manager.pyside.pages.activity_center import ActivityCenterPage
-from weimi_manager.pyside.pages.sales_related import SalesRelatedPage
 from weimi_manager.pyside.task_manager import TaskManager
 
 
@@ -47,44 +46,10 @@ def test_activity_center_is_six_tab_pyside_page() -> None:
             page.deleteLater()
             manager.shutdown()
             application.processEvents()
-
-
-def test_sales_related_is_seven_tab_pyside_page() -> None:
-    application = QApplication.instance() or QApplication([])
-    manager = TaskManager(max_workers=2)
-    with tempfile.TemporaryDirectory() as tmp:
-        workspace = SimpleNamespace(
-            db=Database(Path(tmp) / "sales.db"),
-            service=SimpleNamespace(),
-            web_session=SimpleNamespace(),
-            task_manager=manager,
-            auth_context=None,
-            auth_client=None,
-        )
-        page = SalesRelatedPage(workspace)
-        try:
-            assert page.title == "动销相关"
-            assert [
-                page.tabs.tabText(index)
-                for index in range(page.tabs.count())
-            ] == [
-                "采购任务",
-                "SKU 与数量规则",
-                "订单记录",
-                "售后协同",
-                "买家白名单",
-                "规则设置",
-                "执行日志",
-            ]
-        finally:
-            page.deleteLater()
-            manager.shutdown()
-            application.processEvents()
-
-
-def test_formal_launcher_keeps_original_ui_until_parity() -> None:
+def test_formal_launcher_only_uses_webui() -> None:
     launcher = (
         Path(__file__).resolve().parents[1] / "launcher.py"
     ).read_text(encoding="utf-8")
-    assert "from weimi_manager.main import main" in launcher
-    assert "weimi_manager.pyside.main" not in launcher
+    assert "from weimi_manager.webui.main import main" in launcher
+    assert "from weimi_manager.main import main" not in launcher
+    assert "--legacy-ui" not in launcher

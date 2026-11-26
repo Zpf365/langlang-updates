@@ -1,0 +1,42 @@
+{
+  "fixture_name": "desensitized-taobao-target-capture",
+  "url": "https://item.taobao.com/item.htm?id=1012686581380",
+  "dom": {
+    "title": "厨房整理第1名",
+    "product_title": "",
+    "main_images": []
+  },
+  "responses": [
+    {
+      "url": "https://h5api.m.taobao.com/h5/mtop.taobao.recommend/1.0/?itemId=888888888888",
+      "data": {
+        "data": {
+          "itemId": "888888888888",
+          "title": "厨房整理第1名",
+          "skuId": "RECOMMEND-SKU",
+          "skuProps": {
+            "颜色": "推荐色"
+          },
+          "price": "1.00",
+          "stock": 999
+        }
+      }
+    },
+    {
+      "url": "https://h5api.m.taobao.com/h5/mtop.taobao.item.get/1.0/?itemId=1012686581380",
+      "data": {
+        "data": {
+          "itemId": "1012686581380",
+          "title": "淘宝官方目标商品",
+          "skuId": "TAOBAO-REAL-1",
+          "skuProps": {
+            "颜色": "黑色",
+            "尺码": "XL"
+          },
+          "price": "56.80",
+          "stock": 12
+        }
+      }
+    }
+  ]
+}

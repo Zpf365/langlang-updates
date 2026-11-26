@@ -104,6 +104,25 @@ SKIP_LOGIN_HOSTS = (
     "login.1688.com",
     "havanalogin.taobao.com",
 )
+OFFICIAL_REQUEST_HOSTS = (
+    "1688.com",
+    "alicdn.com",
+)
+
+
+def is_1688_official_url(url: str) -> bool:
+    """Allow only 1688 pages and Alibaba's static asset CDN."""
+    parsed = urlparse(str(url or ""))
+    scheme = parsed.scheme.casefold()
+    if scheme in {"about", "blob", "data"}:
+        return True
+    if scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    return any(
+        host == allowed or host.endswith("." + allowed)
+        for allowed in OFFICIAL_REQUEST_HOSTS
+    )
 
 
 def _offer_id(url: str) -> str:
@@ -287,6 +306,15 @@ def _stock(value: Any) -> int:
         return 0
 
 
+def _optional_stock(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(float(str(value).replace(",", ""))))
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_attr_text(value: Any) -> list[dict[str, str]]:
     if isinstance(value, dict):
         output = []
@@ -359,6 +387,14 @@ def _sku_items(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "spec",
         "specText",
     )
+    spec_text_keys = (
+        "specText",
+        "spec_text",
+        "skuName",
+        "sku_name",
+        "specName",
+        "spec_name",
+    )
     for node in nodes:
         containers = [
             node.get(key)
@@ -395,33 +431,48 @@ def _sku_items(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "",
                     )
                 )
-                identity = sku_id or json.dumps(item, ensure_ascii=False, sort_keys=True)
+                if not sku_id:
+                    continue
+                identity = sku_id
                 if identity in seen:
                     continue
-                seen.add(identity)
                 attrs = []
                 for key in attr_keys:
                     if key in item:
                         attrs = _parse_attr_text(item.get(key))
                         if attrs:
                             break
+                if not attrs:
+                    for key in spec_text_keys:
+                        text = re.sub(
+                            r"\s+",
+                            " ",
+                            str(item.get(key) or ""),
+                        ).strip()
+                        if text:
+                            attrs = [{"attr_key": "规格", "attr_value": text}]
+                            break
+                if not attrs:
+                    continue
+                stock_value = next(
+                    (
+                        item.get(key)
+                        for key in stock_keys
+                        if item.get(key) not in (None, "")
+                    ),
+                    None,
+                )
+                stock_num = _optional_stock(stock_value)
+                if stock_num is None:
+                    continue
+                seen.add(identity)
                 output.append(
                     {
-                        "out_sku_id": sku_id or f"1688-{len(output) + 1}",
+                        "out_sku_id": sku_id,
                         "sale_price": sale_price,
-                        "stock_num": _stock(
-                            next(
-                                (
-                                    item.get(key)
-                                    for key in stock_keys
-                                    if item.get(key) not in (None, "")
-                                ),
-                                0,
-                            )
-                        ),
+                        "stock_num": stock_num,
                         "sku_code": sku_id,
-                        "sku_attrs": attrs
-                        or [{"attr_key": "规格", "attr_value": "默认规格"}],
+                        "sku_attrs": attrs,
                     }
                 )
     return output
@@ -467,6 +518,10 @@ def normalize_1688_capture(
     offer_id = str(capture.get("offer_id") or "")
     title = _first_text(nodes, TITLE_FIELDS)
     if not title:
+        title = str(dom.get("product_title") or "").strip()
+    if not title and not str(
+        capture.get("target_source_id") or ""
+    ).strip():
         title = str(dom.get("title") or "").strip()
     if not title:
         raise Source1688Error("未能读取 1688 商品标题")
@@ -487,33 +542,7 @@ def normalize_1688_capture(
 
     skus = _sku_items(nodes)
     if not skus:
-        price = 0
-        for node in nodes:
-            for key in (
-                "price",
-                "salePrice",
-                "priceText",
-                "consignPrice",
-                "discountPrice",
-            ):
-                price = _price_cents(node.get(key), key)
-                if price > 0:
-                    break
-            if price > 0:
-                break
-        if price <= 0:
-            raise Source1688Error("未能读取 1688 商品价格")
-        skus = [
-            {
-                "out_sku_id": f"1688-{offer_id or 'offer'}-1",
-                "sale_price": price,
-                "stock_num": 0,
-                "sku_code": "",
-                "sku_attrs": [
-                    {"attr_key": "规格", "attr_value": "默认规格"}
-                ],
-            }
-        ]
+        raise Source1688Error("未能读取 1688 商品真实 SKU、价格和库存")
 
     category_name, category_hint = _category_text(nodes, dom)
     source_url = str(capture.get("url") or "")
@@ -665,14 +694,36 @@ PAGE_SNAPSHOT_SCRIPT = r"""
   const categoryNodes = [...document.querySelectorAll(
     '[class*="breadcrumb"] a,[class*="crumb"] a,[class*="category"] a,[class*="category-path"]'
   )];
-  const title = clean(
-    document.querySelector('meta[property="og:title"]')?.content ||
-    document.querySelector('h1')?.innerText ||
-    document.title
-  );
+  const productTitle = (() => {
+    for (const node of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const data = JSON.parse(node.textContent || '{}');
+        const values = Array.isArray(data) ? data : [data];
+        const product = values.find((item) => item && item['@type'] === 'Product');
+        if (clean(product?.name)) return clean(product.name);
+      } catch (_error) {
+        // Ignore malformed structured data and use a target-title selector.
+      }
+    }
+    const selectors = [
+      '[data-spm*="title"]',
+      '[data-testid*="title"]',
+      '[class*="offer-title"]',
+      '[class*="product-title"]',
+      '[class*="ItemHeader--mainTitle"]',
+      '.tb-main-title',
+    ];
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      const text = clean(node?.innerText || node?.textContent);
+      if (text) return text;
+    }
+    return '';
+  })();
   const categoryPaths = categoryNodes.map((node) => clean(node.innerText)).filter(Boolean);
   return {
-    title,
+    title: productTitle,
+    product_title: productTitle,
     url: location.href,
     text: clean(document.body?.innerText || '').slice(0, 30000),
     images: allImages.slice(0, 120),
@@ -793,6 +844,13 @@ class Link1688Collector:
                         return
                     captured.append({"url": response.url, "data": data})
 
+                def route_official(route) -> None:
+                    if is_1688_official_url(route.request.url):
+                        route.continue_()
+                    else:
+                        route.abort()
+
+                page.route("**/*", route_official)
                 page.on("response", on_response)
                 try:
                     page.goto(link.url, wait_until="domcontentloaded", timeout=60000)
@@ -838,6 +896,10 @@ class Link1688Collector:
                         }
                     )
                 finally:
+                    try:
+                        page.unroute("**/*", route_official)
+                    except Exception:
+                        pass
                     try:
                         page.remove_listener("response", on_response)
                     except Exception:

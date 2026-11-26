@@ -74,7 +74,6 @@ def test_pyside_shell_keeps_all_legacy_routes_and_caches_pages(tmp_path: Path) -
             "account",
             "store_groups",
             "activity_center",
-            "sales_related",
             "team",
             "violation_blacklist",
             "dynamic",

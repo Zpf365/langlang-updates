@@ -347,6 +347,7 @@ class MultiShopLoginTests(unittest.TestCase):
         class FakeContext:
             def __init__(self) -> None:
                 self.pages = [FakePage()]
+                self.close_count = 0
 
             def on(self, *_args, **_kwargs) -> None:
                 return None
@@ -361,7 +362,7 @@ class MultiShopLoginTests(unittest.TestCase):
                 ]
 
             def close(self) -> None:
-                return None
+                self.close_count += 1
 
         class FakeBrowser:
             def launch_persistent_context(self, *_args, **_kwargs):
@@ -370,12 +371,19 @@ class MultiShopLoginTests(unittest.TestCase):
         class FakePlaywright:
             chromium = FakeBrowser()
 
+            def __init__(self) -> None:
+                self.stop_count = 0
+
             def stop(self) -> None:
-                return None
+                self.stop_count += 1
 
         class FakeManager:
+            def __init__(self) -> None:
+                self.playwright = FakePlaywright()
+                self.context = None
+
             def start(self) -> FakePlaywright:
-                return FakePlaywright()
+                return self.playwright
 
         class FakeDB:
             def __init__(self) -> None:
@@ -417,16 +425,25 @@ class MultiShopLoginTests(unittest.TestCase):
             store.id,
             store.name,
         )
+        probe_calls = []
         session.probe_payload = lambda *_args, **_kwargs: (
-            "已登录",
+            probe_calls.append(True) or "已登录",
             "网页会话有效",
         )
         enumeration = mock.Mock(return_value={})
         session._capture_all_shop_logins_with_retries = enumeration
 
+        manager = FakeManager()
+        original_launch = FakeBrowser.launch_persistent_context
+
+        def launch(browser, *_args, **_kwargs):
+            manager.context = original_launch(browser, *_args, **_kwargs)
+            return manager.context
+
+        FakeBrowser.launch_persistent_context = launch
         with mock.patch(
             "weimi_manager.web_session.playwright_api",
-            return_value=(FakeError, lambda: FakeManager()),
+            return_value=(FakeError, lambda: manager),
         ):
             payload = session.interactive_login(
                 store,
@@ -434,9 +451,90 @@ class MultiShopLoginTests(unittest.TestCase):
             )
 
         enumeration.assert_called_once()
+        self.assertEqual(
+            enumeration.call_args.args[3],
+            {store.app_id},
+        )
         self.assertTrue(payload["login_confirmed"])
         self.assertEqual(payload["matched_store_id"], store.id)
         self.assertIsNotNone(db.session)
+        self.assertEqual(manager.context.close_count, 1)
+        self.assertEqual(manager.playwright.stop_count, 1)
+
+    def test_interactive_login_cleans_up_once_when_browser_closes_early(self) -> None:
+        class FakeError(Exception):
+            pass
+
+        class ClosedPage:
+            def __init__(self) -> None:
+                self.url = MULTI_LOGIN_URL
+
+            def goto(self, *_args, **_kwargs):
+                raise FakeError("browser closed")
+
+        class FakeContext:
+            def __init__(self) -> None:
+                self.pages = [ClosedPage()]
+                self.close_count = 0
+
+            def on(self, *_args, **_kwargs) -> None:
+                return None
+
+            def clear_cookies(self) -> None:
+                return None
+
+            def cookies(self):
+                return []
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        class FakePlaywright:
+            def __init__(self) -> None:
+                self.context = FakeContext()
+                self.stop_count = 0
+                self.chromium = SimpleNamespace(
+                    launch_persistent_context=lambda *_args, **_kwargs: self.context,
+                )
+
+            def stop(self) -> None:
+                self.stop_count += 1
+
+        class FakeManager:
+            def __init__(self) -> None:
+                self.playwright = FakePlaywright()
+
+            def start(self):
+                return self.playwright
+
+        store = SimpleNamespace(
+            id=1,
+            name="测试店铺",
+            app_id="wx-store-one",
+        )
+        db = SimpleNamespace(
+            list_store_identities=lambda: [],
+            list_stores=lambda: [store],
+            get_store=lambda store_id: store if store_id == store.id else None,
+        )
+        session = WechatWebSession(db, Path(tempfile.gettempdir()))
+        session._store_identity = lambda _store, refresh=False: {
+            "store_name": store.name,
+        }
+        manager = FakeManager()
+
+        with mock.patch(
+            "weimi_manager.web_session.playwright_api",
+            return_value=(FakeError, lambda: manager),
+        ):
+            with self.assertRaises(FakeError):
+                session.interactive_login(
+                    store,
+                    allowed_store_ids={store.id},
+                )
+
+        self.assertEqual(manager.playwright.context.close_count, 1)
+        self.assertEqual(manager.playwright.stop_count, 1)
 
     def test_extracts_wrapped_switch_list(self) -> None:
         payload = {
@@ -732,8 +830,9 @@ class MultiShopLoginTests(unittest.TestCase):
             },
             "account_info": {"nickName": "同一个微信"},
         }
+        probe_calls = []
         session.probe_payload = lambda *_args, **_kwargs: (
-            "已登录",
+            probe_calls.append(True) or "已登录",
             "网页会话有效",
         )
         saved_snapshots: list[tuple[int, int]] = []
@@ -753,8 +852,9 @@ class MultiShopLoginTests(unittest.TestCase):
             sorted(count for _store_id, count in saved_snapshots[:16]),
             list(range(1, 17)),
         )
-        self.assertEqual(page.goto_calls, 15)
-        self.assertEqual(page.wait_calls, 30)
+        self.assertEqual(page.goto_calls, 0)
+        self.assertEqual(page.wait_calls, 0)
+        self.assertEqual(probe_calls, [])
         self.assertNotIn(db.ids["wx-main"], db.sessions)
         self.assertIn(db.ids["wx-main"], db.cleared)
         self.assertTrue(

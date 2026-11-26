@@ -5,6 +5,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -16,12 +17,18 @@ from ..auth_client import AuthError
 from ..auth_service import AuthContext, AuthService
 from ..auth_session import SavedAccount
 from ..config import AppPaths
+from ..runtime_logging import (
+    get_runtime_log_manager,
+    log_error,
+    log_event,
+)
 from ..updater import (
-    DEFAULT_UPDATE_SOURCE,
     check_for_update,
     download_and_stage_update,
     launch_update_installer,
 )
+from .update_progress import UpdateProgressPanel
+from .update_notes_dialog import UpdateNotesDialog
 
 COLORS = {
     "window": "#e9e4d9",
@@ -121,6 +128,14 @@ class AuthWindow(tk.Tk):
         self._register_countdown = 0
         self._recovery_email = ""
         self._update_check_running = False
+        self._available_update: Any | None = None
+        self._update_in_progress = False
+        self._update_worker_active = False
+        self._update_install_started = False
+        self._update_lock_states: dict[tk.Misc, str] = {}
+        self._login_update_dialog: tk.Toplevel | None = None
+        self._login_update_panel: UpdateProgressPanel | None = None
+        self._update_details_dialog: UpdateNotesDialog | None = None
         self._after_ids: set[str] = set()
         self._queue: queue.Queue[tuple[Callable[..., Any], tuple[Any, ...]]] = queue.Queue()
 
@@ -136,6 +151,11 @@ class AuthWindow(tk.Tk):
         self._schedule(70, self._drain_queue)
         self._load_saved_accounts()
         self._show_screen("login")
+        log_event(
+            "auth.window_ready",
+            version=__display_version__,
+            resource_dir=str(self.paths.resource_dir),
+        )
         if (
             getattr(sys, "frozen", False)
             and os.environ.get("WEIMI_DISABLE_AUTO_UPDATE") != "1"
@@ -144,6 +164,22 @@ class AuthWindow(tk.Tk):
                 1200,
                 lambda: self._check_for_updates(manual=False),
             )
+            self._schedule(
+                30 * 60 * 1000,
+                self._periodic_update_check,
+            )
+
+    def _periodic_update_check(self) -> None:
+        if not self._update_in_progress and not self._update_worker_active:
+            self._check_for_updates(manual=False)
+        try:
+            if self.winfo_exists():
+                self._schedule(
+                    30 * 60 * 1000,
+                    self._periodic_update_check,
+                )
+        except tk.TclError:
+            return
 
     def _schedule(self, delay_ms: int, callback: Callable[[], None]) -> None:
         callback_id = ""
@@ -154,6 +190,16 @@ class AuthWindow(tk.Tk):
 
         callback_id = self.after(delay_ms, run)
         self._after_ids.add(callback_id)
+
+    def report_callback_exception(
+        self,
+        exception_type: type[BaseException],
+        value: BaseException,
+        tb: Any,
+    ) -> None:
+        value.__traceback__ = tb
+        log_error("auth.tk_callback_exception", value)
+        super().report_callback_exception(exception_type, value, tb)
 
     def _cancel_scheduled(self) -> None:
         for callback_id in tuple(self._after_ids):
@@ -201,10 +247,16 @@ class AuthWindow(tk.Tk):
         self.card_host.rowconfigure(0, weight=1)
         tk.Label(
             right,
-            text="继续使用即表示同意《服务条款》与《隐私政策》",
+            text=(
+                "继续使用即表示同意《服务条款》与《隐私政策》。"
+                "为提供经营分析，会同步去标识化的店铺、商品、订单和任务统计；"
+                "不上传账号密钥、Cookie、支付凭据或买家联系方式。"
+            ),
             bg=COLORS["panel"],
             fg="#a6aaa5",
             font=("Microsoft YaHei UI", 8),
+            wraplength=520,
+            justify="center",
         ).grid(row=1, column=0, pady=(0, 18))
 
         self.card = tk.Frame(
@@ -295,6 +347,26 @@ class AuthWindow(tk.Tk):
             fg="#a9c4bc",
             font=("Microsoft YaHei UI", 8),
         ).pack(anchor="w", pady=(2, 0))
+
+        self.update_badge = tk.Button(
+            parent,
+            text="",
+            command=self._show_update_details,
+            bg="#f4c95d",
+            fg="#17324a",
+            activebackground="#ffd978",
+            activeforeground="#17324a",
+            justify="left",
+            anchor="w",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=7,
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.update_badge.place(relx=0.5, y=108, anchor="n", width=330)
+        self.update_badge.place_forget()
 
         copy = tk.Frame(content, bg=COLORS["left"])
         copy.pack(side="bottom", anchor="w", fill="x")
@@ -785,6 +857,9 @@ class AuthWindow(tk.Tk):
         self.license_enter_button.configure(state="disabled")
 
     def _show_screen(self, name: str) -> None:
+        if self._update_in_progress:
+            self._set_status("正在更新，请等待完成。", error=True)
+            return
         screens = {
             "login": self.login_screen,
             "register": self.register_screen,
@@ -794,6 +869,7 @@ class AuthWindow(tk.Tk):
         for screen in screens.values():
             screen.grid_remove()
         screens[name].grid()
+        log_event("auth.screen_changed", screen=name)
         self._screen = name
         self._set_status("")
         if name == "login":
@@ -812,8 +888,79 @@ class AuthWindow(tk.Tk):
         self.status_var.set(message)
         self.status_label.configure(fg=COLORS["danger"] if error else COLORS["muted"])
 
+    def _set_update_lock(self, locked: bool) -> None:
+        if locked:
+            if self._update_in_progress:
+                return
+            self._update_lock_states.clear()
+            for widget in self._interactive_descendants(self):
+                try:
+                    state = str(widget.cget("state"))
+                except tk.TclError:
+                    continue
+                if not state:
+                    continue
+                self._update_lock_states[widget] = state
+                widget.configure(state="disabled")
+            self._update_in_progress = True
+            self.protocol("WM_DELETE_WINDOW", self._guard_close_during_update)
+            try:
+                self.configure(cursor="watch")
+            except tk.TclError:
+                pass
+            return
+
+        self._update_in_progress = False
+        for widget, state in tuple(self._update_lock_states.items()):
+            try:
+                if widget.winfo_exists():
+                    widget.configure(state=state)
+            except tk.TclError:
+                pass
+        self._update_lock_states.clear()
+        try:
+            self._restore_window_close_handler()
+            self.configure(cursor="")
+        except tk.TclError:
+            pass
+
+    def _restore_window_close_handler(self) -> None:
+        if self._screen == "license":
+            self.protocol("WM_DELETE_WINDOW", lambda: None)
+        else:
+            self.protocol("WM_DELETE_WINDOW", self._close)
+
+    @staticmethod
+    def _interactive_descendants(widget: tk.Misc) -> list[tk.Misc]:
+        interactive: list[tk.Misc] = []
+        interactive_types = (
+            tk.Button,
+            tk.Checkbutton,
+            tk.Entry,
+            tk.Listbox,
+            tk.Radiobutton,
+            tk.Spinbox,
+            tk.Text,
+        )
+        for child in widget.winfo_children():
+            if isinstance(child, interactive_types):
+                interactive.append(child)
+            interactive.extend(AuthWindow._interactive_descendants(child))
+        return interactive
+
+    def _guard_close_during_update(self) -> None:
+        message = (
+            "更新正在安装，请等待软件自动重启。"
+            if self._update_install_started
+            else "正在更新，请等待完成。"
+        )
+        self._set_status(message, error=True)
+        messagebox.showwarning("正在更新", message, parent=self)
+
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
+        if self._update_in_progress:
+            return
         state = "disabled" if busy else "normal"
         self.login_button.configure(state=state)
         self._update_register_send_state()
@@ -834,6 +981,13 @@ class AuthWindow(tk.Tk):
 
     def _update_register_send_state(self) -> None:
         if not hasattr(self, "register_send_button"):
+            return
+        if self._update_in_progress:
+            self.register_send_button.configure(
+                state="disabled",
+                bg=COLORS["muted"],
+                activebackground=COLORS["muted"],
+            )
             return
         if self._busy or self._register_countdown > 0:
             self.register_send_button.configure(
@@ -915,21 +1069,43 @@ class AuthWindow(tk.Tk):
             message = str(error)
         else:
             message = f"操作失败：{error}"
-        self._set_status(message, error=True)
+        log_event(
+            "auth.operation_failed",
+            error=message,
+        )
+        self._set_status(
+            message + self._log_directory_hint(),
+            error=True,
+        )
+
+    @staticmethod
+    def _log_directory_hint() -> str:
+        manager = get_runtime_log_manager()
+        if manager is None:
+            return ""
+        return f"\n运行日志：{manager.day_dir}"
 
     def _check_for_updates(self, manual: bool = True) -> None:
+        if self._update_in_progress or self._update_worker_active:
+            if manual:
+                self._set_status("正在更新，请等待完成。", error=True)
+            return
         if self._update_check_running:
             if manual:
                 self._set_status("正在检查更新，请稍候。")
             return
         self._update_check_running = True
+        log_event(
+            "update.login.check_started",
+            manual=manual,
+        )
         if manual:
             self._set_status("正在检查更新…")
 
         def worker() -> None:
             try:
                 info = check_for_update(
-                    DEFAULT_UPDATE_SOURCE,
+                    "",
                     self.paths.resource_dir,
                 )
             except Exception as exc:
@@ -950,42 +1126,170 @@ class AuthWindow(tk.Tk):
     def _update_checked(self, info: Any, manual: bool) -> None:
         self._update_check_running = False
         if not info.available:
+            self._available_update = None
+            self._hide_update_badge()
+            self._close_update_details()
+            log_event(
+                "update.login.no_update",
+                manual=manual,
+                current_version=info.current_version,
+            )
             if manual:
                 self._set_status("当前已经是最新版本。")
             return
         if not info.download_url:
+            self._available_update = None
+            self._hide_update_badge()
+            self._close_update_details()
+            log_event(
+                "update.login.missing_download_url",
+                manual=manual,
+                latest_version=info.latest_version,
+            )
             if manual:
                 self._set_status("更新清单没有下载地址。", error=True)
             return
-        notes = str(info.notes or "没有更新说明").strip()
-        if len(notes) > 1600:
-            notes = notes[:1600] + "\n…"
-        accepted = messagebox.askyesno(
-            "发现新版本",
-            (
-                f"当前版本：{info.current_version}\n"
-                f"最新版本：{info.latest_version}\n\n"
-                f"{notes}\n\n"
-                "现在下载并安装更新吗？"
-            ),
-            parent=self,
+        self._available_update = info
+        self._show_update_badge(info)
+        log_event(
+            "update.login.available",
+            manual=manual,
+            current_version=info.current_version,
+            latest_version=info.latest_version,
         )
-        if accepted:
-            self._download_login_update(info)
+        if manual:
+            self._set_status(
+                f"发现新版本 v{info.latest_version}，请点击左上角更新提示查看。"
+            )
+
+    def _show_update_badge(self, info: Any) -> None:
+        button = getattr(self, "update_badge", None)
+        if button is None:
+            return
+        button.configure(
+            text=(
+                f"发现新版本 v{info.latest_version}\n"
+                f"当前 v{info.current_version} · 点击查看"
+            )
+        )
+        try:
+            button.place(relx=0.5, y=108, anchor="n", width=330)
+            button.lift()
+        except tk.TclError:
+            pass
+
+    def _hide_update_badge(self) -> None:
+        button = getattr(self, "update_badge", None)
+        if button is None:
+            return
+        try:
+            button.place_forget()
+        except tk.TclError:
+            pass
+
+    def _show_update_details(self) -> None:
+        if self._update_in_progress:
+            self._set_status("正在更新，请等待完成。", error=True)
+            return
+        info = self._available_update
+        if info is None or not getattr(info, "available", False):
+            self._hide_update_badge()
+            return
+        dialog = self._update_details_dialog
+        if dialog is not None and dialog.winfo_exists():
+            dialog.lift()
+            dialog.focus_force()
+            return
+        log_event(
+            "update.login.details_opened",
+            current_version=info.current_version,
+            latest_version=info.latest_version,
+        )
+        self._update_details_dialog = UpdateNotesDialog(
+            self,
+            info,
+            on_update=lambda: self._accept_update_details(info),
+            on_close=self._clear_update_details,
+        )
+
+    def _accept_update_details(self, info: Any) -> None:
+        log_event(
+            "update.login.accepted",
+            current_version=info.current_version,
+            latest_version=info.latest_version,
+        )
+        self._download_login_update(info)
+
+    def _clear_update_details(self) -> None:
+        if (
+            self._update_details_dialog is not None
+            and not self._update_details_dialog.winfo_exists()
+        ):
+            self._update_details_dialog = None
+
+    def _close_update_details(self) -> None:
+        dialog = self._update_details_dialog
+        self._update_details_dialog = None
+        if dialog is not None and dialog.winfo_exists():
+            dialog.close()
 
     def _update_check_failed(self, error: str, manual: bool) -> None:
         self._update_check_running = False
+        log_event(
+            "update.login.check_failed",
+            manual=manual,
+            error=error,
+        )
         if manual:
-            self._set_status(f"检查更新失败：{error}", error=True)
+            self._set_status(
+                f"检查更新失败：{error}{self._log_directory_hint()}",
+                error=True,
+            )
 
     def _download_login_update(self, info: Any) -> None:
-        self._set_status(f"正在下载 {info.latest_version}…")
+        if self._update_in_progress or self._update_worker_active:
+            self._set_status("更新任务已经开始，请等待完成。", error=True)
+            return
+        self._update_worker_active = True
+        self._update_install_started = False
+        self._set_update_lock(True)
+        self._create_login_update_dialog(info)
+        self._set_status(f"正在更新到 {info.latest_version}…")
+        last_progress = {"at": 0.0, "message": ""}
+
+        def progress(message: str, current: int, total: int) -> None:
+            now = time.monotonic()
+            if message != last_progress["message"]:
+                log_event(
+                    "update.login.stage",
+                    latest_version=info.latest_version,
+                    stage=message,
+                    current=current,
+                    total=total,
+                )
+            immediate = (
+                message != last_progress["message"]
+                or current <= 0
+                or total <= 0
+                or (total > 0 and current >= total)
+            )
+            if not immediate and now - last_progress["at"] < 0.12:
+                return
+            last_progress["at"] = now
+            last_progress["message"] = message
+            self._queue.put(
+                (
+                    self._login_update_progress,
+                    (message, current, total),
+                )
+            )
 
         def worker() -> None:
             try:
                 staged = download_and_stage_update(
                     info,
                     self.paths.project_dir,
+                    progress=progress,
                 )
             except Exception as exc:
                 self._queue.put(
@@ -1005,35 +1309,135 @@ class AuthWindow(tk.Tk):
             name="langlang-login-update-download",
         ).start()
 
+    def _create_login_update_dialog(self, info: Any) -> None:
+        if self._login_update_dialog is not None:
+            try:
+                if self._login_update_dialog.winfo_exists():
+                    return
+            except tk.TclError:
+                pass
+        dialog = tk.Toplevel(self)
+        dialog.title("正在更新（不可关闭）")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.configure(bg=COLORS["panel"])
+        dialog.protocol("WM_DELETE_WINDOW", self._guard_close_during_update)
+        dialog.attributes("-topmost", True)
+        panel = UpdateProgressPanel(
+            dialog,
+            current_version=str(info.current_version),
+            latest_version=str(info.latest_version),
+            colors=COLORS,
+        )
+        panel.pack(fill="both", expand=True)
+        dialog.update_idletasks()
+        width = max(540, dialog.winfo_reqwidth())
+        height = max(250, dialog.winfo_reqheight())
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.grab_set()
+        dialog.lift()
+        self._login_update_dialog = dialog
+        self._login_update_panel = panel
+
+    def _login_update_progress(
+        self,
+        message: str,
+        current: int,
+        total: int,
+    ) -> None:
+        panel = self._login_update_panel
+        if panel is None:
+            return
+        try:
+            if panel.winfo_exists():
+                panel.set_progress(message, current, total)
+        except tk.TclError:
+            return
+
     def _login_update_failed(self, error: str) -> None:
-        self._set_status("更新下载失败。", error=True)
+        self._update_worker_active = False
+        self._update_install_started = False
+        log_event(
+            "update.login.failed",
+            error=error,
+        )
+        panel = self._login_update_panel
+        if panel is not None:
+            try:
+                if panel.winfo_exists():
+                    panel.mark_error(error)
+            except tk.TclError:
+                pass
+        self._destroy_login_update_dialog()
+        self._set_update_lock(False)
+        self._set_status(
+            f"自动更新失败：{error}{self._log_directory_hint()}",
+            error=True,
+        )
         messagebox.showerror("自动更新失败", error, parent=self)
 
     def _login_update_ready(self, staged: Any) -> None:
-        if not messagebox.askyesno(
-            "更新已就绪",
-            (
-                f"{staged.version} 已下载并通过校验。\n\n"
-                "点击“是”后软件将关闭、替换程序并自动重启。"
-                "账号、店铺、密钥和登录状态不会覆盖。"
-            ),
-            parent=self,
-        ):
-            self._set_status("更新已下载，可稍后重新检查更新。")
-            return
+        self._update_worker_active = False
+        log_event(
+            "update.login.ready",
+            latest_version=staged.version,
+        )
+        panel = self._login_update_panel
+        if panel is not None:
+            try:
+                if panel.winfo_exists():
+                    panel.mark_installing()
+            except tk.TclError:
+                pass
         try:
-            log_path = launch_update_installer(
+            launch_update_installer(
                 staged,
                 self.paths.project_dir,
             )
         except Exception as exc:
             self._login_update_failed(str(exc))
             return
-        self._set_status(f"更新准备完成，软件将自动重启：{log_path}")
-        force_exit = threading.Timer(2.0, lambda: os._exit(0))
-        force_exit.daemon = True
-        force_exit.start()
-        self.after(250, self._close)
+        self._update_install_started = True
+        log_event(
+            "update.login.install_started",
+            latest_version=staged.version,
+        )
+        self._set_status(
+            f"{staged.version} 更新包已通过校验，正在自动安装并重启。"
+        )
+        if self._login_update_dialog is not None:
+            try:
+                self._login_update_dialog.title("正在安装更新（不可关闭）")
+            except tk.TclError:
+                pass
+        self._schedule(1200, self._exit_after_update)
+
+    def _destroy_login_update_dialog(self) -> None:
+        dialog = self._login_update_dialog
+        self._login_update_dialog = None
+        self._login_update_panel = None
+        if dialog is None:
+            return
+        try:
+            if dialog.winfo_exists():
+                try:
+                    dialog.grab_release()
+                except tk.TclError:
+                    pass
+                dialog.destroy()
+        except tk.TclError:
+            pass
+
+    def _exit_after_update(self) -> None:
+        log_event("update.login.restarting")
+        self.result = None
+        self._cancel_scheduled()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
 
     def _load_saved_accounts(self) -> None:
         for child in self._saved_box.winfo_children():
@@ -1087,6 +1491,9 @@ class AuthWindow(tk.Tk):
         )
 
     def _login(self) -> None:
+        if self._update_in_progress:
+            self._set_status("正在更新，请等待完成。", error=True)
+            return
         username = self.login_account.get().strip()
         password = self.login_password.get()
         if not username:
@@ -1097,6 +1504,10 @@ class AuthWindow(tk.Tk):
             self._set_status("请输入密码。", error=True)
             return
         remember = bool(self.remember_var.get())
+        log_event(
+            "auth.login_started",
+            account=username,
+        )
 
         def work() -> AuthContext:
             if password:
@@ -1200,7 +1611,15 @@ class AuthWindow(tk.Tk):
         dialog.grab_set()
 
     def _authorized(self, context: AuthContext) -> None:
+        if self._update_in_progress:
+            return
         self._context = context
+        log_event(
+            "auth.login_succeeded",
+            account=context.username,
+            account_id=context.account_id,
+            license_active=bool(context.license.active),
+        )
         if license_allows_entry(context.license):
             self.result = context
             self._cancel_scheduled()
@@ -1399,6 +1818,9 @@ class AuthWindow(tk.Tk):
         self._finish()
 
     def _finish(self) -> None:
+        if self._update_in_progress:
+            self._set_status("正在更新，请等待完成。", error=True)
+            return
         if self._context is None or not license_allows_entry(self._context.license):
             self._set_status("请先完成卡密授权。", error=True)
             return
@@ -1407,7 +1829,11 @@ class AuthWindow(tk.Tk):
         self.destroy()
 
     def _close(self) -> None:
+        if self._update_in_progress:
+            self._guard_close_during_update()
+            return
         self.result = None
+        log_event("auth.window_closed")
         self._cancel_scheduled()
         try:
             if not self.winfo_exists():

@@ -158,6 +158,26 @@ class TesterAuthService:
             )
         return context
 
+    def logout(
+        self,
+        context: AuthContext,
+        *,
+        forget_local: bool = False,
+    ) -> None:
+        error: Exception | None = None
+        if self.remote_service is not None and context.tokens.access_token:
+            try:
+                self._remote().logout(
+                    context,
+                    forget_local=False,
+                )
+            except Exception as exc:
+                error = exc
+        if forget_local:
+            self.store.remove(context.account_id)
+        if error is not None:
+            raise error
+
     def restore_account(self, account: SavedAccount) -> AuthContext:
         if not self._is_local_account(account.account_id):
             return self._remote().restore_account(account)

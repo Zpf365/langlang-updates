@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .dongxiao.infrastructure.migrations import migrate_dongxiao_schema
 from .models import (
     ORDER_STATUS,
     PRODUCT_STATUS,
@@ -17,8 +18,27 @@ from .models import (
     Store,
     product_matches_tab,
 )
-from .sales_related.migrations import migrate_sales_related_schema
+from .address_parser import address_is_complete
 from .security import CredentialProtector
+
+STORE_SCOPED_SETTING_PREFIXES = (
+    "after_sales_last_sync_",
+    "after_sales_full_sync_at_",
+    "after_sales_coverage_start_",
+    "after_sales_coverage_end_",
+    "analytics_product_backfill_at_",
+    "double11_last_result_",
+    "double11_prefill_",
+    "hosted_config_extra_",
+    "hosted_latest_league_",
+    "hosted_listing_count_",
+    "hosted_listing_mode_",
+    "orders_day_backfill_",
+    "product_quota_",
+    "store_metrics_",
+    "webui_previous_store_metrics_",
+    "webui_store_score_state_",
+)
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -52,6 +72,48 @@ CREATE TABLE IF NOT EXISTS store_groups (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS store_credential_states (
+    store_id INTEGER PRIMARY KEY,
+    state TEXT NOT NULL DEFAULT 'unknown',
+    last_probe_at TEXT,
+    last_success_at TEXT,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS store_credential_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id INTEGER NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'wechat_shop',
+    secret_protected BLOB NOT NULL,
+    secret_fingerprint TEXT NOT NULL,
+    source_kind TEXT NOT NULL DEFAULT '',
+    source_name TEXT NOT NULL DEFAULT '',
+    source_row INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'pending',
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    validating_started_at TEXT,
+    created_at TEXT NOT NULL,
+    validated_at TEXT,
+    applied_at TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(store_id, secret_fingerprint),
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_credential_candidates_state
+    ON store_credential_candidates(store_id, state, id DESC);
+
+CREATE TRIGGER IF NOT EXISTS trg_store_credential_state_after_insert
+AFTER INSERT ON stores
+BEGIN
+    INSERT OR IGNORE INTO store_credential_states(store_id, state)
+    VALUES (NEW.id, 'unknown');
+END;
+
 CREATE TABLE IF NOT EXISTS orders (
     store_id INTEGER NOT NULL,
     order_id TEXT NOT NULL,
@@ -74,6 +136,19 @@ CREATE TABLE IF NOT EXISTS orders (
     synced_at TEXT NOT NULL,
     PRIMARY KEY (store_id, order_id),
     FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS order_address_cache (
+    store_id INTEGER NOT NULL,
+    order_id TEXT NOT NULL,
+    payload_protected BLOB NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    source_updated_at TEXT NOT NULL DEFAULT '',
+    confirmed_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(store_id, order_id),
+    FOREIGN KEY (store_id, order_id)
+        REFERENCES orders(store_id, order_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(create_time DESC);
@@ -141,11 +216,22 @@ CREATE TABLE IF NOT EXISTS order_dispatch_tasks (
     product_id TEXT NOT NULL DEFAULT '',
     store_sku_id TEXT NOT NULL DEFAULT '',
     purchase_link_id INTEGER,
+    procurement_order_id INTEGER,
     source_url TEXT NOT NULL DEFAULT '',
     platform TEXT NOT NULL DEFAULT '',
     quantity INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'pending',
     error TEXT NOT NULL DEFAULT '',
+    purchase_amount INTEGER NOT NULL DEFAULT 0,
+    purchase_sku_id TEXT NOT NULL DEFAULT '',
+    purchase_attrs_json TEXT NOT NULL DEFAULT '[]',
+    tracking_company TEXT NOT NULL DEFAULT '',
+    tracking_no TEXT NOT NULL DEFAULT '',
+    after_sale_stage TEXT NOT NULL DEFAULT '',
+    result_unknown INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TEXT NOT NULL DEFAULT '',
+    purchased_at TEXT NOT NULL DEFAULT '',
+    shipped_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(store_id, order_id, product_id, store_sku_id),
@@ -196,6 +282,8 @@ CREATE TABLE IF NOT EXISTS procurement_orders (
     goods_image TEXT NOT NULL DEFAULT '',
     goods_count INTEGER NOT NULL DEFAULT 0,
     pay_amount INTEGER NOT NULL DEFAULT 0,
+    carrier TEXT NOT NULL DEFAULT '',
+    tracking_time TEXT NOT NULL DEFAULT '',
     seller TEXT NOT NULL DEFAULT '',
     buyer TEXT NOT NULL DEFAULT '',
     raw_json TEXT NOT NULL DEFAULT '{}',
@@ -221,6 +309,69 @@ CREATE TABLE IF NOT EXISTS procurement_links (
         REFERENCES orders(store_id, order_id) ON DELETE CASCADE,
     FOREIGN KEY (procurement_order_id)
         REFERENCES procurement_orders(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS procurement_purchase_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id INTEGER NOT NULL,
+    order_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    link_id INTEGER NOT NULL DEFAULT 0,
+    store_sku_id TEXT NOT NULL DEFAULT '',
+    account_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    source_url TEXT NOT NULL DEFAULT '',
+    source_product_id TEXT NOT NULL DEFAULT '',
+    upstream_order_id TEXT NOT NULL,
+    trade_no TEXT NOT NULL DEFAULT '',
+    mail_no TEXT NOT NULL DEFAULT '',
+    carrier TEXT NOT NULL DEFAULT '',
+    upstream_shop TEXT NOT NULL DEFAULT '',
+    goods_title TEXT NOT NULL DEFAULT '',
+    upstream_sku TEXT NOT NULL DEFAULT '',
+    quantity INTEGER NOT NULL DEFAULT 0,
+    unit_amount INTEGER NOT NULL DEFAULT 0,
+    paid_amount INTEGER NOT NULL DEFAULT 0,
+    freight_amount INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT '',
+    status_text TEXT NOT NULL DEFAULT '',
+    purchased_at TEXT NOT NULL DEFAULT '',
+    estimated_profit INTEGER NOT NULL DEFAULT 0,
+    actual_profit INTEGER NOT NULL DEFAULT 0,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(
+        store_id, order_id, product_id, account_id, upstream_order_id
+    ),
+    FOREIGN KEY (store_id, order_id)
+        REFERENCES orders(store_id, order_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id) REFERENCES procurement_accounts(id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_procurement_purchase_order_product
+    ON procurement_purchase_records(store_id, order_id, product_id);
+CREATE INDEX IF NOT EXISTS idx_procurement_purchase_link
+    ON procurement_purchase_records(store_id, order_id, product_id, link_id);
+
+CREATE TABLE IF NOT EXISTS procurement_purchase_attempts (
+    store_id INTEGER NOT NULL,
+    order_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    link_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    platform TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    opened_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(store_id, order_id, product_id, link_id),
+    FOREIGN KEY (store_id, order_id)
+        REFERENCES orders(store_id, order_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id) REFERENCES procurement_accounts(id)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS hosted_configs (
@@ -338,6 +489,9 @@ CREATE TABLE IF NOT EXISTS product_metrics (
     product_id TEXT NOT NULL,
     views30 INTEGER NOT NULL DEFAULT 0,
     sold30 INTEGER NOT NULL DEFAULT 0,
+    views30_available INTEGER NOT NULL DEFAULT 0,
+    sold30_available INTEGER NOT NULL DEFAULT 0,
+    recommend_views30 INTEGER,
     click_cnt INTEGER NOT NULL DEFAULT 0,
     click_uv INTEGER NOT NULL DEFAULT 0,
     pay_cnt INTEGER NOT NULL DEFAULT 0,
@@ -510,6 +664,7 @@ CREATE TABLE IF NOT EXISTS product_purchase_links (
     product_id TEXT NOT NULL,
     source_url TEXT NOT NULL DEFAULT '',
     platform TEXT NOT NULL DEFAULT '',
+    account_id INTEGER,
     use_transfer_warehouse INTEGER NOT NULL DEFAULT 0,
     commission_pct REAL NOT NULL DEFAULT 0,
     note TEXT NOT NULL DEFAULT '',
@@ -557,6 +712,68 @@ CREATE TABLE IF NOT EXISTS activity_operation_runs (
 CREATE INDEX IF NOT EXISTS idx_activity_operation_runs_created
     ON activity_operation_runs(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS activity_renewal_configs (
+    store_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    hours_before INTEGER NOT NULL DEFAULT 6,
+    duration_days INTEGER NOT NULL DEFAULT 7,
+    next_scan_at INTEGER NOT NULL DEFAULT 0,
+    last_checked_at INTEGER NOT NULL DEFAULT 0,
+    last_success_at INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS activity_renewal_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id INTEGER NOT NULL,
+    source_activity_id TEXT NOT NULL,
+    source_end_time INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_checked_at INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL DEFAULT 0,
+    new_activity_id TEXT NOT NULL DEFAULT '',
+    new_start_time INTEGER NOT NULL DEFAULT 0,
+    new_end_time INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(store_id, source_activity_id, source_end_time),
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_renewal_runs_store
+    ON activity_renewal_runs(store_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_renewal_runs_status
+    ON activity_renewal_runs(status, next_retry_at);
+
+CREATE TABLE IF NOT EXISTS activity_auto_create_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id INTEGER NOT NULL,
+    product_id TEXT NOT NULL,
+    observed_date TEXT NOT NULL,
+    rule_version TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL DEFAULT 0,
+    activity_id TEXT NOT NULL DEFAULT '',
+    start_time INTEGER NOT NULL DEFAULT 0,
+    end_time INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_checked_at INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_auto_create_store
+    ON activity_auto_create_runs(store_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_auto_create_status
+    ON activity_auto_create_runs(status, next_retry_at);
+
 CREATE TABLE IF NOT EXISTS analytics_daily (
     store_id INTEGER NOT NULL,
     business_date TEXT NOT NULL,
@@ -571,6 +788,50 @@ CREATE TABLE IF NOT EXISTS analytics_daily (
     synced_at TEXT NOT NULL,
     PRIMARY KEY (store_id, business_date),
     FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS analytics_outbox (
+    event_id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    business_key TEXT NOT NULL DEFAULT '',
+    event_type TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    endpoint TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    device_ref TEXT NOT NULL,
+    store_ref TEXT NOT NULL DEFAULT '',
+    batch_id TEXT NOT NULL,
+    payload_protected BLOB NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 1,
+    aggregation TEXT NOT NULL DEFAULT 'event',
+    revision INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error_category TEXT NOT NULL DEFAULT '',
+    next_attempt_at TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    sent_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_pending
+    ON analytics_outbox(status, next_attempt_at, priority, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_type
+    ON analytics_outbox(event_type, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_outbox_business
+    ON analytics_outbox(business_key, status, revision DESC);
+
+CREATE TABLE IF NOT EXISTS analytics_daily_counters (
+    business_key TEXT PRIMARY KEY,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    task_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    count INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS coupons (
@@ -611,6 +872,37 @@ CREATE INDEX IF NOT EXISTS idx_task_logs_started
 CREATE INDEX IF NOT EXISTS idx_task_logs_scope
     ON task_logs(scope, started_at DESC);
 
+CREATE TABLE IF NOT EXISTS operation_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    store_id INTEGER,
+    product_id TEXT NOT NULL DEFAULT '',
+    alert_key TEXT NOT NULL,
+    category TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    priority TEXT NOT NULL DEFAULT 'P1',
+    status TEXT NOT NULL DEFAULT 'open',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    due_at TEXT,
+    created_by TEXT NOT NULL DEFAULT '',
+    completed_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_tasks_status
+    ON operation_tasks(status, priority, due_at);
+CREATE INDEX IF NOT EXISTS idx_operation_tasks_store_product
+    ON operation_tasks(store_id, product_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS operation_rules (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS upload_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     store_id INTEGER NOT NULL,
@@ -641,6 +933,9 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 def _incoming_session_is_not_older(
@@ -752,9 +1047,64 @@ class Database:
                 }.issubset(procurement_columns)
             ):
                 self._create_migration_backup("pre-procurement-account-fields")
+            if existing_tables and (
+                "store_credential_candidates" not in existing_tables
+                or "store_credential_states" not in existing_tables
+            ):
+                self._create_migration_backup("pre-store-credential-recovery")
         with self.connect() as conn:
+            self._ensure_analytics_columns_before_schema(conn)
             conn.executescript(SCHEMA)
             self._migrate_procurement_link_scope(conn)
+            operation_task_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(operation_tasks)"
+                ).fetchall()
+            }
+            operation_task_migrations = {
+                "created_by": "TEXT NOT NULL DEFAULT ''",
+                "completed_by": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in operation_task_migrations.items():
+                if column not in operation_task_columns:
+                    conn.execute(
+                        "ALTER TABLE operation_tasks "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            product_metric_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(product_metrics)"
+                ).fetchall()
+            }
+            if "recommend_views30" not in product_metric_columns:
+                conn.execute(
+                    "ALTER TABLE product_metrics "
+                    "ADD COLUMN recommend_views30 INTEGER"
+                )
+            product_metric_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(product_metrics)"
+                ).fetchall()
+            }
+            availability_added = False
+            for column in ("views30_available", "sold30_available"):
+                if column not in product_metric_columns:
+                    conn.execute(
+                        "ALTER TABLE product_metrics "
+                        f"ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
+                    availability_added = True
+            if availability_added:
+                conn.execute(
+                    """
+                    UPDATE product_metrics
+                    SET views30_available=1, sold30_available=1
+                    WHERE COALESCE(updated_at, '')<>''
+                    """
+                )
             existing_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(stores)").fetchall()
@@ -791,6 +1141,32 @@ class Database:
                         "ALTER TABLE procurement_accounts "
                         f"ADD COLUMN {column} {definition}"
                     )
+            purchase_record_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(procurement_purchase_records)"
+                ).fetchall()
+            }
+            purchase_record_migrations = {
+                "link_id": "INTEGER NOT NULL DEFAULT 0",
+                "trade_no": "TEXT NOT NULL DEFAULT ''",
+                "mail_no": "TEXT NOT NULL DEFAULT ''",
+                "carrier": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in purchase_record_migrations.items():
+                if column not in purchase_record_columns:
+                    conn.execute(
+                        "ALTER TABLE procurement_purchase_records "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_procurement_purchase_link
+                ON procurement_purchase_records(
+                    store_id, order_id, product_id, link_id
+                )
+                """
+            )
             now = _now()
             conn.execute(
                 """
@@ -813,6 +1189,45 @@ class Database:
                 WHERE TRIM(group_name) <> ''
                 """,
                 (now, now),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO store_credential_states(store_id, state)
+                SELECT id, 'unknown' FROM stores
+                """
+            )
+            conn.execute(
+                """
+                UPDATE analytics_outbox
+                SET status='pending',
+                    next_attempt_at=?,
+                    updated_at=?
+                WHERE status='sending'
+                  AND COALESCE(updated_at, '') < ?
+                """,
+                (
+                    now,
+                    now,
+                    (
+                        datetime.now(UTC) - timedelta(minutes=2)
+                    ).isoformat(timespec="seconds"),
+                ),
+            )
+            stale_cutoff = (
+                datetime.now(UTC) - timedelta(minutes=15)
+            ).isoformat(timespec="seconds")
+            conn.execute(
+                """
+                UPDATE store_credential_candidates
+                SET state='pending',
+                    validating_started_at=NULL,
+                    last_error_code='interrupted',
+                    last_error_message='上次验证中断，已恢复为待验证',
+                    updated_at=?
+                WHERE state='validating'
+                  AND COALESCE(validating_started_at, '') < ?
+                """,
+                (now, stale_cutoff),
             )
             workbench_columns = {
                 row["name"]
@@ -837,6 +1252,96 @@ class Database:
                         "ALTER TABLE order_workbench "
                         f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
                     )
+            dispatch_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(order_dispatch_tasks)"
+                ).fetchall()
+            }
+            dispatch_migrations = {
+                "procurement_order_id": "INTEGER",
+                "purchase_amount": "INTEGER NOT NULL DEFAULT 0",
+                "purchase_sku_id": "TEXT NOT NULL DEFAULT ''",
+                "purchase_attrs_json": "TEXT NOT NULL DEFAULT '[]'",
+                "tracking_company": "TEXT NOT NULL DEFAULT ''",
+                "tracking_no": "TEXT NOT NULL DEFAULT ''",
+                "after_sale_stage": "TEXT NOT NULL DEFAULT ''",
+                "result_unknown": "INTEGER NOT NULL DEFAULT 0",
+                "last_checked_at": "TEXT NOT NULL DEFAULT ''",
+                "purchased_at": "TEXT NOT NULL DEFAULT ''",
+                "shipped_at": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in dispatch_migrations.items():
+                if column not in dispatch_columns:
+                    conn.execute(
+                        "ALTER TABLE order_dispatch_tasks "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            procurement_order_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(procurement_orders)"
+                ).fetchall()
+            }
+            for column in ("carrier", "tracking_time"):
+                if column not in procurement_order_columns:
+                    conn.execute(
+                        "ALTER TABLE procurement_orders "
+                        f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
+            product_link_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(product_purchase_links)"
+                ).fetchall()
+            }
+            if "account_id" not in product_link_columns:
+                conn.execute(
+                    "ALTER TABLE product_purchase_links "
+                    "ADD COLUMN account_id INTEGER"
+                )
+            analytics_outbox_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(analytics_outbox)"
+                ).fetchall()
+            }
+            if (
+                analytics_outbox_columns
+                and "last_error_category" not in analytics_outbox_columns
+            ):
+                conn.execute(
+                    "ALTER TABLE analytics_outbox "
+                    "ADD COLUMN last_error_category TEXT NOT NULL DEFAULT ''"
+                )
+            analytics_outbox_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(analytics_outbox)"
+                ).fetchall()
+            }
+            analytics_outbox_migrations = {
+                "business_key": "TEXT NOT NULL DEFAULT ''",
+                "aggregation": "TEXT NOT NULL DEFAULT 'event'",
+                "revision": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in analytics_outbox_migrations.items():
+                if column not in analytics_outbox_columns:
+                    conn.execute(
+                        "ALTER TABLE analytics_outbox "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            counter_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(analytics_daily_counters)"
+                ).fetchall()
+            }
+            if counter_columns and "count" not in counter_columns:
+                conn.execute(
+                    "ALTER TABLE analytics_daily_counters "
+                    "ADD COLUMN count INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO product_catalog (
@@ -849,16 +1354,63 @@ class Database:
                 (now, now, now),
             )
             conn.commit()
-            migrate_sales_related_schema(
-                conn,
-                self.path,
-                self._create_migration_backup,
-            )
-            migrate_dongxiao_schema(
-                conn,
-                self.path,
-                self._create_migration_backup,
-            )
+            self._run_isolated_schema_migrations(conn)
+
+    @staticmethod
+    def _ensure_analytics_columns_before_schema(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Add columns used by schema indexes before CREATE INDEX runs."""
+        exists = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='analytics_outbox'
+            """
+        ).fetchone()
+        if not exists:
+            return
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(analytics_outbox)"
+            ).fetchall()
+        }
+        migrations = {
+            "business_key": "TEXT NOT NULL DEFAULT ''",
+            "aggregation": "TEXT NOT NULL DEFAULT 'event'",
+            "revision": "INTEGER NOT NULL DEFAULT 0",
+            "last_error_category": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in migrations.items():
+            if column not in columns:
+                conn.execute(
+                    "ALTER TABLE analytics_outbox "
+                    f"ADD COLUMN {column} {definition}"
+                )
+
+    def _run_isolated_schema_migrations(self, conn: sqlite3.Connection) -> None:
+        """Run legacy sales migrations only when explicitly re-enabled.
+
+        The production application must not import the isolated runtime during
+        normal startup, database initialization, or PyInstaller analysis.
+        Existing tables and historical data are never deleted or rewritten by
+        this switch.
+        """
+        if os.environ.get("LANGLANG_ENABLE_DONGXIAO_ISOLATED") != "1":
+            return
+        from .dongxiao.infrastructure.migrations import migrate_dongxiao_schema
+        from .sales_related.migrations import migrate_sales_related_schema
+
+        migrate_sales_related_schema(
+            conn,
+            self.path,
+            self._create_migration_backup,
+        )
+        migrate_dongxiao_schema(
+            conn,
+            self.path,
+            self._create_migration_backup,
+        )
 
     @staticmethod
     def _procurement_link_scope_needs_migration(
@@ -1122,6 +1674,12 @@ class Database:
     def store_metric_map(self) -> dict[int, dict[str, Any]]:
         metrics = self.store_summary_map()
         with self.connect() as conn:
+            store_owners = {
+                int(row["id"]): str(row["app_id"])
+                for row in conn.execute(
+                    "SELECT id, app_id FROM stores"
+                ).fetchall()
+            }
             rows = conn.execute(
                 """
                 SELECT key, value FROM app_settings
@@ -1142,6 +1700,21 @@ class Database:
             except (TypeError, ValueError):
                 continue
             if store_id not in metrics or not isinstance(cached, dict):
+                continue
+            cache_store_id = cached.get("_cache_store_id")
+            if cache_store_id is not None:
+                try:
+                    owner_store_id = int(cache_store_id)
+                except (TypeError, ValueError):
+                    continue
+                if owner_store_id != store_id:
+                    continue
+            cache_app_id = cached.get("_cache_store_app_id")
+            if (
+                cache_app_id is not None
+                and str(cache_app_id)
+                != store_owners.get(store_id, "")
+            ):
                 continue
             metrics[store_id].update(cached)
         for row in quota_rows:
@@ -1502,6 +2075,26 @@ class Database:
                             int(current["id"]),
                         ),
                     )
+                    conn.execute(
+                        """
+                        INSERT INTO store_credential_states(store_id, state)
+                        VALUES (?, 'unknown')
+                        ON CONFLICT(store_id) DO UPDATE SET
+                            state='unknown', last_error_code='',
+                            last_error_message='', consecutive_failures=0
+                        """,
+                        (int(current["id"]),),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE store_credential_candidates
+                        SET state='superseded', validating_started_at=NULL,
+                            validated_at=?, updated_at=?
+                        WHERE store_id=?
+                          AND state IN ('pending', 'validating')
+                        """,
+                        (now, now, int(current["id"])),
+                    )
                 else:
                     conn.execute(
                         """
@@ -1525,30 +2118,77 @@ class Database:
         name: str,
         group_name: str,
         secret: str | None = None,
+        app_id: str | None = None,
     ) -> None:
         now = _now()
+        updates = {
+            "name": name.strip(),
+            "group_name": group_name.strip(),
+            "updated_at": now,
+        }
+        if app_id is not None and app_id.strip():
+            updates["app_id"] = app_id.strip()
+        if secret is not None and secret.strip():
+            updates["secret_protected"] = self.protector.protect(secret.strip())
+            updates["status"] = "未验证"
+        assignments = ", ".join(f"{column}=?" for column in updates)
         with self.connect() as conn:
             self._ensure_store_group(conn, group_name, now)
-            if secret is not None and secret.strip():
+            conn.execute(
+                f"UPDATE stores SET {assignments} WHERE id=?",
+                (*updates.values(), store_id),
+            )
+            if "secret_protected" in updates or "app_id" in updates:
                 conn.execute(
                     """
-                    UPDATE stores
-                    SET name=?, group_name=?, secret_protected=?, status='未验证', updated_at=?
-                    WHERE id=?
+                    INSERT INTO store_credential_states(store_id, state)
+                    VALUES (?, 'unknown')
+                    ON CONFLICT(store_id) DO UPDATE SET
+                        state='unknown', last_error_code='',
+                        last_error_message='', consecutive_failures=0
                     """,
-                    (
-                        name.strip(),
-                        group_name.strip(),
-                        self.protector.protect(secret.strip()),
-                        now,
-                        store_id,
-                    ),
+                    (store_id,),
                 )
-            else:
                 conn.execute(
-                    "UPDATE stores SET name=?, group_name=?, updated_at=? WHERE id=?",
-                    (name.strip(), group_name.strip(), now, store_id),
+                    """
+                    UPDATE store_credential_candidates
+                    SET state='superseded', validating_started_at=NULL,
+                        validated_at=?, updated_at=?
+                    WHERE store_id=? AND state IN ('pending', 'validating')
+                    """,
+                    (now, now, store_id),
                 )
+
+    def replace_placeholder_store_name(
+        self,
+        store_id: int,
+        app_id: str,
+        display_name: str,
+    ) -> bool:
+        """Replace only an AppID placeholder, never a user-renamed store."""
+        resolved_name = str(display_name or "").strip()
+        expected_app_id = str(app_id or "").strip()
+        if not resolved_name or resolved_name == expected_app_id:
+            return False
+        now = _now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE stores
+                SET name=?, updated_at=?
+                WHERE id=?
+                  AND TRIM(app_id)=?
+                  AND (TRIM(name)='' OR LOWER(TRIM(name))=LOWER(?))
+                """,
+                (
+                    resolved_name,
+                    now,
+                    int(store_id),
+                    expected_app_id,
+                    expected_app_id,
+                ),
+            )
+            return cursor.rowcount > 0
 
     def set_store_groups(
         self,
@@ -1582,6 +2222,638 @@ class Database:
         protected = row["secret_protected"]
         secret = self.protector.unprotect(protected) if protected else ""
         return self._store_from_row(row), secret
+
+    def store_credential_state_map(self) -> dict[int, dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM store_credential_states"
+            ).fetchall()
+        return {
+            int(row["store_id"]): dict(row)
+            for row in rows
+        }
+
+    def get_store_credential_state(self, store_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM store_credential_states WHERE store_id=?",
+                (int(store_id),),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO store_credential_states(store_id, state)
+                    VALUES (?, 'unknown')
+                    """,
+                    (int(store_id),),
+                )
+                row = conn.execute(
+                    "SELECT * FROM store_credential_states WHERE store_id=?",
+                    (int(store_id),),
+                ).fetchone()
+        return dict(row) if row else {
+            "store_id": int(store_id),
+            "state": "unknown",
+            "last_probe_at": None,
+            "last_success_at": None,
+            "last_error_code": "",
+            "last_error_message": "",
+            "consecutive_failures": 0,
+        }
+
+    def set_store_credential_state(
+        self,
+        store_id: int,
+        state: str,
+        *,
+        error_code: str = "",
+        error_message: str = "",
+        mark_probe: bool = False,
+    ) -> dict[str, Any]:
+        if state not in {"unknown", "valid", "invalid", "probing"}:
+            raise ValueError("不支持的凭据状态")
+        now = _now()
+        with self.connect() as conn:
+            previous = conn.execute(
+                """
+                SELECT consecutive_failures
+                FROM store_credential_states
+                WHERE store_id=?
+                """,
+                (int(store_id),),
+            ).fetchone()
+            failures = int(previous["consecutive_failures"] or 0) if previous else 0
+            if state == "valid":
+                failures = 0
+            elif state == "invalid":
+                failures += 1
+            conn.execute(
+                """
+                INSERT INTO store_credential_states(
+                    store_id, state, last_probe_at, last_success_at,
+                    last_error_code, last_error_message, consecutive_failures
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_id) DO UPDATE SET
+                    state=excluded.state,
+                    last_probe_at=CASE
+                        WHEN ? THEN excluded.last_probe_at
+                        ELSE store_credential_states.last_probe_at
+                    END,
+                    last_success_at=CASE
+                        WHEN excluded.state='valid' THEN excluded.last_success_at
+                        ELSE store_credential_states.last_success_at
+                    END,
+                    last_error_code=excluded.last_error_code,
+                    last_error_message=excluded.last_error_message,
+                    consecutive_failures=excluded.consecutive_failures
+                """,
+                (
+                    int(store_id),
+                    state,
+                    now if mark_probe or state in {"valid", "invalid", "probing"} else None,
+                    now if state == "valid" else None,
+                    str(error_code or "")[:120],
+                    str(error_message or "")[:1000],
+                    failures,
+                    1 if mark_probe or state in {"valid", "invalid", "probing"} else 0,
+                ),
+            )
+        return self.get_store_credential_state(store_id)
+
+    def list_store_credential_candidates(
+        self,
+        store_id: int | None = None,
+        *,
+        states: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT id, store_id, provider, secret_fingerprint, source_kind,
+                   source_name, source_row, state, last_error_code,
+                   last_error_message, validating_started_at, created_at,
+                   validated_at, applied_at, updated_at
+            FROM store_credential_candidates
+            WHERE 1=1
+        """
+        args: list[Any] = []
+        if store_id is not None:
+            sql += " AND store_id=?"
+            args.append(int(store_id))
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            sql += f" AND state IN ({placeholders})"
+            args.extend(states)
+        sql += " ORDER BY id DESC"
+        with self.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(sql, args).fetchall()
+            ]
+
+    def get_store_credential_candidate_secret(
+        self,
+        candidate_id: int,
+    ) -> tuple[dict[str, Any], str]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM store_credential_candidates WHERE id=?",
+                (int(candidate_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError("凭据候选不存在")
+        item = dict(row)
+        protected = item.pop("secret_protected", b"")
+        secret = self.protector.unprotect(protected) if protected else ""
+        return item, secret
+
+    def create_store_credential_candidate(
+        self,
+        store_id: int,
+        secret: str,
+        *,
+        source_kind: str,
+        source_name: str,
+        source_row: int,
+    ) -> dict[str, Any]:
+        normalized = str(secret or "").strip()
+        if not normalized:
+            raise ValueError("候选密钥不能为空")
+        fingerprint = hashlib.sha256(
+            normalized.encode("utf-8")
+        ).hexdigest()
+        protected = self.protector.protect(normalized)
+        now = _now()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM stores WHERE id=?",
+                (int(store_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("店铺不存在")
+            conn.execute(
+                """
+                INSERT INTO store_credential_candidates(
+                    store_id, provider, secret_protected, secret_fingerprint,
+                    source_kind, source_name, source_row, state,
+                    created_at, updated_at
+                ) VALUES (?, 'wechat_shop', ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(store_id, secret_fingerprint) DO UPDATE SET
+                    source_kind=excluded.source_kind,
+                    source_name=excluded.source_name,
+                    source_row=excluded.source_row,
+                    state=CASE
+                        WHEN store_credential_candidates.state='superseded'
+                        THEN 'pending'
+                        ELSE store_credential_candidates.state
+                    END,
+                    last_error_code=CASE
+                        WHEN store_credential_candidates.state='superseded'
+                        THEN ''
+                        ELSE store_credential_candidates.last_error_code
+                    END,
+                    last_error_message=CASE
+                        WHEN store_credential_candidates.state='superseded'
+                        THEN ''
+                        ELSE store_credential_candidates.last_error_message
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    int(store_id),
+                    protected,
+                    fingerprint,
+                    str(source_kind or "")[:40],
+                    str(source_name or "")[:240],
+                    int(source_row or 0),
+                    now,
+                    now,
+                ),
+            )
+            candidate = conn.execute(
+                """
+                SELECT id, store_id, provider, secret_fingerprint,
+                       source_kind, source_name, source_row, state,
+                       last_error_code, last_error_message,
+                       validating_started_at, created_at, validated_at,
+                       applied_at, updated_at
+                FROM store_credential_candidates
+                WHERE store_id=? AND secret_fingerprint=?
+                """,
+                (int(store_id), fingerprint),
+            ).fetchone()
+        return dict(candidate) if candidate else {}
+
+    def claim_pending_credential_candidate(
+        self,
+        store_id: int,
+    ) -> dict[str, Any] | None:
+        now = _now()
+        stale_cutoff = (
+            datetime.now(UTC) - timedelta(minutes=15)
+        ).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE store_credential_candidates
+                SET state='pending',
+                    validating_started_at=NULL,
+                    last_error_code='interrupted',
+                    last_error_message='上次验证中断，已恢复为待验证',
+                    updated_at=?
+                WHERE store_id=? AND state='validating'
+                  AND COALESCE(validating_started_at, '') < ?
+                """,
+                (now, int(store_id), stale_cutoff),
+            )
+            active = conn.execute(
+                """
+                SELECT id FROM store_credential_candidates
+                WHERE store_id=? AND state='validating'
+                LIMIT 1
+                """,
+                (int(store_id),),
+            ).fetchone()
+            if active is not None:
+                return None
+            state = conn.execute(
+                """
+                SELECT state FROM store_credential_states
+                WHERE store_id=?
+                """,
+                (int(store_id),),
+            ).fetchone()
+            if state is None or str(state["state"] or "") != "invalid":
+                return None
+            candidate = conn.execute(
+                """
+                SELECT id FROM store_credential_candidates
+                WHERE store_id=? AND state='pending'
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (int(store_id),),
+            ).fetchone()
+            if candidate is None:
+                return None
+            conn.execute(
+                """
+                UPDATE store_credential_candidates
+                SET state='validating', validating_started_at=?,
+                    last_error_code='', last_error_message='', updated_at=?
+                WHERE id=?
+                """,
+                (now, now, int(candidate["id"])),
+            )
+            row = conn.execute(
+                """
+                SELECT id, store_id, provider, secret_fingerprint,
+                       source_kind, source_name, source_row, state,
+                       last_error_code, last_error_message,
+                       validating_started_at, created_at, validated_at,
+                       applied_at, updated_at
+                FROM store_credential_candidates WHERE id=?
+                """,
+                (int(candidate["id"]),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def release_credential_candidate(
+        self,
+        candidate_id: int,
+        *,
+        state: str = "pending",
+        error_code: str = "",
+        error_message: str = "",
+    ) -> None:
+        if state not in {"pending", "invalid", "superseded", "applied"}:
+            raise ValueError("不支持的候选凭据状态")
+        now = _now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE store_credential_candidates
+                SET state=?, validating_started_at=NULL,
+                    last_error_code=?, last_error_message=?,
+                    validated_at=CASE
+                        WHEN ? IN ('invalid', 'applied') THEN ?
+                        ELSE validated_at
+                    END,
+                    applied_at=CASE
+                        WHEN ?='applied' THEN ?
+                        ELSE applied_at
+                    END,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    state,
+                    str(error_code or "")[:120],
+                    str(error_message or "")[:1000],
+                    state,
+                    now,
+                    state,
+                    now,
+                    now,
+                    int(candidate_id),
+                ),
+            )
+
+    def supersede_store_credential_candidates(
+        self,
+        store_id: int,
+        *,
+        except_id: int | None = None,
+    ) -> int:
+        now = _now()
+        sql = """
+            UPDATE store_credential_candidates
+            SET state='superseded', validating_started_at=NULL,
+                validated_at=?, updated_at=?
+            WHERE store_id=? AND state IN ('pending', 'validating')
+        """
+        args: list[Any] = [now, now, int(store_id)]
+        if except_id is not None:
+            sql += " AND id<>?"
+            args.append(int(except_id))
+        with self.connect() as conn:
+            cursor = conn.execute(sql, args)
+        return max(0, int(cursor.rowcount or 0))
+
+    def apply_store_credential_candidate(
+        self,
+        candidate_id: int,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM store_credential_candidates WHERE id=?",
+                (int(candidate_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("凭据候选不存在")
+            if str(row["state"] or "") != "validating":
+                raise ValueError("凭据候选不在验证中，不能提交替换")
+            store_id = int(row["store_id"])
+            protected = row["secret_protected"]
+            secret = self.protector.unprotect(protected) if protected else ""
+            if not secret:
+                raise ValueError("凭据候选无法解密")
+            conn.execute(
+                """
+                UPDATE stores
+                SET secret_protected=?, status='连接成功', updated_at=?
+                WHERE id=?
+                """,
+                (protected, now, store_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO store_credential_states(
+                    store_id, state, last_probe_at, last_success_at,
+                    last_error_code, last_error_message, consecutive_failures
+                ) VALUES (?, 'valid', ?, ?, '', '', 0)
+                ON CONFLICT(store_id) DO UPDATE SET
+                    state='valid', last_probe_at=excluded.last_probe_at,
+                    last_success_at=excluded.last_success_at,
+                    last_error_code='', last_error_message='',
+                    consecutive_failures=0
+                """,
+                (store_id, now, now),
+            )
+            conn.execute(
+                """
+                UPDATE store_credential_candidates
+                SET state='applied', validating_started_at=NULL,
+                    validated_at=?, applied_at=?, last_error_code='',
+                    last_error_message='', updated_at=?
+                WHERE id=?
+                """,
+                (now, now, now, int(candidate_id)),
+            )
+            conn.execute(
+                """
+                UPDATE store_credential_candidates
+                SET state='superseded', validating_started_at=NULL,
+                    validated_at=?, updated_at=?
+                WHERE store_id=? AND id<>?
+                  AND state IN ('pending', 'validating')
+                """,
+                (now, now, store_id, int(candidate_id)),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM stores WHERE id=?",
+                (store_id,),
+            ).fetchone()
+        if refreshed is None:
+            raise ValueError("店铺不存在")
+        return {
+            "store": self._store_from_row(refreshed),
+            "candidate_id": int(candidate_id),
+        }
+
+    def commit_store_import_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        source_name: str,
+        source_hash: str,
+    ) -> dict[str, Any]:
+        now = _now()
+        created_ids: list[int] = []
+        candidate_ids: list[int] = []
+        skipped: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        seen_app_ids: set[str] = set()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_rows = conn.execute(
+                "SELECT id, name, app_id FROM stores"
+            ).fetchall()
+            existing = {
+                str(row["app_id"]): dict(row)
+                for row in existing_rows
+            }
+            used_names = {
+                str(row["name"] or "").strip().casefold()
+                for row in existing_rows
+                if str(row["name"] or "").strip()
+            }
+            for raw in rows:
+                row = dict(raw)
+                row_number = int(row.get("row_number") or 0)
+                name = str(row.get("name") or "").strip()
+                app_id = str(row.get("app_id") or "").strip()
+                secret = str(row.get("secret") or "").strip()
+                group_name = str(row.get("group_name") or "").strip()
+                parse_errors = list(row.get("parse_errors") or [])
+                if parse_errors:
+                    errors.append(
+                        {
+                            "row_number": row_number,
+                            "app_id": app_id,
+                            "reason": "；".join(parse_errors),
+                        }
+                    )
+                    continue
+                if app_id in seen_app_ids:
+                    skipped.append(
+                        {
+                            "row_number": row_number,
+                            "app_id": app_id,
+                            "reason": "本批次重复 AppID",
+                        }
+                    )
+                    continue
+                seen_app_ids.add(app_id)
+                current = existing.get(app_id)
+                if current is not None:
+                    state_row = conn.execute(
+                        """
+                        SELECT state FROM store_credential_states
+                        WHERE store_id=?
+                        """,
+                        (int(current["id"]),),
+                    ).fetchone()
+                    state = str(state_row["state"] or "") if state_row else "unknown"
+                    if state != "invalid":
+                        skipped.append(
+                            {
+                                "row_number": row_number,
+                                "app_id": app_id,
+                                "reason": "AppID 已存在且旧凭据未标记失效",
+                            }
+                        )
+                        continue
+                    fingerprint = hashlib.sha256(
+                        secret.encode("utf-8")
+                    ).hexdigest()
+                    candidate = conn.execute(
+                        """
+                        SELECT id FROM store_credential_candidates
+                        WHERE store_id=? AND secret_fingerprint=?
+                        """,
+                        (int(current["id"]), fingerprint),
+                    ).fetchone()
+                    if candidate is None:
+                        protected = self.protector.protect(secret)
+                        cursor = conn.execute(
+                            """
+                            INSERT INTO store_credential_candidates(
+                                store_id, provider, secret_protected,
+                                secret_fingerprint, source_kind, source_name,
+                                source_row, state, created_at, updated_at
+                            ) VALUES (?, 'wechat_shop', ?, ?, ?, ?, ?, 'pending', ?, ?)
+                            """,
+                            (
+                                int(current["id"]),
+                                protected,
+                                fingerprint,
+                                str(row.get("source_kind") or "")[:40],
+                                str(source_name or "")[:240],
+                                row_number,
+                                now,
+                                now,
+                            ),
+                        )
+                        candidate_id = int(cursor.lastrowid)
+                        candidate_ids.append(candidate_id)
+                        conn.execute(
+                            """
+                            INSERT INTO task_logs(
+                                scope, operation, status, message, detail,
+                                started_at, finished_at, store_id
+                            ) VALUES (
+                                'stores', 'credential_candidate_created',
+                                'success', '已保存失效密钥候选',
+                                ?, ?, ?, ?
+                            )
+                            """,
+                            (
+                                json.dumps(
+                                    {
+                                        "store_id": int(current["id"]),
+                                        "candidate_id": candidate_id,
+                                        "source_row": row_number,
+                                        "fingerprint_prefix": fingerprint[:10],
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                now,
+                                now,
+                                int(current["id"]),
+                            ),
+                        )
+                    continue
+
+                normalized_name = name.casefold()
+                if normalized_name in used_names:
+                    conflicts.append(
+                        {
+                            "row_number": row_number,
+                            "app_id": app_id,
+                            "name": name,
+                            "reason": "同名店铺使用不同 AppID，请修改显示名称",
+                        }
+                    )
+                    continue
+                protected = self.protector.protect(secret)
+                cursor = conn.execute(
+                    """
+                    INSERT INTO stores(
+                        name, app_id, secret_protected, group_name,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, '未验证', ?, ?)
+                    """,
+                    (
+                        name,
+                        app_id,
+                        protected,
+                        group_name,
+                        now,
+                        now,
+                    ),
+                )
+                store_id = int(cursor.lastrowid)
+                created_ids.append(store_id)
+                existing[app_id] = {
+                    "id": store_id,
+                    "name": name,
+                    "app_id": app_id,
+                }
+                used_names.add(normalized_name)
+                if group_name:
+                    self._ensure_store_group(conn, group_name, now)
+
+            detail = {
+                "source_name": Path(str(source_name or "")).name,
+                "source_hash": str(source_hash or "")[:64],
+                "created_store_ids": created_ids,
+                "created_count": len(created_ids),
+                "candidate_ids": candidate_ids,
+                "candidate_count": len(candidate_ids),
+                "skipped": skipped,
+                "conflicts": conflicts,
+                "errors": errors,
+            }
+            conn.execute(
+                """
+                INSERT INTO task_logs(
+                    scope, operation, status, message, detail,
+                    started_at, finished_at
+                ) VALUES (
+                    'stores', 'batch_import_commit', 'success',
+                    '店铺批量导入本地候选已保存', ?, ?, ?
+                )
+                """,
+                (
+                    json.dumps(detail, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return detail
 
     def set_store_status(self, store_id: int, status: str) -> None:
         with self.connect() as conn:
@@ -1780,16 +3052,19 @@ class Database:
             incoming_session_time = str(
                 item.get("web_session_updated_at") or ""
             )
+            incoming_status = str(item.get("web_status") or "已登录")
             apply_login = (
-                _incoming_session_is_not_older(
-                    incoming_session_time,
-                    current_session_time,
+                incoming_status == "未登录"
+                or (
+                    _incoming_session_is_not_older(
+                        incoming_session_time,
+                        current_session_time,
+                    )
+                    if incoming_session_time
+                    else current_web_status != "已登录"
                 )
-                if incoming_session_time
-                else current_web_status != "已登录"
             )
             cookies = item.get("cookies")
-            incoming_status = str(item.get("web_status") or "已登录")
             incoming_detail = str(
                 item.get("web_status_detail")
                 or "账户同步恢复"
@@ -1985,6 +3260,14 @@ class Database:
             ).fetchone()
         return str(row["value"]) if row else default
 
+    def get_settings_with_prefix(self, prefix: str) -> dict[str, str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM app_settings WHERE key LIKE ?",
+                (f"{prefix}%",),
+            ).fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
+
     def set_setting(self, key: str, value: str) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -1996,6 +3279,22 @@ class Database:
                     updated_at=excluded.updated_at
                 """,
                 (key, value, _now()),
+            )
+
+    def set_settings(self, values: dict[str, str]) -> None:
+        if not values:
+            return
+        now = _now()
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO app_settings(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                [(key, value, now) for key, value in values.items()],
             )
 
     def delete_setting(self, key: str) -> None:
@@ -2051,6 +3350,25 @@ class Database:
                 metrics = {}
             quota = quota if isinstance(quota, dict) else {}
             metrics = metrics if isinstance(metrics, dict) else {}
+            store_row = conn.execute(
+                "SELECT app_id FROM stores WHERE id=?",
+                (store_id,),
+            ).fetchone()
+            app_id = str(store_row["app_id"]) if store_row else ""
+            try:
+                cache_owner_matches = (
+                    metrics.get("_cache_store_id") is None
+                    or int(metrics.get("_cache_store_id")) == int(store_id)
+                )
+            except (TypeError, ValueError):
+                cache_owner_matches = False
+            if (
+                metrics.get("_cache_store_app_id") is not None
+                and str(metrics.get("_cache_store_app_id")) != app_id
+            ):
+                cache_owner_matches = False
+            if not cache_owner_matches:
+                metrics = {}
             remaining = max(
                 0,
                 int(quota.get("remaining") or 0) + quota_delta,
@@ -2072,6 +3390,9 @@ class Database:
                     + listing_delta,
                 )
             metrics["_pending_refresh"] = True
+            metrics["_cache_store_id"] = int(store_id)
+            metrics["_cache_store_app_id"] = app_id
+            metrics["_cache_schema_version"] = 2
             metrics["upload_updated_at"] = _now()
             for key, value in (
                 (quota_key, quota),
@@ -2424,6 +3745,11 @@ class Database:
         values = (
             str(payload.get("source_url") or ""),
             str(payload.get("platform") or ""),
+            (
+                int(payload.get("account_id"))
+                if str(payload.get("account_id") or "").isdigit()
+                else None
+            ),
             1 if payload.get("use_transfer_warehouse") else 0,
             float(payload.get("commission_pct") or 0),
             str(payload.get("note") or ""),
@@ -2452,7 +3778,8 @@ class Database:
                 conn.execute(
                     """
                     UPDATE product_purchase_links
-                    SET source_url=?, platform=?, use_transfer_warehouse=?,
+                    SET source_url=?, platform=?, account_id=?,
+                        use_transfer_warehouse=?,
                         commission_pct=?, note=?, address_info_json=?,
                         source_product_id=?,
                         source_title=?, source_skus_json=?, updated_at=?
@@ -2464,12 +3791,12 @@ class Database:
             cursor = conn.execute(
                 """
                 INSERT INTO product_purchase_links (
-                    store_id, product_id, source_url, platform,
+                    store_id, product_id, source_url, platform, account_id,
                     use_transfer_warehouse, commission_pct, note,
                     address_info_json,
                     source_product_id, source_title, source_skus_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(store_id),
@@ -2718,9 +4045,16 @@ class Database:
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT t.*, l.note AS link_note, l.commission_pct,
-                   l.use_transfer_warehouse
+                   l.use_transfer_warehouse,
+                   l.account_id AS purchase_account_id,
+                   l.source_product_id,
+                   l.source_title,
+                   a.label AS purchase_account_label,
+                   a.platform AS purchase_account_platform,
+                   a.status AS purchase_account_status
             FROM order_dispatch_tasks t
             LEFT JOIN product_purchase_links l ON l.id=t.purchase_link_id
+            LEFT JOIN procurement_accounts a ON a.id=l.account_id
             WHERE 1=1
         """
         args: list[Any] = []
@@ -2748,22 +4082,43 @@ class Database:
         self,
         task_id: int,
         *,
-        status: str,
-        error: str = "",
+        status: str | None = None,
+        error: str | None = None,
+        **changes: Any,
     ) -> None:
+        allowed = {
+            "procurement_order_id",
+            "purchase_amount",
+            "purchase_sku_id",
+            "purchase_attrs_json",
+            "tracking_company",
+            "tracking_no",
+            "after_sale_stage",
+            "result_unknown",
+            "last_checked_at",
+            "purchased_at",
+            "shipped_at",
+        }
+        updates = {
+            key: value
+            for key, value in changes.items()
+            if key in allowed
+        }
+        if status is not None:
+            updates["status"] = str(status)
+        if error is not None:
+            updates["error"] = str(error)[:1000]
+        if not updates:
+            return
+        assignments = ", ".join(f"{key}=?" for key in updates)
         with self.connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE order_dispatch_tasks
-                SET status=?, error=?, updated_at=?
+                SET {assignments}, updated_at=?
                 WHERE id=?
                 """,
-                (
-                    str(status),
-                    str(error)[:1000],
-                    _now(),
-                    int(task_id),
-                ),
+                (*updates.values(), _now(), int(task_id)),
             )
 
     def record_activity_operation(
@@ -2813,6 +4168,386 @@ class Database:
                 (max(1, int(limit)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_activity_renewal_config(
+        self,
+        store_id: int,
+    ) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM activity_renewal_configs
+                WHERE store_id=?
+                """,
+                (int(store_id),),
+            ).fetchone()
+        if row is None:
+            return {
+                "store_id": int(store_id),
+                "enabled": 0,
+                "hours_before": 6,
+                "duration_days": 7,
+                "next_scan_at": 0,
+                "last_checked_at": 0,
+                "last_success_at": 0,
+                "last_error": "",
+                "updated_at": "",
+            }
+        return dict(row)
+
+    def list_activity_renewal_configs(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.*, s.name AS store_name, s.web_status,
+                       s.status AS api_status
+                FROM activity_renewal_configs c
+                JOIN stores s ON s.id=c.store_id
+                ORDER BY s.name, c.store_id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_activity_renewal_config(
+        self,
+        store_id: int,
+        *,
+        enabled: int | None = None,
+        hours_before: int | None = None,
+        duration_days: int | None = None,
+        next_scan_at: int | None = None,
+        last_checked_at: int | None = None,
+        last_success_at: int | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_activity_renewal_config(store_id)
+        values = {
+            "enabled": int(current["enabled"] if enabled is None else enabled),
+            "hours_before": int(
+                current["hours_before"]
+                if hours_before is None
+                else hours_before
+            ),
+            "duration_days": int(
+                current["duration_days"]
+                if duration_days is None
+                else duration_days
+            ),
+            "next_scan_at": int(
+                current["next_scan_at"]
+                if next_scan_at is None
+                else next_scan_at
+            ),
+            "last_checked_at": int(
+                current["last_checked_at"]
+                if last_checked_at is None
+                else last_checked_at
+            ),
+            "last_success_at": int(
+                current["last_success_at"]
+                if last_success_at is None
+                else last_success_at
+            ),
+            "last_error": str(
+                current["last_error"]
+                if last_error is None
+                else last_error
+            )[:2000],
+        }
+        now = _now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO activity_renewal_configs (
+                    store_id, enabled, hours_before, duration_days,
+                    next_scan_at, last_checked_at, last_success_at,
+                    last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_id) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    hours_before=excluded.hours_before,
+                    duration_days=excluded.duration_days,
+                    next_scan_at=excluded.next_scan_at,
+                    last_checked_at=excluded.last_checked_at,
+                    last_success_at=excluded.last_success_at,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    int(store_id),
+                    values["enabled"],
+                    values["hours_before"],
+                    values["duration_days"],
+                    values["next_scan_at"],
+                    values["last_checked_at"],
+                    values["last_success_at"],
+                    values["last_error"],
+                    now,
+                ),
+            )
+        return {
+            **self.get_activity_renewal_config(store_id),
+            "store_name": "",
+        }
+
+    def get_activity_renewal_run(
+        self,
+        store_id: int,
+        source_activity_id: str,
+        source_end_time: int,
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM activity_renewal_runs
+                WHERE store_id=? AND source_activity_id=?
+                  AND source_end_time=?
+                """,
+                (
+                    int(store_id),
+                    str(source_activity_id),
+                    int(source_end_time),
+                ),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_activity_renewal_run(
+        self,
+        store_id: int,
+        source_activity_id: str,
+        source_end_time: int,
+        *,
+        status: str,
+        attempts: int,
+        last_checked_at: int,
+        next_retry_at: int = 0,
+        new_activity_id: str = "",
+        new_start_time: int = 0,
+        new_end_time: int = 0,
+        error: str = "",
+    ) -> dict[str, Any]:
+        now = _now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO activity_renewal_runs (
+                    store_id, source_activity_id, source_end_time,
+                    status, attempts, last_checked_at, next_retry_at,
+                    new_activity_id, new_start_time, new_end_time,
+                    error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_id, source_activity_id, source_end_time)
+                DO UPDATE SET
+                    status=excluded.status,
+                    attempts=excluded.attempts,
+                    last_checked_at=excluded.last_checked_at,
+                    next_retry_at=excluded.next_retry_at,
+                    new_activity_id=excluded.new_activity_id,
+                    new_start_time=excluded.new_start_time,
+                    new_end_time=excluded.new_end_time,
+                    error=excluded.error,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    int(store_id),
+                    str(source_activity_id),
+                    int(source_end_time),
+                    str(status),
+                    max(0, int(attempts)),
+                    int(last_checked_at),
+                    int(next_retry_at),
+                    str(new_activity_id),
+                    int(new_start_time),
+                    int(new_end_time),
+                    str(error)[:4000],
+                    now,
+                    now,
+                ),
+            )
+        row = self.get_activity_renewal_run(
+            store_id,
+            source_activity_id,
+            source_end_time,
+        )
+        return row or {}
+
+    def list_activity_renewal_runs(
+        self,
+        store_id: int | None = None,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT r.*, s.name AS store_name
+            FROM activity_renewal_runs r
+            JOIN stores s ON s.id=r.store_id
+        """
+        args: list[Any] = []
+        if store_id is not None:
+            sql += " WHERE r.store_id=?"
+            args.append(int(store_id))
+        sql += " ORDER BY r.updated_at DESC, r.id DESC LIMIT ?"
+        args.append(max(1, min(2000, int(limit))))
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_new_product_candidates(
+        self,
+        store_id: int,
+        *,
+        start_at: str,
+        end_at: str,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.product_id, c.first_seen_at, c.last_seen_at,
+                       p.title, p.status, p.status_text, p.min_price,
+                       p.stock_total, p.sku_count, p.head_img,
+                       p.out_product_id, p.raw_json, p.synced_at
+                FROM product_catalog c
+                JOIN products p
+                  ON p.store_id=c.store_id
+                 AND p.product_id=c.product_id
+                WHERE c.store_id=?
+                  AND c.first_seen_at>=?
+                  AND c.first_seen_at<?
+                ORDER BY c.first_seen_at, c.product_id
+                """,
+                (int(store_id), str(start_at), str(end_at)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_activity_auto_create_run(
+        self,
+        store_id: int,
+        product_id: str,
+        observed_date: str,
+        rule_version: str,
+    ) -> dict[str, Any] | None:
+        key = (
+            f"{int(store_id)}:{str(product_id)}:"
+            f"{str(observed_date)}:{str(rule_version)}"
+        )
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM activity_auto_create_runs
+                WHERE idempotency_key=?
+                """,
+                (key,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_activity_auto_create_run(
+        self,
+        store_id: int,
+        product_id: str,
+        observed_date: str,
+        rule_version: str,
+        *,
+        status: str,
+        attempts: int,
+        next_retry_at: int = 0,
+        activity_id: str = "",
+        start_time: int = 0,
+        end_time: int = 0,
+        error: str = "",
+        last_checked_at: int = 0,
+    ) -> dict[str, Any]:
+        key = (
+            f"{int(store_id)}:{str(product_id)}:"
+            f"{str(observed_date)}:{str(rule_version)}"
+        )
+        now = _now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO activity_auto_create_runs (
+                    store_id, product_id, observed_date, rule_version,
+                    idempotency_key, status, attempts, next_retry_at,
+                    activity_id, start_time, end_time, error,
+                    created_at, updated_at, last_checked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    status=excluded.status,
+                    attempts=excluded.attempts,
+                    next_retry_at=excluded.next_retry_at,
+                    activity_id=CASE WHEN excluded.activity_id<>''
+                        THEN excluded.activity_id
+                        ELSE activity_auto_create_runs.activity_id END,
+                    start_time=CASE WHEN excluded.start_time>0
+                        THEN excluded.start_time
+                        ELSE activity_auto_create_runs.start_time END,
+                    end_time=CASE WHEN excluded.end_time>0
+                        THEN excluded.end_time
+                        ELSE activity_auto_create_runs.end_time END,
+                    error=excluded.error,
+                    updated_at=excluded.updated_at,
+                    last_checked_at=excluded.last_checked_at
+                """,
+                (
+                    int(store_id),
+                    str(product_id),
+                    str(observed_date),
+                    str(rule_version),
+                    key,
+                    str(status),
+                    max(0, int(attempts)),
+                    int(next_retry_at),
+                    str(activity_id),
+                    int(start_time),
+                    int(end_time),
+                    str(error)[:4000],
+                    now,
+                    now,
+                    int(last_checked_at),
+                ),
+            )
+        return self.get_activity_auto_create_run(
+            store_id,
+            product_id,
+            observed_date,
+            rule_version,
+        ) or {}
+
+    def list_activity_auto_create_runs(
+        self,
+        store_id: int | None = None,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT r.*, s.name AS store_name
+            FROM activity_auto_create_runs r
+            JOIN stores s ON s.id=r.store_id
+        """
+        args: list[Any] = []
+        if store_id is not None:
+            sql += " WHERE r.store_id=?"
+            args.append(int(store_id))
+        sql += " ORDER BY r.updated_at DESC, r.id DESC LIMIT ?"
+        args.append(max(1, min(2000, int(limit))))
+        with self.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(sql, args).fetchall()
+            ]
+
+    def count_activity_auto_create_successes(
+        self,
+        observed_date: str,
+    ) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM activity_auto_create_runs
+                WHERE observed_date=? AND status='success'
+                """,
+                (str(observed_date),),
+            ).fetchone()
+        return int(row[0] or 0)
 
     def get_after_sale(
         self,
@@ -3008,6 +4743,123 @@ class Database:
                 ),
             )
 
+    def get_order_address_cache(
+        self,
+        store_id: int,
+        order_id: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM order_address_cache
+                WHERE store_id=? AND order_id=?
+                """,
+                (int(store_id), str(order_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            address = json.loads(
+                self.protector.unprotect(row["payload_protected"])
+            )
+        except Exception:
+            return None
+        if not isinstance(address, dict):
+            return None
+        return {
+            "address": address,
+            "source": str(row["source"] or ""),
+            "source_updated_at": str(row["source_updated_at"] or ""),
+            "confirmed_at": str(row["confirmed_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+
+    def upsert_order_address_cache(
+        self,
+        store_id: int,
+        order_id: str,
+        address: dict[str, Any],
+        *,
+        source: str,
+        source_updated_at: str = "",
+        force: bool = False,
+    ) -> dict[str, Any]:
+        now = _now()
+        incoming = {
+            key: str(address.get(key) or "").strip()
+            for key in (
+                "user_name",
+                "tel_number",
+                "province_name",
+                "city_name",
+                "county_name",
+                "street_name",
+                "detail_info",
+            )
+        }
+        existing = self.get_order_address_cache(store_id, order_id)
+        if existing and not force:
+            previous = existing["address"]
+            previous_complete = address_is_complete(previous)
+            incoming_complete = address_is_complete(incoming)
+            priorities = {
+                "official_sync": 1,
+                "decrypted_official": 2,
+                "software_manual": 3,
+            }
+            previous_priority = priorities.get(
+                existing["source"],
+                0,
+            )
+            incoming_priority = priorities.get(source, 0)
+            if previous_complete and not incoming_complete:
+                return existing
+            if (
+                previous_complete
+                and incoming_complete
+                and previous_priority >= incoming_priority
+                and (
+                    existing["source_updated_at"]
+                    or existing["updated_at"]
+                )
+                >= (source_updated_at or now)
+            ):
+                return existing
+        payload = self.protector.protect(
+            json.dumps(incoming, ensure_ascii=False)
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO order_address_cache (
+                    store_id, order_id, payload_protected, source,
+                    source_updated_at, confirmed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_id, order_id) DO UPDATE SET
+                    payload_protected=excluded.payload_protected,
+                    source=excluded.source,
+                    source_updated_at=excluded.source_updated_at,
+                    confirmed_at=excluded.confirmed_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    int(store_id),
+                    str(order_id),
+                    payload,
+                    source,
+                    source_updated_at or now,
+                    now if address_is_complete(incoming) else "",
+                    now,
+                ),
+            )
+        return self.get_order_address_cache(store_id, order_id) or {
+            "address": incoming,
+            "source": source,
+            "source_updated_at": source_updated_at or now,
+            "confirmed_at": now if address_is_complete(incoming) else "",
+            "updated_at": now,
+        }
+
     def touch_store_sync(self, store_id: int) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -3015,9 +4867,142 @@ class Database:
                 (_now(), _now(), store_id),
             )
 
+    @staticmethod
+    def _store_scoped_setting_keys(
+        conn: sqlite3.Connection,
+    ) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT key
+            FROM app_settings
+            WHERE key LIKE 'after_sales_last_sync_%'
+               OR key LIKE 'after_sales_full_sync_at_%'
+               OR key LIKE 'after_sales_coverage_start_%'
+               OR key LIKE 'after_sales_coverage_end_%'
+               OR key LIKE 'analytics_product_backfill_at_%'
+               OR key LIKE 'double11_last_result_%'
+               OR key LIKE 'double11_prefill_%'
+               OR key LIKE 'hosted_config_extra_%'
+               OR key LIKE 'hosted_latest_league_%'
+               OR key LIKE 'hosted_listing_count_%'
+               OR key LIKE 'hosted_listing_mode_%'
+               OR key LIKE 'orders_day_backfill_%'
+               OR key LIKE 'product_quota_%'
+               OR key LIKE 'store_metrics_%'
+               OR key LIKE 'webui_previous_store_metrics_%'
+               OR key LIKE 'webui_store_score_state_%'
+               OR key LIKE 'activity_last_result_%'
+            """
+        ).fetchall()
+        return [str(row["key"]) for row in rows]
+
+    @staticmethod
+    def _store_setting_owner_id(key: str) -> int | None:
+        for prefix in STORE_SCOPED_SETTING_PREFIXES:
+            if not key.startswith(prefix):
+                continue
+            suffix = key[len(prefix):].split("_", 1)[0]
+            try:
+                store_id = int(suffix)
+            except ValueError:
+                return None
+            return store_id if store_id > 0 else None
+        if key.startswith("activity_last_result_"):
+            suffix = key[len("activity_last_result_"):]
+            if "_" not in suffix:
+                return None
+            try:
+                store_id = int(suffix.split("_", 1)[0])
+            except ValueError:
+                return None
+            return store_id if store_id > 0 else None
+        return None
+
+    @classmethod
+    def _delete_store_scoped_settings(
+        cls,
+        conn: sqlite3.Connection,
+        store_ids: set[int],
+    ) -> int:
+        ids = {
+            int(store_id)
+            for store_id in store_ids
+            if int(store_id) > 0
+        }
+        if not ids:
+            return 0
+        keys = [
+            key
+            for key in cls._store_scoped_setting_keys(conn)
+            if cls._store_setting_owner_id(key) in ids
+        ]
+        if keys:
+            conn.executemany(
+                "DELETE FROM app_settings WHERE key=?",
+                [(key,) for key in keys],
+            )
+        return len(keys)
+
+    def prune_orphaned_store_cache_settings(self) -> int:
+        """Delete only store-scoped caches whose owning store no longer exists."""
+        with self.connect() as conn:
+            store_ids = {
+                int(row["id"])
+                for row in conn.execute("SELECT id FROM stores").fetchall()
+            }
+            keys = [
+                key
+                for key in self._store_scoped_setting_keys(conn)
+                if (
+                    (owner_id := self._store_setting_owner_id(key))
+                    is not None
+                    and owner_id not in store_ids
+                )
+            ]
+            if keys:
+                conn.executemany(
+                    "DELETE FROM app_settings WHERE key=?",
+                    [(key,) for key in keys],
+                )
+            return len(keys)
+
     def delete_store(self, store_id: int) -> None:
         with self.connect() as conn:
+            self._delete_store_scoped_settings(conn, {int(store_id)})
             conn.execute("DELETE FROM stores WHERE id = ?", (store_id,))
+
+    def delete_stores(self, store_ids: list[int]) -> list[dict[str, Any]]:
+        """Delete several stores and all cascaded local data atomically."""
+        ids = [int(store_id) for store_id in store_ids]
+        if not ids:
+            raise ValueError("店铺 ID 不能为空")
+        if len(ids) != len(set(ids)):
+            raise ValueError("店铺 ID 不能重复")
+        if len(ids) > 500:
+            raise ValueError("单次批量删除不能超过 500 家店铺")
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, name, app_id
+                FROM stores
+                WHERE id IN ({placeholders})
+                ORDER BY id
+                """,
+                ids,
+            ).fetchall()
+            existing_ids = {int(row["id"]) for row in rows}
+            missing = sorted(set(ids) - existing_ids)
+            if missing:
+                raise ValueError(
+                    "店铺不存在：" + ", ".join(map(str, missing))
+                )
+            self._delete_store_scoped_settings(conn, set(ids))
+            conn.execute(
+                f"DELETE FROM stores WHERE id IN ({placeholders})",
+                ids,
+            )
+        return [dict(row) for row in rows]
 
     def upsert_order(self, order: Order) -> None:
         now = _now()
@@ -3196,7 +5181,9 @@ class Database:
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT o.*, s.name AS store_name,
-                   GROUP_CONCAT(oi.title || ' ×' || oi.sku_count, '；') AS item_summary
+                   GROUP_CONCAT(oi.title || ' ×' || oi.sku_count, '；') AS item_summary,
+                   MAX(oi.thumb_url) AS item_thumb_url,
+                   MAX(oi.product_id) AS item_product_id
             FROM orders o
             JOIN stores s ON s.id = o.store_id
             LEFT JOIN order_items oi
@@ -3224,6 +5211,72 @@ class Database:
         args.append(limit)
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+    def list_refund_orders_by_update_time(
+        self,
+        store_id: int,
+        start_time: int,
+        end_time: int,
+        *,
+        limit: int = 100000,
+    ) -> list[dict[str, Any]]:
+        """Return completed-refund orders whose refund event falls in range."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM orders
+                WHERE store_id=?
+                  AND status=200
+                  AND update_time>=?
+                  AND update_time<?
+                ORDER BY update_time DESC
+                LIMIT ?
+                """,
+                (
+                    int(store_id),
+                    int(start_time),
+                    int(end_time),
+                    max(1, int(limit)),
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_order_product_links(
+        self,
+        store_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT o.store_id, o.order_id, oi.product_id, o.status,
+                   o.status_text, o.create_time, o.pay_time, o.raw_json
+            FROM order_items oi
+            JOIN orders o
+              ON o.store_id=oi.store_id AND o.order_id=oi.order_id
+            WHERE 1=1
+        """
+        args: list[Any] = []
+        if store_id is not None:
+            sql += " AND o.store_id=?"
+            args.append(int(store_id))
+        sql += """
+            GROUP BY o.store_id, o.order_id, oi.product_id
+            ORDER BY COALESCE(NULLIF(o.pay_time, 0), o.create_time) DESC
+        """
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+    def count_orders(
+        self,
+        store_id: int | None = None,
+    ) -> int:
+        sql = "SELECT COUNT(*) FROM orders"
+        args: tuple[Any, ...] = ()
+        if store_id is not None:
+            sql += " WHERE store_id=?"
+            args = (int(store_id),)
+        with self.connect() as conn:
+            row = conn.execute(sql, args).fetchone()
+        return int(row[0]) if row else 0
 
     def get_order_workbench(
         self,
@@ -3707,9 +5760,9 @@ class Database:
                 INSERT INTO procurement_orders (
                     account_id, platform, external_order_id, trade_no, mail_no,
                     pickup_code, station_name, station_phone, status, status_text,
-                    goods_title, goods_image, goods_count, pay_amount, seller,
-                    buyer, raw_json, fetched_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    goods_title, goods_image, goods_count, pay_amount, carrier,
+                    tracking_time, seller, buyer, raw_json, fetched_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, external_order_id) DO UPDATE SET
                     trade_no=excluded.trade_no,
                     mail_no=excluded.mail_no,
@@ -3725,6 +5778,8 @@ class Database:
                     goods_image=excluded.goods_image,
                     goods_count=excluded.goods_count,
                     pay_amount=excluded.pay_amount,
+                    carrier=excluded.carrier,
+                    tracking_time=excluded.tracking_time,
                     seller=excluded.seller,
                     buyer=excluded.buyer,
                     raw_json=excluded.raw_json,
@@ -3746,6 +5801,8 @@ class Database:
                     str(record.get("goods_image") or ""),
                     int(record.get("goods_count") or 0),
                     int(record.get("pay_amount") or 0),
+                    str(record.get("carrier") or ""),
+                    str(record.get("tracking_time") or ""),
                     str(record.get("seller") or ""),
                     str(record.get("buyer") or ""),
                     json.dumps(record.get("raw") or record, ensure_ascii=False),
@@ -3887,7 +5944,7 @@ class Database:
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT l.*, p.platform, p.external_order_id, p.mail_no, p.pickup_code,
-                   p.goods_title, p.pay_amount, p.seller
+                   p.carrier, p.goods_title, p.pay_amount, p.seller
             FROM procurement_links l
             JOIN procurement_orders p ON p.id=l.procurement_order_id
             WHERE 1=1
@@ -3902,6 +5959,197 @@ class Database:
         sql += " ORDER BY l.updated_at DESC"
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+    def upsert_procurement_purchase_record(
+        self,
+        store_id: int,
+        order_id: str,
+        payload: dict[str, Any],
+    ) -> int:
+        now = _now()
+        values = (
+            str(payload.get("product_id") or ""),
+            int(payload.get("link_id") or 0),
+            str(payload.get("store_sku_id") or ""),
+            int(payload.get("account_id") or 0),
+            str(payload.get("platform") or ""),
+            str(payload.get("source_url") or ""),
+            str(payload.get("source_product_id") or ""),
+            str(payload.get("upstream_order_id") or ""),
+            str(payload.get("trade_no") or ""),
+            str(payload.get("mail_no") or ""),
+            str(payload.get("carrier") or ""),
+            str(payload.get("upstream_shop") or ""),
+            str(payload.get("goods_title") or ""),
+            str(payload.get("upstream_sku") or ""),
+            int(payload.get("quantity") or 0),
+            int(payload.get("unit_amount") or 0),
+            int(payload.get("paid_amount") or 0),
+            int(payload.get("freight_amount") or 0),
+            str(payload.get("status") or ""),
+            str(payload.get("status_text") or ""),
+            str(payload.get("purchased_at") or ""),
+            int(payload.get("estimated_profit") or 0),
+            int(payload.get("actual_profit") or 0),
+            json.dumps(
+                payload.get("raw")
+                if isinstance(payload.get("raw"), dict)
+                else {},
+                ensure_ascii=False,
+            ),
+            now,
+            now,
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO procurement_purchase_records (
+                    store_id, order_id, product_id, link_id, store_sku_id,
+                    account_id, platform, source_url, source_product_id,
+                    upstream_order_id, trade_no, mail_no, carrier,
+                    upstream_shop, goods_title,
+                    upstream_sku, quantity, unit_amount, paid_amount,
+                    freight_amount, status, status_text, purchased_at,
+                    estimated_profit, actual_profit, raw_json,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(
+                    store_id, order_id, product_id, account_id,
+                    upstream_order_id
+                ) DO UPDATE SET
+                    link_id=excluded.link_id,
+                    store_sku_id=excluded.store_sku_id,
+                    platform=excluded.platform,
+                    source_url=excluded.source_url,
+                    source_product_id=excluded.source_product_id,
+                    trade_no=excluded.trade_no,
+                    mail_no=excluded.mail_no,
+                    carrier=excluded.carrier,
+                    upstream_shop=excluded.upstream_shop,
+                    goods_title=excluded.goods_title,
+                    upstream_sku=excluded.upstream_sku,
+                    quantity=excluded.quantity,
+                    unit_amount=excluded.unit_amount,
+                    paid_amount=excluded.paid_amount,
+                    freight_amount=excluded.freight_amount,
+                    status=excluded.status,
+                    status_text=excluded.status_text,
+                    purchased_at=excluded.purchased_at,
+                    estimated_profit=excluded.estimated_profit,
+                    actual_profit=excluded.actual_profit,
+                    raw_json=excluded.raw_json,
+                    updated_at=excluded.updated_at
+                """,
+                (int(store_id), str(order_id), *values),
+            )
+            row = conn.execute(
+                """
+                SELECT id FROM procurement_purchase_records
+                WHERE store_id=? AND order_id=? AND product_id=?
+                  AND account_id=? AND upstream_order_id=?
+                """,
+                (
+                    int(store_id),
+                    str(order_id),
+                    str(payload.get("product_id") or ""),
+                    int(payload.get("account_id") or 0),
+                    str(payload.get("upstream_order_id") or ""),
+                ),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("采购成功记录写入失败")
+        return int(row["id"])
+
+    def list_procurement_purchase_records(
+        self,
+        store_id: int,
+        order_id: str,
+        product_id: str | None = None,
+        link_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT * FROM procurement_purchase_records
+            WHERE store_id=? AND order_id=?
+        """
+        args: list[Any] = [int(store_id), str(order_id)]
+        if product_id is not None:
+            sql += " AND product_id=?"
+            args.append(str(product_id))
+        if link_id is not None:
+            sql += " AND link_id=?"
+            args.append(int(link_id))
+        sql += " ORDER BY purchased_at DESC, id DESC"
+        with self.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(sql, args).fetchall()
+            ]
+
+    def upsert_procurement_purchase_attempt(
+        self,
+        store_id: int,
+        order_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        now = _now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO procurement_purchase_attempts (
+                    store_id, order_id, product_id, link_id, account_id,
+                    platform, source_url, status, opened_at, last_error,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_id, order_id, product_id, link_id)
+                DO UPDATE SET
+                    account_id=excluded.account_id,
+                    platform=excluded.platform,
+                    source_url=excluded.source_url,
+                    status=excluded.status,
+                    opened_at=excluded.opened_at,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    int(store_id),
+                    str(order_id),
+                    str(payload.get("product_id") or ""),
+                    int(payload.get("link_id") or 0),
+                    int(payload.get("account_id") or 0),
+                    str(payload.get("platform") or ""),
+                    str(payload.get("source_url") or ""),
+                    str(payload.get("status") or ""),
+                    str(payload.get("opened_at") or now),
+                    str(payload.get("last_error") or "")[:1000],
+                    now,
+                ),
+            )
+
+    def get_procurement_purchase_attempt(
+        self,
+        store_id: int,
+        order_id: str,
+        product_id: str,
+        link_id: int,
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM procurement_purchase_attempts
+                WHERE store_id=? AND order_id=? AND product_id=?
+                  AND link_id=?
+                """,
+                (
+                    int(store_id),
+                    str(order_id),
+                    str(product_id),
+                    int(link_id),
+                ),
+            ).fetchone()
+        return dict(row) if row else None
 
     def mark_procurement_note_synced(self, link_id: int) -> None:
         with self.connect() as conn:
@@ -4020,6 +6268,132 @@ class Database:
             "pending": int(row["pending"] or 0),
             "failed": int(row["failed"] or 0),
             "missing": int(row["missing"] or 0),
+        }
+
+    def product_first_seen_summary(self, store_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS observed_count,
+                    MIN(first_seen_at) AS first_observed_at,
+                    MAX(first_seen_at) AS latest_first_seen_at
+                FROM product_catalog
+                WHERE store_id=?
+                """,
+                (int(store_id),),
+            ).fetchone()
+        return {
+            "observed_count": int(row["observed_count"] or 0),
+            "first_observed_at": row["first_observed_at"],
+            "latest_first_seen_at": row["latest_first_seen_at"],
+        }
+
+    def product_first_seen_map(
+        self,
+        store_ids: set[int] | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        sql = """
+            SELECT
+                store_id,
+                COUNT(*) AS observed_count,
+                MIN(first_seen_at) AS first_observed_at,
+                MAX(first_seen_at) AS latest_first_seen_at
+            FROM product_catalog
+        """
+        args: list[Any] = []
+        if store_ids:
+            placeholders = ",".join("?" for _ in store_ids)
+            sql += f" WHERE store_id IN ({placeholders})"
+            args.extend(sorted(store_ids))
+        sql += " GROUP BY store_id"
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return {
+            int(row["store_id"]): {
+                "observed_count": int(row["observed_count"] or 0),
+                "first_observed_at": row["first_observed_at"],
+                "latest_first_seen_at": row["latest_first_seen_at"],
+            }
+            for row in rows
+        }
+
+    def product_new_today_map(
+        self,
+        store_ids: set[int] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        local_now = now or datetime.now(SHANGHAI_TZ)
+        if local_now.tzinfo is None:
+            local_now = local_now.replace(tzinfo=SHANGHAI_TZ)
+        else:
+            local_now = local_now.astimezone(SHANGHAI_TZ)
+        start_local = local_now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        end_local = start_local + timedelta(days=1)
+        start_utc = start_local.astimezone(UTC).isoformat(timespec="seconds")
+        end_utc = end_local.astimezone(UTC).isoformat(timespec="seconds")
+        args: list[Any] = [start_utc, end_utc]
+        scope_sql = ""
+        if store_ids is not None:
+            normalized_ids = sorted(int(store_id) for store_id in store_ids)
+            if not normalized_ids:
+                return {}
+            placeholders = ",".join("?" for _ in normalized_ids)
+            scope_sql = f" AND store_id IN ({placeholders})"
+            args.extend(normalized_ids)
+        with self.connect() as conn:
+            if store_ids is None:
+                ids = [
+                    int(row["id"])
+                    for row in conn.execute("SELECT id FROM stores").fetchall()
+                ]
+            else:
+                ids = normalized_ids
+            if not ids:
+                return {}
+            counts = {
+                int(row["store_id"]): int(row["count"] or 0)
+                for row in conn.execute(
+                    f"""
+                    SELECT store_id, COUNT(DISTINCT product_id) AS count
+                    FROM product_catalog
+                    WHERE first_seen_at>=? AND first_seen_at<?
+                    {scope_sql}
+                    GROUP BY store_id
+                    """,
+                    args,
+                ).fetchall()
+            }
+            scan_args: list[Any] = [start_utc, end_utc, *ids]
+            id_placeholders = ",".join("?" for _ in ids)
+            completed = {
+                int(row["store_id"]): str(row["completed_at"] or "")
+                for row in conn.execute(
+                    f"""
+                    SELECT store_id, MAX(finished_at) AS completed_at
+                    FROM sync_runs
+                    WHERE resource='product_catalog'
+                      AND status='success'
+                      AND finished_at>=? AND finished_at<?
+                      AND store_id IN ({id_placeholders})
+                    GROUP BY store_id
+                    """,
+                    scan_args,
+                ).fetchall()
+            }
+        return {
+            store_id: {
+                "count": counts.get(store_id, 0) if store_id in completed else None,
+                "scan_completed_today": store_id in completed,
+                "last_scan_completed_at": completed.get(store_id, ""),
+            }
+            for store_id in ids
         }
 
     def store_summary(self, store_id: int) -> dict[str, int]:
@@ -4150,11 +6524,12 @@ class Database:
         self,
         store_id: int,
         product_id: str,
-        **metrics: int,
+        **metrics: Any,
     ) -> None:
         allowed = {
             "views30",
             "sold30",
+            "recommend_views30",
             "click_cnt",
             "click_uv",
             "pay_cnt",
@@ -4172,17 +6547,31 @@ class Database:
         current = dict(row) if row else {}
         for key, value in metrics.items():
             if key in allowed:
-                current[key] = int(value or 0)
+                current[key] = (
+                    None
+                    if value is None
+                    else int(value)
+                )
+        for key in ("views30", "sold30"):
+            if key in metrics:
+                current[f"{key}_available"] = (
+                    0 if metrics[key] is None else 1
+                )
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO product_metrics (
-                    store_id, product_id, views30, sold30, click_cnt, click_uv,
-                    pay_cnt, pay_uv, pay_gmv, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    store_id, product_id, views30, sold30,
+                    views30_available, sold30_available,
+                    recommend_views30, click_cnt, click_uv, pay_cnt,
+                    pay_uv, pay_gmv, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(store_id, product_id) DO UPDATE SET
                     views30=excluded.views30,
                     sold30=excluded.sold30,
+                    views30_available=excluded.views30_available,
+                    sold30_available=excluded.sold30_available,
+                    recommend_views30=excluded.recommend_views30,
                     click_cnt=excluded.click_cnt,
                     click_uv=excluded.click_uv,
                     pay_cnt=excluded.pay_cnt,
@@ -4195,6 +6584,13 @@ class Database:
                     str(product_id),
                     int(current.get("views30") or 0),
                     int(current.get("sold30") or 0),
+                    int(current.get("views30_available") or 0),
+                    int(current.get("sold30_available") or 0),
+                    (
+                        None
+                        if current.get("recommend_views30") is None
+                        else int(current["recommend_views30"])
+                    ),
                     int(current.get("click_cnt") or 0),
                     int(current.get("click_uv") or 0),
                     int(current.get("pay_cnt") or 0),
@@ -4215,13 +6611,27 @@ class Database:
             ).fetchall()
         return {
             str(row["product_id"]): {
-                "views30": int(row["views30"] or 0),
-                "sold30": int(row["sold30"] or 0),
+                "views30": (
+                    int(row["views30"] or 0)
+                    if int(row["views30_available"] or 0)
+                    else None
+                ),
+                "sold30": (
+                    int(row["sold30"] or 0)
+                    if int(row["sold30_available"] or 0)
+                    else None
+                ),
+                "recommend_views30": (
+                    None
+                    if row["recommend_views30"] is None
+                    else int(row["recommend_views30"])
+                ),
                 "click_cnt": int(row["click_cnt"] or 0),
                 "click_uv": int(row["click_uv"] or 0),
                 "pay_cnt": int(row["pay_cnt"] or 0),
                 "pay_uv": int(row["pay_uv"] or 0),
                 "pay_gmv": int(row["pay_gmv"] or 0),
+                "updated_at": str(row["updated_at"] or ""),
             }
             for row in rows
         }
@@ -4962,6 +7372,112 @@ class Database:
                 (notes, _now(), store_id, order_id),
             )
 
+    def update_order_platform_detail(
+        self,
+        store_id: int,
+        order_id: str,
+        *,
+        merchant_notes: str | None = None,
+        merchant_notes_tag_color: int | None = None,
+        packages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Merge official order-note and package fields into cached order data."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT merchant_notes, waybill_id, carrier, raw_json
+                FROM orders
+                WHERE store_id=? AND order_id=?
+                """,
+                (store_id, order_id),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                raw = json.loads(str(row["raw_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            order_detail = raw.get("order_detail")
+            if not isinstance(order_detail, dict):
+                order_detail = {}
+                raw["order_detail"] = order_detail
+            if merchant_notes is not None or merchant_notes_tag_color is not None:
+                ext_info = order_detail.get("ext_info")
+                if not isinstance(ext_info, dict):
+                    ext_info = {}
+                    order_detail["ext_info"] = ext_info
+                if merchant_notes is not None:
+                    ext_info["merchant_notes"] = str(merchant_notes)
+                if merchant_notes_tag_color is not None:
+                    ext_info["merchant_notes_tag_color"] = int(
+                        merchant_notes_tag_color
+                    )
+            waybill_id = str(row["waybill_id"] or "")
+            carrier = str(row["carrier"] or "")
+            if packages is not None:
+                delivery_info = order_detail.get("delivery_info")
+                if not isinstance(delivery_info, dict):
+                    delivery_info = {}
+                    order_detail["delivery_info"] = delivery_info
+                normalized_packages = []
+                for package in packages:
+                    if not isinstance(package, dict):
+                        continue
+                    package_waybill = str(
+                        package.get("waybill_id") or ""
+                    ).strip()
+                    package_delivery = str(
+                        package.get("delivery_id") or ""
+                    ).strip()
+                    if not package_waybill and not package_delivery:
+                        continue
+                    normalized_packages.append(
+                        {
+                            "waybill_id": package_waybill,
+                            "delivery_id": package_delivery,
+                            "delivery_name": str(
+                                package.get("delivery_name") or ""
+                            ),
+                            "product_infos": list(
+                                package.get("product_infos") or []
+                            ),
+                        }
+                    )
+                delivery_info["delivery_product_info"] = normalized_packages
+                if normalized_packages:
+                    waybill_id = str(
+                        normalized_packages[0].get("waybill_id") or ""
+                    )
+                    carrier = str(
+                        normalized_packages[0].get("delivery_id") or ""
+                    )
+            conn.execute(
+                """
+                UPDATE orders
+                SET merchant_notes=?,
+                    waybill_id=?,
+                    carrier=?,
+                    raw_json=?,
+                    synced_at=?
+                WHERE store_id=? AND order_id=?
+                """,
+                (
+                    (
+                        str(merchant_notes)
+                        if merchant_notes is not None
+                        else str(row["merchant_notes"] or "")
+                    ),
+                    waybill_id,
+                    carrier,
+                    json.dumps(raw, ensure_ascii=False),
+                    _now(),
+                    store_id,
+                    order_id,
+                ),
+            )
+
     def start_sync_run(self, store_id: int | None, resource: str) -> int:
         with self.connect() as conn:
             cursor = conn.execute(
@@ -5071,6 +7587,191 @@ class Database:
     def clear_task_logs(self) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM task_logs")
+
+    def create_operation_task(
+        self,
+        *,
+        store_id: int | None,
+        product_id: str,
+        alert_key: str,
+        category: str,
+        title: str,
+        detail: str = "",
+        priority: str = "P1",
+        evidence_json: str = "{}",
+        due_at: str | None = None,
+        created_by: str = "",
+    ) -> dict[str, Any]:
+        now = _now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO operation_tasks(
+                    store_id, product_id, alert_key, category, title, detail,
+                    priority, status, evidence_json, due_at, created_by,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+                """,
+                (
+                    store_id,
+                    str(product_id or "")[:200],
+                    str(alert_key or "")[:240],
+                    str(category or "")[:80],
+                    str(title or "")[:1000],
+                    str(detail or "")[:4000],
+                    str(priority or "P1")[:8],
+                    str(evidence_json or "{}")[:12000],
+                    str(due_at or "") or None,
+                    str(created_by or "")[:160],
+                    now,
+                    now,
+                ),
+            )
+            task_id = int(cursor.lastrowid)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT t.*, COALESCE(s.name, '') AS store_name,
+                       COALESCE(p.title, '') AS product_title
+                FROM operation_tasks t
+                LEFT JOIN stores s ON s.id=t.store_id
+                LEFT JOIN products p
+                    ON p.store_id=t.store_id AND p.product_id=t.product_id
+                WHERE t.id=?
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("运营任务创建后无法读取")
+        return dict(row)
+
+    def update_operation_task(
+        self,
+        task_id: int,
+        *,
+        status: str,
+        due_at: str | None = None,
+        completed_by: str = "",
+    ) -> dict[str, Any]:
+        now = _now()
+        completed_at = now if status == "done" else None
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE operation_tasks
+                SET status=?, due_at=COALESCE(?, due_at),
+                    completed_at=?, completed_by=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    due_at,
+                    completed_at,
+                    str(completed_by or "")[:160],
+                    now,
+                    int(task_id),
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("运营任务不存在")
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT t.*, COALESCE(s.name, '') AS store_name,
+                       COALESCE(p.title, '') AS product_title
+                FROM operation_tasks t
+                LEFT JOIN stores s ON s.id=t.store_id
+                LEFT JOIN products p
+                    ON p.store_id=t.store_id AND p.product_id=t.product_id
+                WHERE t.id=?
+                """,
+                (int(task_id),),
+            ).fetchone()
+        if row is None:
+            raise ValueError("运营任务不存在")
+        return dict(row)
+
+    def list_operation_tasks(
+        self,
+        *,
+        status: str = "",
+        store_id: int | None = None,
+        product_id: str = "",
+        priority: str = "",
+        category: str = "",
+        search: str = "",
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT t.*, COALESCE(s.name, '') AS store_name,
+                   COALESCE(p.title, '') AS product_title
+            FROM operation_tasks t
+            LEFT JOIN stores s ON s.id=t.store_id
+            LEFT JOIN products p
+                ON p.store_id=t.store_id AND p.product_id=t.product_id
+            WHERE 1=1
+        """
+        args: list[Any] = []
+        if status:
+            sql += " AND t.status=?"
+            args.append(status)
+        if store_id is not None:
+            sql += " AND t.store_id=?"
+            args.append(int(store_id))
+        if product_id:
+            sql += " AND t.product_id=?"
+            args.append(str(product_id))
+        if priority:
+            sql += " AND t.priority=?"
+            args.append(str(priority))
+        if category:
+            sql += " AND t.category=?"
+            args.append(str(category))
+        if search:
+            term = f"%{search.strip()}%"
+            sql += (
+                " AND (t.title LIKE ? OR t.detail LIKE ?"
+                " OR t.alert_key LIKE ? OR p.title LIKE ? OR s.name LIKE ?)"
+            )
+            args.extend((term, term, term, term, term))
+        sql += """
+            ORDER BY
+                CASE t.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 ELSE 2 END,
+                CASE WHEN t.status='open' THEN 0 ELSE 1 END,
+                COALESCE(t.due_at, '9999-12-31') ASC,
+                t.updated_at DESC
+        """
+        with self.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(sql, args).fetchall()
+            ]
+
+    def get_operation_rules(self) -> dict[str, str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM operation_rules ORDER BY key"
+            ).fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
+
+    def save_operation_rules(self, values: dict[str, str]) -> dict[str, str]:
+        if not values:
+            return self.get_operation_rules()
+        now = _now()
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO operation_rules(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                [
+                    (str(key)[:120], str(value)[:2000], now)
+                    for key, value in values.items()
+                ],
+            )
+        return self.get_operation_rules()
 
     def record_upload_history(
         self,

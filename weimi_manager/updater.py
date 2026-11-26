@@ -10,7 +10,7 @@ import subprocess
 import time
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote, urljoin, urlsplit
@@ -18,6 +18,11 @@ from urllib.parse import unquote, urljoin, urlsplit
 import requests
 
 from . import __version__
+from .update_notes import (
+    build_update_summary,
+    normalize_update_summary,
+    release_notes_url_from_download,
+)
 
 ProgressCallback = Callable[[str, int, int], None]
 DEFAULT_UPDATE_SOURCE = (
@@ -33,6 +38,18 @@ GITHUB_RELEASE_ASSET = re.compile(
     r"^https://github\.com/([^/]+)/([^/]+)/releases/download/"
     r"([^/]+)/([^/?#]+)$",
     re.IGNORECASE,
+)
+DEFAULT_REQUIRED_UPDATE_FILES = (
+    "LangLang.exe",
+    "_internal/update_manifest.json",
+    "_internal/webui/dist/index.html",
+    "_internal/webui/dist/assets/ActivityPage-*.js",
+    "_internal/webui/dist/assets/StoresPage-*.js",
+    "_internal/webui/dist/assets/OrdersParityPage-*.js",
+    "_internal/webui/dist/assets/ProductsPage-*.js",
+    "_internal/webui/dist/assets/autoRefresh-*.js",
+    "_internal/PySide6/Qt6WebEngineCore.dll",
+    "_internal/PySide6/Qt6WebEngineWidgets.dll",
 )
 
 
@@ -55,6 +72,11 @@ class UpdateInfo:
     sha256: str = ""
     mandatory: bool = False
     published_at: str = ""
+    required_files: tuple[str, ...] = ()
+    channel: str = ""
+    prerelease: bool = False
+    summary: list[dict[str, object]] = field(default_factory=list)
+    release_notes_url: str = ""
 
 
 @dataclass(slots=True)
@@ -177,6 +199,37 @@ def _github_manifest_via_api(source: str) -> dict:
     return data
 
 
+def _github_manifest_via_latest_redirect(source: str) -> dict:
+    match = GITHUB_LATEST_MANIFEST.match(source)
+    if not match:
+        raise ValueError("不是 GitHub latest manifest 地址")
+    owner, repository = match.group(1), match.group(2)
+    session = _requests_session()
+    response = session.get(
+        f"https://github.com/{owner}/{repository}/releases/latest",
+        allow_redirects=False,
+        timeout=(8, 25),
+    )
+    location = str(response.headers.get("Location") or "")
+    tag_match = re.search(r"/releases/tag/([^/?#]+)", location)
+    if response.status_code not in {301, 302, 303, 307, 308} or not tag_match:
+        raise ValueError("GitHub Latest 重定向中没有稳定 tag")
+    tag = unquote(tag_match.group(1))
+    manifest_url = (
+        f"https://github.com/{owner}/{repository}/releases/download/"
+        f"{tag}/update_manifest.json"
+    )
+    manifest_response = _get_with_retries(
+        session,
+        manifest_url,
+        timeout=(8, 25),
+    )
+    data = manifest_response.json()
+    if not isinstance(data, dict):
+        raise ValueError("GitHub tag 更新清单格式不正确")
+    return data
+
+
 def _github_download_via_api(download_url: str) -> str | None:
     match = GITHUB_RELEASE_ASSET.match(download_url)
     if not match:
@@ -209,9 +262,15 @@ def _read_manifest(source: str, project_dir: Path | None) -> tuple[dict, str]:
     source = source.strip()
     if source.startswith(("http://", "https://")):
         if GITHUB_LATEST_MANIFEST.match(source):
+            data: dict | None = None
             try:
                 data = _github_manifest_via_api(source)
             except Exception:
+                try:
+                    data = _github_manifest_via_latest_redirect(source)
+                except Exception:
+                    data = None
+            if data is None:
                 response = _get_with_retries(
                     _requests_session(),
                     source,
@@ -240,12 +299,19 @@ def _read_manifest(source: str, project_dir: Path | None) -> tuple[dict, str]:
 def check_for_update(
     source: str = "",
     project_dir: Path | None = None,
+    *,
+    current_version: str | None = None,
 ) -> UpdateInfo:
+    source = (
+        source.strip()
+        or os.environ.get("LANGLANG_UPDATE_SOURCE", "").strip()
+        or DEFAULT_UPDATE_SOURCE
+    )
     payload, resolved_source = _read_manifest(source, project_dir)
     if not payload:
         return UpdateInfo(
-            current_version=__version__,
-            latest_version=__version__,
+            current_version=str(current_version or __version__),
+            latest_version=str(current_version or __version__),
             available=False,
             notes="没有配置更新源，当前已是最新本地版本。",
             source=resolved_source,
@@ -253,31 +319,76 @@ def check_for_update(
     latest = str(payload.get("version") or payload.get("latest_version") or "")
     if not latest:
         raise ValueError("更新清单缺少 version")
+    required_files = payload.get("required_files")
+    if not isinstance(required_files, (list, tuple)):
+        required_files = ()
+    current = str(current_version or __version__)
+    notes = str(payload.get("notes") or "")
+    download_url = _resolve_download_url(
+        resolved_source,
+        str(payload.get("download_url") or ""),
+    )
+    summary = normalize_update_summary(payload.get("summary"))
+    if not summary:
+        summary = build_update_summary(notes)
+    release_notes_url = str(
+        payload.get("release_notes_url")
+        or payload.get("release_url")
+        or release_notes_url_from_download(download_url)
+    ).strip()
     return UpdateInfo(
-        current_version=__version__,
+        current_version=current,
         latest_version=latest,
-        available=_version_tuple(latest) > _version_tuple(__version__),
-        download_url=_resolve_download_url(
-            resolved_source,
-            str(payload.get("download_url") or ""),
-        ),
-        notes=str(payload.get("notes") or ""),
+        available=_version_tuple(latest) > _version_tuple(current),
+        download_url=download_url,
+        notes=notes,
         source=resolved_source,
         sha256=str(payload.get("sha256") or "").strip().lower(),
         mandatory=bool(payload.get("mandatory", False)),
         published_at=str(payload.get("published_at") or ""),
+        required_files=tuple(
+            str(value).strip()
+            for value in required_files
+            if str(value).strip()
+        ),
+        channel=str(payload.get("channel") or "").strip().casefold(),
+        prerelease=bool(payload.get("prerelease", False)),
+        summary=summary,
+        release_notes_url=release_notes_url,
     )
 
 
-def _safe_extract_zip(archive: Path, destination: Path) -> None:
+def _safe_extract_zip(
+    archive: Path,
+    destination: Path,
+    progress: ProgressCallback | None = None,
+) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
     with zipfile.ZipFile(archive) as package:
-        for member in package.infolist():
+        members = package.infolist()
+        for member in members:
             target = (destination / member.filename).resolve()
             if not target.is_relative_to(root):
                 raise ValueError("更新包包含非法路径")
-        package.extractall(destination)
+        total = sum(max(0, member.file_size) for member in members)
+        extracted = 0
+        if progress:
+            progress("正在解压更新包", 0, total)
+        for member in members:
+            target = (destination / member.filename).resolve()
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with package.open(member, "r") as source, target.open("wb") as output:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    output.write(chunk)
+                    extracted += len(chunk)
+                    if progress:
+                        progress("正在解压更新包", extracted, total)
+        if progress:
+            progress("更新包已解压完成", total, total)
 
 
 def _find_package_root(staging_root: Path) -> Path:
@@ -291,6 +402,54 @@ def _find_package_root(staging_root: Path) -> Path:
     if len(candidates) != 1:
         raise ValueError("更新包结构不正确：未找到唯一的 LangLang.exe")
     return candidates[0]
+
+
+def _required_update_files(info: UpdateInfo) -> tuple[str, ...]:
+    values = info.required_files or DEFAULT_REQUIRED_UPDATE_FILES
+    normalized: list[str] = []
+    for value in values:
+        pattern = str(value).strip().replace("\\", "/")
+        if not pattern:
+            continue
+        path = Path(pattern)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"更新清单包含非法必需文件路径：{value}")
+        normalized.append(pattern)
+    if not normalized:
+        raise ValueError("更新清单没有可校验的必需文件")
+    return tuple(dict.fromkeys(normalized))
+
+
+def _verify_staged_package(
+    package_root: Path,
+    info: UpdateInfo,
+) -> None:
+    missing = [
+        pattern
+        for pattern in _required_update_files(info)
+        if not any(
+            path.is_file()
+            for path in package_root.glob(pattern)
+        )
+    ]
+    if missing:
+        raise ValueError(
+            "更新包缺少必需文件：" + ", ".join(missing)
+        )
+    package_manifest = package_root / "_internal" / "update_manifest.json"
+    if not package_manifest.is_file():
+        package_manifest = package_root / "update_manifest.json"
+    if not package_manifest.is_file():
+        raise ValueError("更新包缺少 update_manifest.json")
+    bundled = json.loads(
+        package_manifest.read_text(encoding="utf-8-sig")
+    )
+    bundled_version = str(bundled.get("version") or "")
+    if (
+        _version_tuple(bundled_version)
+        != _version_tuple(info.latest_version)
+    ):
+        raise ValueError("更新包版本与更新清单不一致")
 
 
 def _download_archive(
@@ -317,7 +476,7 @@ def _download_archive(
             pass
     if info.download_url.startswith("file://"):
         source_path = Path(unquote(urlsplit(info.download_url).path))
-        shutil.copy2(source_path, partial)
+        _copy_file_with_progress(source_path, partial, progress)
     elif info.download_url.startswith(("http://", "https://")):
         session = _requests_session()
         download_url = info.download_url
@@ -386,7 +545,7 @@ def _download_archive(
                                 progress(
                                     "正在下载更新包",
                                     downloaded,
-                                    total or downloaded,
+                                    total,
                                 )
                     actual_size = partial.stat().st_size
                     if total and actual_size < total:
@@ -443,14 +602,28 @@ def _download_archive(
         source_path = Path(info.download_url)
         if not source_path.is_file():
             raise FileNotFoundError(f"更新包不存在：{source_path}")
-        shutil.copy2(source_path, partial)
+        _copy_file_with_progress(source_path, partial, progress)
+    if progress:
+        completed_size = partial.stat().st_size
+        progress("下载完成，正在校验更新包", completed_size, completed_size)
     for verification_attempt in range(2):
         if not info.sha256:
             break
         digest = hashlib.sha256()
+        verification_total = partial.stat().st_size
+        verification_done = 0
+        if progress:
+            progress("正在校验更新包 SHA256", 0, verification_total)
         with partial.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
+                verification_done += len(chunk)
+                if progress:
+                    progress(
+                        "正在校验更新包 SHA256",
+                        verification_done,
+                        verification_total,
+                    )
         actual = digest.hexdigest().lower()
         if actual != info.sha256:
             partial.unlink(missing_ok=True)
@@ -470,6 +643,9 @@ def _download_archive(
                         sha256=info.sha256,
                         mandatory=info.mandatory,
                         published_at=info.published_at,
+                        required_files=info.required_files,
+                        channel=info.channel,
+                        prerelease=info.prerelease,
                     ),
                     destination,
                     progress,
@@ -479,6 +655,25 @@ def _download_archive(
             raise ValueError("更新包 SHA256 校验失败，已取消安装")
         break
     partial.replace(destination)
+
+
+def _copy_file_with_progress(
+    source: Path,
+    destination: Path,
+    progress: ProgressCallback | None,
+) -> None:
+    total = source.stat().st_size
+    copied = 0
+    if progress:
+        progress("正在读取更新包", 0, total)
+    with source.open("rb") as input_handle, destination.open("wb") as output_handle:
+        for chunk in iter(lambda: input_handle.read(1024 * 1024), b""):
+            output_handle.write(chunk)
+            copied += len(chunk)
+            if progress:
+                progress("正在读取更新包", copied, total)
+    if progress:
+        progress("更新包读取完成", total, total)
 
 
 def download_and_stage_update(
@@ -501,8 +696,13 @@ def download_and_stage_update(
     )
     if staging_root.exists():
         shutil.rmtree(staging_root)
-    _safe_extract_zip(archive_path, staging_root)
-    package_root = _find_package_root(staging_root)
+    _safe_extract_zip(archive_path, staging_root, progress)
+    try:
+        package_root = _find_package_root(staging_root)
+        _verify_staged_package(package_root, info)
+    except (OSError, ValueError, json.JSONDecodeError):
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
     package_manifest = package_root / "update_manifest.json"
     if not package_manifest.is_file():
         package_manifest = package_root / "_internal" / "update_manifest.json"
@@ -560,11 +760,11 @@ function Write-UpdateLog([string]$Message) {
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
 }
 $backup = ""
-$newCopy = ""
 $parent = Split-Path -Parent $Target
 $targetName = Split-Path -Leaf $Target
 $targetExe = Join-Path $Target "LangLang.exe"
-Set-Location -LiteralPath (Split-Path -Parent $LogPath)
+$updatesRoot = Split-Path -Parent $LogPath
+Set-Location -LiteralPath $updatesRoot
 function Get-TargetProcessIds {
     @(
         Get-Process -Name "LangLang" -ErrorAction SilentlyContinue |
@@ -688,21 +888,14 @@ try {
         }
     }
 
-    $backup = Join-Path $parent (
-        $targetName + ".update-backup-" +
+    $backup = Join-Path $updatesRoot (
+        "rollback-" + $targetName + "-" +
         (Get-Date -Format "yyyyMMdd-HHmmss-fff")
-    )
-    $newCopy = Join-Path $parent (
-        $targetName + ".update-new-" + [guid]::NewGuid().ToString("N")
     )
     Write-UpdateLog (
         "Preparing update: expected=" + $ExpectedVersion +
         " source=" + $Source + " target=" + $Target
     )
-    Copy-Item -LiteralPath $Source -Destination $newCopy -Recurse -Force
-    if (!(Test-Path -LiteralPath (Join-Path $newCopy "LangLang.exe"))) {
-        throw "更新文件预复制不完整"
-    }
     $legacyInternalAuth = Join-Path $Target "_internal\assets\auth_config.json"
     $legacySidecarAuth = Join-Path $Target "auth_config.json"
     $legacyEnv = Join-Path $Target ".env.local"
@@ -713,46 +906,34 @@ try {
         $preservedAuth = $legacyInternalAuth
     }
     if ($preservedAuth) {
-        Copy-Item -LiteralPath $preservedAuth `
-            -Destination (Join-Path $newCopy "auth_config.json") -Force
-        $newInternalAssets = Join-Path $newCopy "_internal\assets"
+        $targetSidecarAuth = Join-Path $Target "auth_config.json"
+        if (
+            [IO.Path]::GetFullPath($preservedAuth) -ne
+            [IO.Path]::GetFullPath($targetSidecarAuth)
+        ) {
+            Copy-Item -LiteralPath $preservedAuth `
+                -Destination $targetSidecarAuth -Force
+        }
+        $newInternalAssets = Join-Path $Target "_internal\assets"
         New-Item -ItemType Directory -Path $newInternalAssets -Force | Out-Null
-        Copy-Item -LiteralPath $preservedAuth `
-            -Destination (Join-Path $newInternalAssets "auth_config.json") -Force
+        $targetInternalAuth = Join-Path $newInternalAssets "auth_config.json"
+        if (
+            [IO.Path]::GetFullPath($preservedAuth) -ne
+            [IO.Path]::GetFullPath($targetInternalAuth)
+        ) {
+            Copy-Item -LiteralPath $preservedAuth `
+                -Destination $targetInternalAuth -Force
+        }
     }
     if (Test-Path -LiteralPath $legacyEnv) {
         Copy-Item -LiteralPath $legacyEnv `
-            -Destination (Join-Path $newCopy ".env.local") -Force
+            -Destination (Join-Path $Target ".env.local") -Force
     }
 
-    Write-UpdateLog "Backup: $Target -> $backup"
-    $targetMoved = $false
-    $inPlaceUpdated = $false
-    try {
-        Invoke-WithRetry {
-            Move-Item -LiteralPath $Target -Destination $backup -ErrorAction Stop
-        } "move target to backup"
-        $targetMoved = $true
-        Invoke-WithRetry {
-            Move-Item -LiteralPath $newCopy -Destination $Target -ErrorAction Stop
-        } "move new version into target"
-        $newCopy = ""
-    } catch {
-        Write-UpdateLog (
-            "Directory swap unavailable, switching to in-place update: " +
-            $_.Exception.Message
-        )
-        Copy-TreeWithRetry $Target $backup "copy backup before in-place update"
-        Copy-TreeWithRetry $Source $Target "in-place update"
-        $inPlaceUpdated = $true
-        if ($newCopy -and (Test-Path -LiteralPath $newCopy)) {
-            Invoke-WithRetry {
-                Remove-Item -LiteralPath $newCopy -Recurse -Force -ErrorAction Stop
-            } "remove unused staged copy"
-        }
-        $newCopy = ""
-        Write-UpdateLog "In-place update completed"
-    }
+    Write-UpdateLog "Rollback copy: $Target -> $backup"
+    Copy-TreeWithRetry $Target $backup "copy rollback before in-place update"
+    Copy-TreeWithRetry $Source $Target "in-place update"
+    Write-UpdateLog "In-place update completed in original folder"
     $newProcess = Start-Process `
         -FilePath (Join-Path $Target "LangLang.exe") `
         -WorkingDirectory $Target `
@@ -765,26 +946,17 @@ try {
         )
     }
     Write-UpdateLog "New version started"
+    if ($backup -and (Test-Path -LiteralPath $backup)) {
+        Invoke-WithRetry {
+            Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop
+        } "remove successful rollback copy"
+        $backup = ""
+        Write-UpdateLog "Verified rollback copy removed"
+    }
 } catch {
     Write-UpdateLog ("Update failed: " + $_.Exception.Message)
-    if ($newCopy -and (Test-Path -LiteralPath $newCopy)) {
-        Invoke-WithRetry {
-            Remove-Item -LiteralPath $newCopy -Recurse -Force -ErrorAction Stop
-        } "remove incomplete new version"
-    }
     if ($backup -and (Test-Path -LiteralPath $backup)) {
-        if ($inPlaceUpdated -and (Test-Path -LiteralPath $Target)) {
-            Copy-TreeWithRetry $backup $Target "restore previous version in-place"
-        } elseif (Test-Path -LiteralPath $Target) {
-            Invoke-WithRetry {
-                Remove-Item -LiteralPath $Target -Recurse -Force -ErrorAction Stop
-            } "remove incomplete target"
-        }
-        if (!$inPlaceUpdated) {
-            Invoke-WithRetry {
-                Move-Item -LiteralPath $backup -Destination $Target -ErrorAction Stop
-            } "restore previous version"
-        }
+        Copy-TreeWithRetry $backup $Target "restore previous version in-place"
         Write-UpdateLog "Previous version restored"
     }
     if (
