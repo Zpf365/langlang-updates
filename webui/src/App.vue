@@ -67,7 +67,9 @@ const navEmoji = {
   customer_service: "💬",
 };
 const sidebarUtilityLinks = computed(() => [
-  ["采购账号", "shopping-cart", "/procurement-accounts"],
+  ...(hasEntitlement("feature.procurement_association")
+    ? [["采购账号", "shopping-cart", "/procurement-accounts"]]
+    : []),
   ["物流监控", "radar", "/logistics"],
   ["AI客服", "message", "/customer-service"],
   ["利润统计", "chart", "/statistics"],

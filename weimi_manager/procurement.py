@@ -65,6 +65,16 @@ PLATFORM_COOKIE_DOMAINS = {
     "jd": ".jd.com",
 }
 
+CHECKOUT_URL_MARKERS = (
+    "confirm_order",
+    "confirmorder",
+    "/order/confirm",
+    "buy.1688.com",
+    "order.1688.com",
+    "buyer_make_order",
+    "smart_make_order",
+)
+
 
 def _default_cookie_domain(platform: str) -> str:
     return PLATFORM_COOKIE_DOMAINS.get(
@@ -83,6 +93,174 @@ def _wait_for_page_close(page: Any) -> None:
     except Exception as exc:
         if "closed" not in str(exc).casefold():
             raise
+
+
+def _page_frames(page: Any) -> list[Any]:
+    frames: list[Any] = [page]
+    try:
+        for frame in page.frames:
+            if frame not in frames:
+                frames.append(frame)
+    except Exception:
+        pass
+    return frames
+
+
+def _is_checkout_url(value: str) -> bool:
+    current = str(value or "").casefold()
+    return any(marker in current for marker in CHECKOUT_URL_MARKERS)
+
+
+def _checkout_attempt_key(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    return f"{parsed.netloc.casefold()}{parsed.path or '/'}"
+
+
+def _set_checkout_address_preparing(
+    page: Any,
+    ready: bool,
+) -> None:
+    try:
+        page.evaluate(
+            """(ready) => {
+              const className = 'langlang-address-preparing';
+              const key = `langlang-address-ready:${location.pathname}${location.search}`;
+              if (ready) {
+                try { sessionStorage.setItem(key, '1'); } catch (_error) {}
+                document.documentElement.classList.remove(className);
+              } else {
+                try { sessionStorage.removeItem(key); } catch (_error) {}
+                document.documentElement.classList.add(className);
+              }
+            }""",
+            bool(ready),
+        )
+    except Exception:
+        pass
+
+
+def _wait_for_checkout_address_entry(
+    page: Any,
+    timeout_ms: int = 20000,
+) -> bool:
+    deadline = time.monotonic() + max(1, timeout_ms) / 1000
+    while time.monotonic() < deadline:
+        for scope in _page_frames(page):
+            try:
+                text = re.sub(
+                    r"\s+",
+                    "",
+                    scope.locator("body").inner_text(timeout=500),
+                )
+                if (
+                    re.search(
+                        r"修改地址|使用临时地址|编辑临时地址|更换地址",
+                        text,
+                    )
+                    and re.search(
+                        r"立即下单|提交订单|确认订单",
+                        text,
+                    )
+                ):
+                    return True
+            except Exception:
+                continue
+        time.sleep(0.25)
+    return False
+
+
+_PURCHASE_SUCCESS_ORDER_ID_KEYS = (
+    "orderId",
+    "order_id",
+    "tradeId",
+    "trade_id",
+    "tradeNo",
+    "trade_no",
+)
+
+
+def extract_purchase_completion_evidence(
+    url: str,
+    body_text: str = "",
+) -> dict[str, Any]:
+    """Read a purchase success URL without depending on the success page body."""
+
+    current_url = str(url or "").strip()
+    reason = ""
+    upstream_order_id = ""
+    for _depth in range(4):
+        if not current_url:
+            break
+        parsed = urlparse(current_url)
+        path = unquote(parsed.path or "").casefold()
+        if "make_order_success" in path:
+            reason = "make_order_success"
+        elif "paysuccess" in path:
+            reason = reason or "payment_success_page"
+        elif "pay_result" in path or "payment/result" in path:
+            reason = reason or "payment_result_page"
+
+        query = parse_qs(parsed.query, keep_blank_values=False)
+        for key in _PURCHASE_SUCCESS_ORDER_ID_KEYS:
+            for value in query.get(key, []):
+                candidate = str(value or "").strip()
+                if candidate.isdigit():
+                    upstream_order_id = candidate
+                    break
+            if upstream_order_id:
+                break
+        next_url = ""
+        for key in (
+            "returnUrl",
+            "return_url",
+            "redirectUrl",
+            "redirect_url",
+        ):
+            values = query.get(key) or []
+            if values:
+                next_url = unquote(str(values[0] or "").strip())
+                break
+        if not next_url or next_url == current_url:
+            break
+        current_url = next_url
+
+    compact_body = re.sub(r"\s+", "", str(body_text or ""))
+    body_success = any(
+        phrase in compact_body
+        for phrase in (
+            "下单成功",
+            "支付成功",
+            "付款成功",
+            "订单提交成功",
+            "等待卖家发货",
+        )
+    )
+    if body_success and not reason:
+        reason = "payment_success_text"
+    return {
+        "detected": bool(reason),
+        "reason": reason,
+        "upstream_order_id": upstream_order_id,
+    }
+
+
+def _purchase_completion_evidence(page: Any) -> dict[str, Any]:
+    try:
+        current_url = str(page.url or "")
+    except Exception:
+        current_url = ""
+    evidence = extract_purchase_completion_evidence(current_url)
+    if evidence["detected"]:
+        return evidence
+    try:
+        body = page.locator("body").inner_text(timeout=800)
+    except Exception:
+        body = ""
+    return extract_purchase_completion_evidence(current_url, body)
+
+
+def _purchase_completion_signal(page: Any) -> str:
+    return str(_purchase_completion_evidence(page).get("reason") or "")
 
 
 def canonical_platform(platform: str) -> str:
@@ -587,7 +765,51 @@ def match_procurement_purchase(
     sku_tokens: list[str],
     started_after: int,
     before_order_ids: set[str],
+    upstream_order_id: str = "",
 ) -> dict[str, Any]:
+    target_order_id = str(upstream_order_id or "").strip()
+    if target_order_id:
+        exact = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and str(
+                record.get("external_order_id")
+                or record.get("trade_no")
+                or ""
+            ).strip()
+            == target_order_id
+        ]
+        if not exact:
+            return {
+                "status": "not_found",
+                "reason": f"官方尚未回读到采购订单 {target_order_id}",
+                "candidates": [],
+            }
+        if len(exact) > 1:
+            return {
+                "status": "ambiguous",
+                "reason": f"官方返回了 {len(exact)} 条相同订单号记录",
+                "candidates": exact,
+            }
+        order = exact[0]
+        if not str(order.get("goods_title") or "").strip() and int(
+            order.get("goods_count") or 0
+        ) <= 0:
+            return {
+                "status": "not_found",
+                "reason": (
+                    f"官方仅返回订单号 {target_order_id}，"
+                    "商品明细尚未可读"
+                ),
+                "candidates": exact,
+            }
+        return {
+            "status": "confirmed",
+            "reason": "",
+            "order": order,
+            "candidates": exact,
+        }
     target_id = str(source_product_id or "").strip()
     if not target_id:
         return {
@@ -690,6 +912,18 @@ def _first(data: dict[str, Any], keys: tuple[str, ...], default: Any = "") -> An
     return default
 
 
+def _first_in_tree(
+    value: Any,
+    keys: tuple[str, ...],
+    default: Any = "",
+) -> Any:
+    for node in _walk_dicts(value):
+        result = _first(node, keys)
+        if result is not None and result != "":
+            return result
+    return default
+
+
 def _int(value: Any) -> int:
     try:
         return int(round(float(value or 0)))
@@ -719,6 +953,17 @@ def _amount_cents(platform: str, data: dict[str, Any]) -> tuple[int, str, str]:
     return 0, "", "cent"
 
 
+def _amount_cents_in_tree(
+    platform: str,
+    value: Any,
+) -> tuple[int, str, str]:
+    for node in _walk_dicts(value):
+        result = _amount_cents(platform, node)
+        if result[0] > 0:
+            return result
+    return 0, "", "cent"
+
+
 def _walk_dicts(value: Any):
     if isinstance(value, dict):
         yield value
@@ -727,6 +972,14 @@ def _walk_dicts(value: Any):
     elif isinstance(value, list):
         for child in value:
             yield from _walk_dicts(child)
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.startswith(("{", "[")):
+            try:
+                nested = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return
+            yield from _walk_dicts(nested)
 
 
 def normalize_procurement_records(
@@ -743,6 +996,19 @@ def normalize_procurement_records(
                 )
             )
             mail_no = str(
+                _first_in_tree(
+                    item,
+                    (
+                        "mailNo",
+                        "mail_no",
+                        "waybillNo",
+                        "waybill_no",
+                        "billNo",
+                        "trackingNumber",
+                    ),
+                )
+            )
+            direct_mail_no = str(
                 _first(
                     item,
                     (
@@ -769,7 +1035,7 @@ def normalize_procurement_records(
                 )
             )
             goods_title = str(
-                _first(
+                _first_in_tree(
                     item,
                     (
                         "itemName",
@@ -782,43 +1048,99 @@ def normalize_procurement_records(
                     ),
                 )
             )
-            if not (trade_no or mail_no):
+            # Only nodes that directly own an order identity are record roots.
+            # Nested fields may enrich that node but must not create a second
+            # order keyed by a descendant waybill number.
+            if not (trade_no or direct_mail_no):
                 continue
-            external_id = trade_no or mail_no
-            pay, pay_source, pay_unit = _amount_cents(platform, item)
-            status = str(
-                _first(item, ("status", "tradeStatus", "orderStatus", "logisticsStatus"))
+            external_id = trade_no or direct_mail_no
+            pay, pay_source, pay_unit = _amount_cents_in_tree(
+                platform,
+                item,
             )
-            records[external_id] = {
+            status = str(
+                _first_in_tree(
+                    item,
+                    (
+                        "status",
+                        "tradeStatus",
+                        "orderStatus",
+                        "logisticsStatus",
+                        "orderStatusDesc",
+                    ),
+                )
+            )
+            source_product_ids = sorted({
+                str(node.get(key))
+                for node in _walk_dicts(item)
+                for key in (
+                    "offerId",
+                    "offer_id",
+                    "itemId",
+                    "item_id",
+                    "productId",
+                    "product_id",
+                )
+                if node.get(key) not in (None, "")
+            })
+            normalized = {
                 "external_order_id": external_id,
                 "trade_no": trade_no or external_id,
                 "mail_no": mail_no,
                 "pickup_code": pickup_code,
                 "station_name": str(
-                    _first(
+                    _first_in_tree(
                         item,
                         ("stationName", "station_name", "pickupStation", "siteName"),
                     )
                 ),
                 "station_phone": str(
-                    _first(item, ("stationPhone", "station_phone", "phone", "mobile"))
+                    _first_in_tree(
+                        item,
+                        (
+                            "stationPhone",
+                            "station_phone",
+                            "phone",
+                            "mobile",
+                        ),
+                    )
                 ),
                 "status": status,
                 "status_text": str(
-                    _first(item, ("statusText", "status_text", "statusName"), default=status)
+                    _first_in_tree(
+                        item,
+                        (
+                            "statusText",
+                            "status_text",
+                            "statusName",
+                            "orderStatusDesc",
+                        ),
+                        default=status,
+                    )
                 ),
                 "goods_title": goods_title,
                 "goods_image": str(
-                    _first(item, ("itemImg", "item_img", "goodsImage", "picUrl"))
+                    _first_in_tree(
+                        item,
+                        (
+                            "itemImg",
+                            "item_img",
+                            "goodsImage",
+                            "picUrl",
+                        ),
+                    )
                 ),
                 "goods_count": _int(
-                    _first(item, ("itemNum", "item_num", "quantity", "buyAmount"))
+                    _first_in_tree(
+                        item,
+                        ("itemNum", "item_num", "quantity", "buyAmount"),
+                    )
                 ),
                 "pay_amount": pay,
                 "pay_amount_source": pay_source,
                 "pay_amount_unit": pay_unit,
                 "unit_price": parse_procurement_amount_cents(
-                    _first(
+                    _first_in_tree(
                         item,
                         (
                             "unitPrice",
@@ -831,7 +1153,7 @@ def normalize_procurement_records(
                     pay_unit,
                 ),
                 "freight_amount": parse_procurement_amount_cents(
-                    _first(
+                    _first_in_tree(
                         item,
                         (
                             "postFee",
@@ -845,7 +1167,7 @@ def normalize_procurement_records(
                     pay_unit,
                 ),
                 "purchase_time": str(
-                    _first(
+                    _first_in_tree(
                         item,
                         (
                             "createTime",
@@ -859,7 +1181,7 @@ def normalize_procurement_records(
                     )
                 ),
                 "sku_text": str(
-                    _first(
+                    _first_in_tree(
                         item,
                         (
                             "skuName",
@@ -871,20 +1193,9 @@ def normalize_procurement_records(
                         ),
                     )
                 ),
-                "source_product_ids": [
-                    str(item.get(key))
-                    for key in (
-                        "offerId",
-                        "offer_id",
-                        "itemId",
-                        "item_id",
-                        "productId",
-                        "product_id",
-                    )
-                    if item.get(key) not in (None, "")
-                ],
+                "source_product_ids": source_product_ids,
                 "carrier": str(
-                    _first(
+                    _first_in_tree(
                         item,
                         (
                             "deliveryId",
@@ -899,7 +1210,7 @@ def normalize_procurement_records(
                     )
                 ),
                 "tracking_time": str(
-                    _first(
+                    _first_in_tree(
                         item,
                         (
                             "deliveryTime",
@@ -911,15 +1222,64 @@ def normalize_procurement_records(
                     )
                 ),
                 "seller": str(
-                    _first(item, ("seller", "sellerName", "companyName", "supplier"))
+                    _first_in_tree(
+                        item,
+                        (
+                            "seller",
+                            "sellerName",
+                            "sellerLoginId",
+                            "companyName",
+                            "supplier",
+                        ),
+                    )
                 ),
                 "buyer": str(
-                    _first(item, ("buyer", "buyerName", "receiverName", "rcvName"))
+                    _first_in_tree(
+                        item,
+                        (
+                            "buyer",
+                            "buyerName",
+                            "receiverName",
+                            "rcvName",
+                        ),
+                    )
                 ),
                 "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "raw": item,
                 "platform": platform,
             }
+            existing = records.get(external_id)
+            if existing is None:
+                records[external_id] = normalized
+                continue
+            for key, value in normalized.items():
+                if key in {
+                    "source_product_ids",
+                    "raw",
+                    "platform",
+                    "fetched_at",
+                }:
+                    continue
+                current = existing.get(key)
+                if value and (
+                    not current
+                    or (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value > 0
+                    )
+                ):
+                    existing[key] = value
+            existing["source_product_ids"] = sorted({
+                *existing.get("source_product_ids", []),
+                *source_product_ids,
+            })
+            existing_raw = existing.get("raw")
+            if (
+                not isinstance(existing_raw, dict)
+                or len(item) > len(existing_raw)
+            ):
+                existing["raw"] = item
     return list(records.values())
 
 
@@ -1965,30 +2325,56 @@ class ProcurementWebSession:
         self,
         account: dict[str, Any],
         context: Any,
+        upstream_order_id: str = "",
     ) -> list[dict[str, Any]]:
         platform = canonical_platform(str(account.get("platform") or ""))
-        order_url = (
-            "https://trade.1688.com/order/buyer_order_list.htm"
-            if platform == "1688"
-            else (
+        target_order_id = str(upstream_order_id or "").strip()
+        if platform == "1688":
+            order_url = (
+                "https://trade.1688.com/order/buyer_order_list.htm"
+                + (
+                    f"?orderIds={target_order_id}"
+                    if target_order_id
+                    else ""
+                )
+            )
+        else:
+            order_url = (
                 "https://buyertrade.taobao.com/trade/itemlist/"
                 "list_bought_items.htm"
             )
-        )
         order_page = context.new_page()
         captured: list[dict[str, Any]] = []
+        target_payload_seen = False
+        risk_control_message = ""
 
         def on_response(response) -> None:
+            nonlocal target_payload_seen, risk_control_message
             content_type = str(
                 response.headers.get("content-type") or ""
             ).casefold()
             if "json" not in content_type:
                 return
             try:
+                response_text = response.text()
                 data = response.json()
             except Exception:
                 return
+            if any(
+                marker in response_text
+                for marker in (
+                    "FAIL_SYS_USER_VALIDATE",
+                    "RGV587_ERROR",
+                    '"action":"captcha"',
+                )
+            ):
+                risk_control_message = (
+                    "1688 官方订单读取触发安全验证/风控，"
+                    "已停止且未继续绕过"
+                )
             captured.append({"url": response.url, "data": data})
+            if target_order_id and target_order_id in response_text:
+                target_payload_seen = True
 
         order_page.on("response", on_response)
         try:
@@ -1998,9 +2384,36 @@ class ProcurementWebSession:
                 timeout=60000,
             )
             order_page.wait_for_timeout(2500)
-            for _ in range(2):
+            final_url = str(order_page.url or "").casefold()
+            try:
+                body_text = order_page.locator("body").inner_text(
+                    timeout=1200
+                )
+            except Exception:
+                body_text = ""
+            if (
+                "login." in final_url
+                or "passport." in final_url
+                or "captcha" in final_url
+                or any(
+                    marker in str(body_text)
+                    for marker in ("请登录", "安全验证", "验证码")
+                )
+            ):
+                raise ProcurementError(
+                    "官方订单读取要求重新登录或安全验证"
+                )
+            if risk_control_message:
+                raise ProcurementError(risk_control_message)
+            for _ in range(4 if not target_order_id else 24):
                 order_page.mouse.wheel(0, 900)
                 order_page.wait_for_timeout(500)
+                if target_order_id and target_payload_seen:
+                    break
+                if risk_control_message:
+                    break
+            if risk_control_message:
+                raise ProcurementError(risk_control_message)
         finally:
             try:
                 order_page.remove_listener("response", on_response)
@@ -2017,9 +2430,17 @@ class ProcurementWebSession:
                 client = MtopClient(platform, cookies)
                 for api in MTOP_APIS[platform]:
                     data = (
-                        {"page": 1, "pageSize": 30}
+                        (
+                            {"orderId": target_order_id}
+                            if target_order_id
+                            else {"page": 1, "pageSize": 30}
+                        )
                         if "Order" in api or "trade" in api
-                        else {"pageNo": 1, "pageSize": 30}
+                        else (
+                            {"orderId": target_order_id}
+                            if target_order_id
+                            else {"pageNo": 1, "pageSize": 30}
+                        )
                     )
                     try:
                         payloads.append(client.call(api, data))
@@ -2027,7 +2448,149 @@ class ProcurementWebSession:
                         continue
             except ProcurementError:
                 pass
-        return normalize_procurement_records(platform, payloads)
+        records = normalize_procurement_records(platform, payloads)
+        if not target_order_id:
+            return records
+        return [
+            record
+            for record in records
+            if str(
+                record.get("external_order_id")
+                or record.get("trade_no")
+                or ""
+            ).strip()
+            == target_order_id
+        ]
+
+    def read_order_by_id(
+        self,
+        account: dict[str, Any],
+        upstream_order_id: str,
+    ) -> dict[str, Any]:
+        target_order_id = str(upstream_order_id or "").strip()
+        if not target_order_id.isdigit():
+            return {
+                "status": "error",
+                "reason": "1688 上游订单号无效",
+                "read_attempts": 0,
+            }
+        payload = self.db.get_procurement_session(int(account["id"]))
+        if not payload:
+            return {
+                "status": "login_required",
+                "reason": "采购账号登录会话不存在，请重新登录",
+                "read_attempts": 0,
+            }
+        platform = canonical_platform(str(account.get("platform") or ""))
+        if platform != "1688":
+            return {
+                "status": "error",
+                "reason": "指定订单号回读当前仅支持 1688",
+                "read_attempts": 0,
+            }
+        cookies = normalize_cookies(payload.get("cookies") or [])
+        if not cookies:
+            return {
+                "status": "login_required",
+                "reason": "采购账号登录会话不完整，请重新登录",
+                "read_attempts": 0,
+            }
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return {
+                "status": "error",
+                "reason": "缺少 Playwright 本地运行环境",
+                "read_attempts": 0,
+            }
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    **browser_launch_options(
+                        headless=True,
+                        args=["--no-first-run"],
+                    )
+                )
+                context = None
+                try:
+                    context = browser.new_context(
+                        viewport={"width": 1360, "height": 900},
+                    )
+                    context.add_cookies(
+                        [
+                            {
+                                "name": cookie["name"],
+                                "value": cookie["value"],
+                                "domain": cookie.get("domain")
+                                or _default_cookie_domain(platform),
+                                "path": cookie.get("path") or "/",
+                            }
+                            for cookie in cookies
+                        ]
+                    )
+                    records = self._read_order_list_in_context(
+                        account,
+                        context,
+                        target_order_id,
+                    )
+                    latest_cookies = normalize_cookies(context.cookies())
+                    if latest_cookies:
+                        refreshed_session = dict(payload)
+                        refreshed_session["cookies"] = latest_cookies
+                        refreshed_session[
+                            "last_order_readback_at"
+                        ] = datetime.now().isoformat(timespec="seconds")
+                        self.db.set_procurement_session(
+                            int(account["id"]),
+                            refreshed_session,
+                            "已登录",
+                            "",
+                        )
+                finally:
+                    if context is not None:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            reason = str(exc)
+            if "风控" in reason or "安全验证" in reason:
+                status = "risk_control"
+            elif any(
+                    marker in reason
+                    for marker in ("登录", "安全验证", "验证码")
+                ):
+                status = "login_required"
+            else:
+                status = "error"
+            return {
+                "status": status,
+                "reason": reason[:1000],
+                "read_attempts": 1,
+            }
+        if not records:
+            return {
+                "status": "not_found",
+                "reason": f"官方尚未回读到采购订单 {target_order_id}",
+                "read_attempts": 1,
+            }
+        return {
+            **match_procurement_purchase(
+                records,
+                source_product_id="",
+                quantity=0,
+                amount_cents=0,
+                sku_tokens=[],
+                started_after=0,
+                before_order_ids=set(),
+                upstream_order_id=target_order_id,
+            ),
+            "read_attempts": 1,
+        }
 
     def open_product(
         self,
@@ -2681,19 +3244,20 @@ def _attempt_official_checkout_address(
 
 
 def _visible_locator(page: Any, selectors: tuple[str, ...]) -> Any:
-    for selector in selectors:
-        try:
-            locator = page.locator(selector)
-            count = locator.count()
-        except Exception:
-            continue
-        for index in range(count):
-            candidate = locator.nth(index)
+    for scope in _page_frames(page):
+        for selector in selectors:
             try:
-                if candidate.is_visible():
-                    return candidate
+                locator = scope.locator(selector)
+                count = locator.count()
             except Exception:
                 continue
+            for index in range(count):
+                candidate = locator.nth(index)
+                try:
+                    if candidate.is_visible():
+                        return candidate
+                except Exception:
+                    continue
     return None
 
 
@@ -2708,9 +3272,11 @@ def _visible_labeled_field(
     between releases. Its labels remain visible next to the editable controls,
     so select the input whose nearest labelled wrapper is shortest.
     """
-    try:
-        found = page.evaluate(
-            r"""({marker, labelPattern}) => {
+    for scope_index, scope in enumerate(_page_frames(page)):
+        marker_value = f"{marker}-{scope_index}"
+        try:
+            found = scope.evaluate(
+                r"""({marker, labelPattern}) => {
               const pattern = new RegExp(labelPattern);
               const visible = (el) => {
                 if (!el) return false;
@@ -2759,24 +3325,24 @@ def _visible_labeled_field(
               );
               chosen.setAttribute('data-langlang-address-field', marker);
               return true;
-            }""",
-            {
-                "marker": marker,
-                "labelPattern": label_pattern,
-            },
-        )
-    except Exception:
-        return None
-    if not found:
-        return None
-    try:
-        locator = page.locator(
-            f"[data-langlang-address-field='{marker}']"
-        )
-        if locator.count() and locator.first.is_visible():
-            return locator.first
-    except Exception:
-        return None
+                }""",
+                {
+                    "marker": marker_value,
+                    "labelPattern": label_pattern,
+                },
+            )
+        except Exception:
+            continue
+        if not found:
+            continue
+        try:
+            locator = scope.locator(
+                f"[data-langlang-address-field='{marker_value}']"
+            )
+            if locator.count() and locator.first.is_visible():
+                return locator.first
+        except Exception:
+            continue
     return None
 
 
@@ -2851,9 +3417,16 @@ def _read_official_checkout_address(
 ) -> str:
     """Read a short official address block, excluding the injected sidebar."""
 
-    try:
-        value = page.evaluate(
-            r"""(wanted) => {
+    wanted = [
+        payload["display_name"],
+        payload["phone_base"],
+        payload["display_address"],
+    ]
+    matches: list[str] = []
+    for scope in _page_frames(page):
+        try:
+            value = scope.evaluate(
+                r"""(wanted) => {
               const compact = (value) =>
                 String(value || '').replace(/\s+/g, '');
               const needles = wanted.map(compact).filter(Boolean);
@@ -2887,16 +3460,16 @@ def _read_official_checkout_address(
               }
               candidates.sort((a, b) => a.length - b.length);
               return candidates[0] || '';
-            }""",
-            [
-                payload["display_name"],
-                payload["phone_base"],
-                payload["display_address"],
-            ],
-        )
-    except Exception:
-        return ""
-    return str(value or "").strip()
+                }""",
+                wanted,
+            )
+        except Exception:
+            continue
+        text = str(value or "").strip()
+        if text:
+            matches.append(text)
+    matches.sort(key=len)
+    return matches[0] if matches else ""
 
 
 def _set_temporary_address_phase(
@@ -2904,35 +3477,38 @@ def _set_temporary_address_phase(
     fingerprint: str,
     phase: str,
 ) -> None:
-    try:
-        page.evaluate(
-            """({fingerprint, phase}) => {
-              window.__langlang1688TemporaryAddress = {fingerprint, phase};
-            }""",
-            {
-                "fingerprint": fingerprint,
-                "phase": phase,
-            },
-        )
-    except Exception:
-        pass
+    for scope in _page_frames(page):
+        try:
+            scope.evaluate(
+                """({fingerprint, phase}) => {
+                  window.__langlang1688TemporaryAddress = {fingerprint, phase};
+                }""",
+                {
+                    "fingerprint": fingerprint,
+                    "phase": phase,
+                },
+            )
+        except Exception:
+            continue
 
 
 def _temporary_address_phase(
     page: Any,
     fingerprint: str,
 ) -> str:
-    try:
-        state = page.evaluate(
-            """() => window.__langlang1688TemporaryAddress || null"""
-        )
-    except Exception:
-        return ""
-    if not isinstance(state, dict):
-        return ""
-    if str(state.get("fingerprint") or "") != fingerprint:
-        return ""
-    return str(state.get("phase") or "")
+    for scope in _page_frames(page):
+        try:
+            state = scope.evaluate(
+                """() => window.__langlang1688TemporaryAddress || null"""
+            )
+        except Exception:
+            continue
+        if not isinstance(state, dict):
+            continue
+        if str(state.get("fingerprint") or "") != fingerprint:
+            continue
+        return str(state.get("phase") or "")
+    return ""
 
 
 def _attempt_1688_temporary_address(
@@ -2956,8 +3532,8 @@ def _attempt_1688_temporary_address(
         return "结算页已使用当前订单的1688临时地址"
     if phase in {"submitting", "submitted"}:
         return (
-            "1688临时地址已提交但顶部地址未回读，"
-            "请勿重复提交，请在结算页人工核对"
+            "地址自动设置失败/需人工处理："
+            "临时地址已提交但顶部地址未回读，请勿重复保存"
         )
     edit = _visible_locator(
         page,
@@ -2967,6 +3543,30 @@ def _attempt_1688_temporary_address(
             "button:has-text('编辑临时地址')",
         ),
     )
+    if edit is None:
+        temporary_entry = _visible_locator(
+            page,
+            (
+                "text=使用临时地址",
+                "a:has-text('使用临时地址')",
+                "button:has-text('使用临时地址')",
+                "[role='button']:has-text('使用临时地址')",
+            ),
+        )
+        if temporary_entry is not None:
+            try:
+                temporary_entry.click(timeout=6000)
+                page.wait_for_timeout(900)
+            except Exception:
+                pass
+            edit = _visible_locator(
+                page,
+                (
+                    "text=编辑临时地址",
+                    "a:has-text('编辑临时地址')",
+                    "button:has-text('编辑临时地址')",
+                ),
+            )
     if edit is None:
         modify = _visible_locator(
             page,
@@ -2990,11 +3590,46 @@ def _attempt_1688_temporary_address(
                     "button:has-text('编辑临时地址')",
                 ),
             )
+        if edit is None:
+            temporary_entry = _visible_locator(
+                page,
+                (
+                    "text=使用临时地址",
+                    "a:has-text('使用临时地址')",
+                    "button:has-text('使用临时地址')",
+                    "[role='button']:has-text('使用临时地址')",
+                ),
+            )
+            if temporary_entry is not None:
+                try:
+                    temporary_entry.click(timeout=6000)
+                    page.wait_for_timeout(900)
+                except Exception:
+                    pass
+                edit = _visible_locator(
+                    page,
+                    (
+                        "text=编辑临时地址",
+                        "a:has-text('编辑临时地址')",
+                        "button:has-text('编辑临时地址')",
+                    ),
+                )
     if edit is None:
-        return "未找到“编辑临时地址”入口，请在结算页人工处理"
+        return (
+            "地址自动设置失败/需人工处理："
+            "未找到“使用临时地址”或“编辑临时地址”入口"
+        )
     try:
-        edit.click(timeout=6000)
-        page.wait_for_timeout(900)
+        opened_textarea = _visible_locator(
+            page,
+            (
+                "textarea",
+                "[contenteditable='true']",
+            ),
+        )
+        if opened_textarea is None:
+            edit.click(timeout=6000)
+            page.wait_for_timeout(900)
         textarea = _visible_locator(
             page,
             (
@@ -3003,7 +3638,10 @@ def _attempt_1688_temporary_address(
             ),
         )
         if textarea is None:
-            return "已打开临时地址，但未找到批量地址输入框"
+            return (
+                "地址自动设置失败/需人工处理："
+                "已打开临时地址，但未找到批量地址输入框"
+            )
         textarea.fill(
             f"{payload['name']}\n{phone_base}\n{display_address}"
         )
@@ -3057,6 +3695,39 @@ def _attempt_1688_temporary_address(
             )
         if address_input is not None:
             address_input.fill(display_address)
+        phone_input = _visible_labeled_field(
+            page,
+            "recipient-phone",
+            "手机|电话|联系方式",
+        )
+        if phone_input is not None:
+            phone_input.fill(phone_base)
+        region_input = _visible_labeled_field(
+            page,
+            "recipient-region",
+            "地区|省|市|区",
+        )
+        region_value = (
+            str(region_input.input_value())
+            if region_input is not None
+            else ""
+        )
+        required_region_tokens = (
+            str(address.get("province_name") or ""),
+            str(address.get("city_name") or ""),
+            str(address.get("county_name") or ""),
+        )
+        if (
+            not region_value
+            or any(
+                token and token not in region_value
+                for token in required_region_tokens
+            )
+        ):
+            return (
+                "地址自动设置失败/需人工处理："
+                "官方地区字段未完整回填，未提交保存"
+            )
 
         save = _visible_locator(
             page,
@@ -3066,25 +3737,34 @@ def _attempt_1688_temporary_address(
             ),
         )
         if save is None:
-            return "临时地址已填写，但未找到保存按钮，请人工确认"
+            return (
+                "地址自动设置失败/需人工处理："
+                "临时地址已填写，但未找到官方保存按钮"
+            )
         _set_temporary_address_phase(page, fingerprint, "submitting")
         save.click(timeout=6000)
         _set_temporary_address_phase(page, fingerprint, "submitted")
         page.wait_for_timeout(1200)
         if _read_official_checkout_address(page, payload):
             _set_temporary_address_phase(page, fingerprint, "confirmed")
-            return "1688临时地址已保存并回读一致，请核对后付款"
-        return "1688临时地址保存结果未回读，请在结算页人工确认"
+            return "1688临时地址已自动设置并回读一致，请核对后付款"
+        return (
+            "地址自动设置失败/需人工处理："
+            "保存后页面顶部地址与客户地址不一致"
+        )
     except Exception as exc:
         if _read_official_checkout_address(page, payload):
             _set_temporary_address_phase(page, fingerprint, "confirmed")
-            return "1688临时地址已保存并回读一致，请核对后付款"
+            return "1688临时地址已自动设置并回读一致，请核对后付款"
         if _temporary_address_phase(page, fingerprint) == "submitting":
             return (
-                "1688临时地址提交状态未知，请勿重复提交，"
-                "请在结算页人工核对：" + str(exc)[:180]
+                "地址自动设置失败/需人工处理："
+                "提交状态未知，请勿重复保存：" + str(exc)[:180]
             )
-        return "1688临时地址自动填写失败，请人工确认：" + str(exc)[:180]
+        return (
+            "地址自动设置失败/需人工处理："
+            + str(exc)[:180]
+        )
 
 
 class ControlledPurchaseWindow:
@@ -3108,6 +3788,10 @@ class ControlledPurchaseWindow:
         ] = queue.Queue()
         self.ready = threading.Event()
         self.closed = threading.Event()
+        self.purchase_observed = threading.Event()
+        self.returned_to_software = threading.Event()
+        self.purchase_signal_reason = ""
+        self.purchase_order_id = ""
         self.error = ""
         self.thread = threading.Thread(
             target=self._run,
@@ -3154,6 +3838,38 @@ class ControlledPurchaseWindow:
                     ],
                 ),
             )
+            context.add_init_script(
+                script=f"""(() => {{
+                  const markers = {json.dumps(CHECKOUT_URL_MARKERS)};
+                  const className = 'langlang-address-preparing';
+                  const ensureStyle = () => {{
+                    if (document.getElementById('langlang-address-guard-style')) return;
+                    const style = document.createElement('style');
+                    style.id = 'langlang-address-guard-style';
+                    style.textContent = 'html.' + className + ' {{ opacity: 0 !important; }}';
+                    (document.head || document.documentElement).append(style);
+                  }};
+                  const sync = () => {{
+                    ensureStyle();
+                    const href = String(location.href || '').toLowerCase();
+                    const checkout = markers.some((marker) => href.includes(marker));
+                    if (!checkout) {{
+                      document.documentElement.classList.remove(className);
+                      return;
+                    }}
+                    const key = 'langlang-address-ready:' + location.pathname + location.search;
+                    let acknowledged = false;
+                    try {{ acknowledged = sessionStorage.getItem(key) === '1'; }} catch (_error) {{}}
+                    if (acknowledged) {{
+                      document.documentElement.classList.remove(className);
+                    }} else {{
+                      document.documentElement.classList.add(className);
+                    }}
+                  }};
+                  sync();
+                  setInterval(sync, 50);
+                }})();"""
+            )
             if self.details:
                 details = _inline_overlay_thumbnails(
                     context,
@@ -3187,6 +3903,7 @@ class ControlledPurchaseWindow:
             session = ProcurementWebSession(self.db, self.data_dir)
             attempted_checkout_urls: dict[str, int] = {}
             checkout_messages: dict[str, str] = {}
+            return_grace_deadline = 0.0
             while True:
                 try:
                     command, args, response = self.commands.get(timeout=1)
@@ -3197,60 +3914,93 @@ class ControlledPurchaseWindow:
                         if not candidate.is_closed()
                     ]
                     if not active_pages:
-                        break
+                        self.returned_to_software.set()
+                        if not return_grace_deadline:
+                            return_grace_deadline = time.monotonic() + 20
+                        if time.monotonic() >= return_grace_deadline:
+                            break
+                        continue
+                    return_grace_deadline = 0.0
                     for candidate in active_pages:
                         current_url = str(candidate.url or "")
-                        checkout = any(
-                            marker in current_url.casefold()
-                            for marker in (
-                                "confirm_order",
-                                "confirmorder",
-                                "/order/confirm",
-                                "buy.1688.com",
-                                "order.1688.com",
-                                "buyer_make_order",
-                                "smart_make_order",
+                        evidence = _purchase_completion_evidence(candidate)
+                        if evidence["detected"]:
+                            self.purchase_signal_reason = str(
+                                evidence.get("reason") or ""
                             )
-                        )
+                            self.purchase_order_id = str(
+                                evidence.get("upstream_order_id") or ""
+                            )
+                            self.purchase_observed.set()
+                            self.returned_to_software.set()
+                            try:
+                                latest_cookies = normalize_cookies(
+                                    context.cookies()
+                                )
+                            except Exception:
+                                latest_cookies = []
+                            if latest_cookies:
+                                refreshed_session = dict(payload)
+                                refreshed_session["cookies"] = latest_cookies
+                                refreshed_session[
+                                    "last_purchase_success_at"
+                                ] = datetime.now().isoformat(
+                                    timespec="seconds"
+                                )
+                                self.db.set_procurement_session(
+                                    int(self.account["id"]),
+                                    refreshed_session,
+                                    "已登录",
+                                    "",
+                                )
+                            break
+                        checkout = _is_checkout_url(current_url)
                         if not checkout:
                             continue
-                        previous_message = checkout_messages.get(
-                            current_url,
-                            "",
-                        )
-                        attempts = attempted_checkout_urls.get(
-                            current_url,
-                            0,
-                        )
-                        should_retry = (
-                            attempts == 0
-                            or (
-                                "未找到" in previous_message
-                                and attempts < 4
+                        attempt_key = _checkout_attempt_key(current_url)
+                        if attempted_checkout_urls.get(attempt_key, 0):
+                            _set_overlay_status(
+                                candidate,
+                                checkout_messages.get(
+                                    attempt_key,
+                                    "地址自动设置失败/需人工处理："
+                                    "当前结算页已完成一次地址尝试",
+                                ),
                             )
-                        )
-                        if not should_retry:
+                            _set_checkout_address_preparing(
+                                candidate,
+                                True,
+                            )
                             continue
-                        attempted_checkout_urls[current_url] = attempts + 1
-                        candidate.wait_for_timeout(
-                            1200 if attempts == 0 else 1800
-                        )
+                        attempted_checkout_urls[attempt_key] = 1
+                        _set_checkout_address_preparing(candidate, False)
                         _set_overlay_status(
                             candidate,
-                            "正在核对官方结算页收件地址…",
+                            "正在自动设置官方结算页收件地址…",
                         )
                         try:
-                            message = _attempt_official_checkout_address(
+                            if not _wait_for_checkout_address_entry(
                                 candidate,
-                                self.address,
-                            )
+                            ):
+                                message = (
+                                    "地址自动设置失败/需人工处理："
+                                    "结算页地址入口未就绪"
+                                )
+                            else:
+                                message = _attempt_official_checkout_address(
+                                    candidate,
+                                    self.address,
+                                )
                         except Exception as exc:
                             message = (
-                                "地址自动核对未完成，请人工确认："
+                                "地址自动设置失败/需人工处理："
                                 + str(exc)[:160]
                             )
-                        checkout_messages[current_url] = message
+                        checkout_messages[attempt_key] = message
                         _set_overlay_status(candidate, message)
+                        _set_checkout_address_preparing(candidate, True)
+                    if self.purchase_observed.is_set():
+                        break
                     continue
                 if command == "close":
                     response.put({"status": "closed"})

@@ -103,8 +103,13 @@ describe("procurement link platform and account binding", () => {
     expect(dialog).not.toContain("已完成采购，开始核验");
     expect(dialog).toContain("orders.procurement.link-upsert");
     expect(dialog).toContain("orders.procurement.purchase-open");
-    expect(dialog).toContain("orders.procurement.purchase-confirm");
-    expect(dialog).toContain("确认已付款并回读");
+    expect(dialog).not.toContain("orders.procurement.purchase-confirm");
+    expect(dialog).not.toContain("确认已付款并回读");
+    expect(dialog).not.toContain("请手动点击");
+    expect(dialog).toContain(
+      "orders.procurement.purchase-auto-verify.status",
+    );
+    expect(dialog).toContain("付款完成后软件会自动有限次核对");
     expect(dialog).toContain("purchase_attempt_status");
     expect(dialog).toContain("采购页面已打开 / 待用户付款");
     expect(dialog).not.toContain("setInterval(");

@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import html
+from pathlib import Path
+
 import pytest
 
 from weimi_manager.procurement import (
     _attempt_1688_temporary_address,
+    _checkout_attempt_key,
+    _read_official_checkout_address,
+    _set_checkout_address_preparing,
     _temporary_address_payload,
+    _temporary_address_fingerprint,
+    _temporary_address_phase,
+    _wait_for_checkout_address_entry,
 )
 
 
@@ -36,9 +45,12 @@ CHECKOUT_FIXTURE = r"""
   </style>
 </head>
 <body>
-  <section id="current-address">旧收件地址</section>
-  <button id="modify-address">修改地址</button>
-  <button id="edit-temporary">编辑临时地址</button>
+  <main>
+    <section id="current-address">旧省 旧市 旧区 旧街道 旧门牌</section>
+    <a id="modify-address" href="#">修改地址</a>
+    <a id="use-temp" href="#">使用临时地址</a>
+    <button id="submit-order">立即下单</button>
+  </main>
 
   <section class="modal" id="address-modal" role="dialog" aria-label="编辑临时地址">
     <h2>编辑临时地址</h2>
@@ -58,8 +70,9 @@ CHECKOUT_FIXTURE = r"""
   <script>
     window.__counters = {opened: 0, parsed: 0, saved: 0};
     const modal = document.querySelector('#address-modal');
-    document.querySelector('#modify-address').onclick = () => {};
-    document.querySelector('#edit-temporary').onclick = () => {
+    document.querySelector('#modify-address').onclick = (event) => event.preventDefault();
+    document.querySelector('#use-temp').onclick = (event) => {
+      event.preventDefault();
       window.__counters.opened += 1;
       modal.classList.add('open');
     };
@@ -90,6 +103,12 @@ CHECKOUT_FIXTURE = r"""
 </body>
 </html>
 """
+
+PROCUREMENT_SOURCE = (
+    Path(__file__).resolve().parents[1]
+    / "weimi_manager"
+    / "procurement.py"
+).read_text(encoding="utf-8")
 
 
 @pytest.fixture()
@@ -136,12 +155,29 @@ def test_temporary_address_payload_avoids_duplicate_extension() -> None:
     assert payload["display_address"].count("[6155]") == 1
 
 
+def test_checkout_attempt_identity_ignores_volatile_query_parameters() -> None:
+    first = _checkout_attempt_key(
+        "https://sale.1688.com/order/smart_make_order.htm?token=one"
+    )
+    refreshed = _checkout_attempt_key(
+        "https://sale.1688.com/order/smart_make_order.htm?token=two"
+    )
+
+    assert first == refreshed
+
+
+def test_checkout_window_hides_already_painted_old_address_until_guard_completes() -> None:
+    assert "langlang-address-preparing" in PROCUREMENT_SOURCE
+    assert "opacity: 0 !important" in PROCUREMENT_SOURCE
+    assert "setInterval(sync, 50)" in PROCUREMENT_SOURCE
+
+
 def test_1688_temporary_address_is_filled_saved_and_read_back(
     browser_page,
 ) -> None:
     message = _attempt_1688_temporary_address(browser_page, ADDRESS)
 
-    assert "已保存并回读一致" in message
+    assert "已自动设置并回读一致" in message
     assert browser_page.locator("#recipient-name").input_value() == "测试收件人[6155]"
     assert browser_page.locator("#phone").input_value() == "13800138000"
     assert browser_page.locator("#recipient-address").input_value() == (
@@ -166,13 +202,16 @@ def test_1688_temporary_address_is_filled_saved_and_read_back(
 def test_1688_temporary_address_missing_entry_does_not_claim_success(
     browser_page,
 ) -> None:
-    browser_page.locator("#edit-temporary").evaluate(
-        "(el) => el.remove()"
+    browser_page.evaluate(
+        """() => {
+          document.querySelector('#modify-address')?.remove();
+          document.querySelector('#use-temp')?.remove();
+        }"""
     )
 
     message = _attempt_1688_temporary_address(browser_page, ADDRESS)
 
-    assert "人工处理" in message
+    assert "地址自动设置失败/需人工处理" in message
     assert browser_page.evaluate("window.__counters")["saved"] == 0
 
 
@@ -181,7 +220,6 @@ def test_1688_temporary_address_requires_read_back(browser_page) -> None:
         """() => {
           document.querySelector('#save-address').onclick = () => {
             window.__counters.saved += 1;
-            document.querySelector('#address-modal').classList.remove('open');
           };
         }"""
     )
@@ -189,9 +227,15 @@ def test_1688_temporary_address_requires_read_back(browser_page) -> None:
     message = _attempt_1688_temporary_address(browser_page, ADDRESS)
     repeated = _attempt_1688_temporary_address(browser_page, ADDRESS)
 
-    assert message == "1688临时地址保存结果未回读，请在结算页人工确认"
-    assert "请勿重复提交" in repeated
+    assert message == (
+        "地址自动设置失败/需人工处理："
+        "保存后页面顶部地址与客户地址不一致"
+    )
+    assert "地址自动设置失败/需人工处理" in repeated
     assert browser_page.evaluate("window.__counters")["saved"] == 1
+    assert browser_page.locator("#address-modal").evaluate(
+        "(el) => el.classList.contains('open')"
+    )
 
 
 def test_checkout_readback_ignores_text_from_procurement_sidebar(
@@ -216,5 +260,53 @@ def test_checkout_readback_ignores_text_from_procurement_sidebar(
 
     message = _attempt_1688_temporary_address(browser_page, ADDRESS)
 
-    assert "已保存并回读一致" in message
+    assert "已自动设置并回读一致" in message
     assert browser_page.evaluate("window.__counters")["saved"] == 1
+
+
+def test_checkout_page_stays_prepared_until_address_read_back(
+    browser_page,
+) -> None:
+    _set_checkout_address_preparing(browser_page, False)
+    assert browser_page.locator("html").evaluate(
+        "(el) => el.classList.contains('langlang-address-preparing')"
+    )
+
+    message = _attempt_1688_temporary_address(browser_page, ADDRESS)
+    _set_checkout_address_preparing(browser_page, True)
+    payload = _temporary_address_payload(ADDRESS)
+
+    assert "已自动设置并回读一致" in message
+    assert _read_official_checkout_address(browser_page, payload)
+    assert browser_page.locator("html").evaluate(
+        "(el) => el.classList.contains('langlang-address-preparing')"
+    ) is False
+    assert _temporary_address_phase(
+        browser_page,
+        _temporary_address_fingerprint(payload),
+    ) == "confirmed"
+
+
+def test_1688_temporary_address_works_inside_checkout_iframe(
+    browser_page,
+) -> None:
+    browser_page.set_content(
+        '<iframe id="checkout-frame" style="width:1200px;height:900px" srcdoc="'
+        + html.escape(CHECKOUT_FIXTURE, quote=True)
+        + '"></iframe>',
+        wait_until="domcontentloaded",
+    )
+    browser_page.wait_for_timeout(800)
+
+    assert _wait_for_checkout_address_entry(browser_page, timeout_ms=3000)
+    message = _attempt_1688_temporary_address(browser_page, ADDRESS)
+
+    assert "已自动设置并回读一致" in message
+    checkout_frame = next(
+        frame
+        for frame in browser_page.frames
+        if frame != browser_page.main_frame
+    )
+    assert checkout_frame.locator("#current-address").inner_text().startswith(
+        "测试省测试市测试区测试街道虚拟仓库一号门[6155]"
+    )

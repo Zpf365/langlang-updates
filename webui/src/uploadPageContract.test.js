@@ -118,7 +118,7 @@ describe("upload page contract", () => {
     expect(selectionSource).toContain("生成并开始上传");
     expect(selectionSource).toContain('v-if="selectedStoreIds.includes(Number(store.id))"');
     expect(selectionSource).toContain('class="store-config-placeholder"');
-    expect(selectionSource).toContain("勾选后展开运费模板、品牌和售后地址");
+    expect(selectionSource).toContain("勾选后展开运费模板、售后地址和品牌");
     expect(selectionSource).toContain("无品牌");
     expect(selectionSource).toContain("function configValue");
     expect(selectionSource).toContain(":value=\"configValue(store.id, 'freight_template_id')\"");

@@ -50,7 +50,11 @@ def _template_payload(name: str, **changes):
         "low_price_multiplier": 2.5,
         "low_price_action": "删除最低价",
         "trim_head": 1,
+        "remove_head_index": 0,
+        "remove_detail_index": 0,
         "trim_detail": 2,
+        "trim_detail_tail": 2,
+        "detail_keep_first": 0,
         "cloud_violation": True,
         "cloud_violation_types": "出售假冒商品\n质量不合格",
         "strip_title_brackets": True,
@@ -124,13 +128,27 @@ def test_upload_template_round_trip_copy_default_and_delete(tmp_path: Path) -> N
 
 def test_upload_template_validation_and_real_cloud_reasons(tmp_path: Path) -> None:
     database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("违规原因店铺", "wx-reasons", "secret")
+    database.update_web_status(store_id, "已登录", "")
     database.set_setting(
         "violation_library",
         json.dumps(
             [
-                {"reason": "出售假冒商品"},
-                {"reason": "质量不合格"},
-                {"reason": "出售假冒商品"},
+                {
+                    "reason": "出售假冒商品",
+                    "store_id": store_id,
+                    "store_app_id": "wx-reasons",
+                },
+                {
+                    "reason": "质量不合格",
+                    "store_id": store_id,
+                    "store_app_id": "wx-reasons",
+                },
+                {
+                    "reason": "出售假冒商品",
+                    "store_id": store_id,
+                    "store_app_id": "wx-reasons",
+                },
             ],
             ensure_ascii=False,
         ),
@@ -154,6 +172,111 @@ def test_upload_template_validation_and_real_cloud_reasons(tmp_path: Path) -> No
         )
     listed = controller.dispatch("upload.list", {})
     assert listed["cloud_violation_types"] == ["出售假冒商品", "质量不合格"]
+
+
+def test_legacy_template_cloud_default_preserves_explicit_false(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    database.set_setting(
+        "upload_templates",
+        json.dumps(
+            [
+                {
+                    "id": "legacy-missing",
+                    "name": "旧模板缺少字段",
+                },
+                {
+                    "id": "legacy-off",
+                    "name": "用户明确关闭",
+                    "cloud_violation": False,
+                },
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    controller = NextUiController(database)
+
+    templates = controller.dispatch("upload.list", {})["templates"]
+    by_id = {template["id"]: template for template in templates}
+
+    assert by_id["legacy-missing"]["cloud_violation"] is True
+    assert by_id["legacy-off"]["cloud_violation"] is False
+    persisted = {
+        row["id"]: row
+        for row in json.loads(
+            database.get_setting("upload_templates", "[]")
+        )
+    }
+    assert persisted["legacy-missing"]["cloud_violation"] is True
+    assert persisted["legacy-off"]["cloud_violation"] is False
+
+
+def test_cloud_violation_types_exclude_stale_and_demo_stores(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    real_id = database.add_store(
+        "真实登录店铺",
+        "wx-real-types",
+        "secret",
+    )
+    database.update_web_status(real_id, "已登录", "")
+    demo_id = database.add_store(
+        "演示店铺",
+        "demo-store",
+        "local",
+    )
+    database.update_web_status(demo_id, "已登录", "")
+    offline_id = database.add_store(
+        "已掉线店铺",
+        "wx-offline-types",
+        "secret",
+    )
+    database.update_web_status(offline_id, "未登录", "")
+    database.set_setting(
+        "violation_library",
+        json.dumps(
+            [
+                {
+                    "title": "真实违规",
+                    "reason": "出售假冒商品",
+                    "store_id": real_id,
+                    "store_app_id": "wx-real-types",
+                },
+                {
+                    "title": "演示违规",
+                    "reason": "演示专用原因",
+                    "store_id": demo_id,
+                    "store_app_id": "demo-store",
+                },
+                {
+                    "title": "掉线违规",
+                    "reason": "掉线专用原因",
+                    "store_id": offline_id,
+                    "store_app_id": "wx-offline-types",
+                },
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    database.set_setting(
+        "cloud_counterfeit_violation_titles",
+        json.dumps(
+            [{"title": "跨店售假", "reason": "售假"}],
+            ensure_ascii=False,
+        ),
+    )
+
+    types = NextUiController(database).dispatch(
+        "upload.list",
+        {},
+    )["cloud_violation_types"]
+
+    assert "出售假冒商品" in types
+    assert "售假" in types
+    assert "演示专用原因" not in types
+    assert "掉线专用原因" not in types
 
 
 def test_default_template_is_used_for_task_snapshot(tmp_path: Path) -> None:
@@ -183,6 +306,14 @@ def test_default_template_is_used_for_task_snapshot(tmp_path: Path) -> None:
                             "price": 1000,
                             "stock": 8,
                             "itemImgs": ["https://img.alicdn.com/main.jpg"],
+                            "desc": [
+                                "https://img.alicdn.com/detail-1.jpg",
+                                "https://img.alicdn.com/detail-2.jpg",
+                                "https://img.alicdn.com/detail-3.jpg",
+                                "https://img.alicdn.com/detail-4.jpg",
+                                "https://img.alicdn.com/detail-5.jpg",
+                                "https://img.alicdn.com/detail-6.jpg",
+                            ],
                             "skus": [
                                 {"price": "1000", "quantity": "8", "id": "1"}
                             ],
@@ -211,6 +342,168 @@ def test_default_template_is_used_for_task_snapshot(tmp_path: Path) -> None:
     controller.dispatch("upload.templates.save", {"template": changed})
     persisted = controller.dispatch("upload.list", {})["tasks"][0]["template"]
     assert persisted["name"] == "默认任务模板"
+
+
+def test_counterfeit_title_is_blocked_even_when_cloud_switch_is_off(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("违规拦截店", "wx-counterfeit", "secret")
+    database.update_web_status(store_id, "已登录", "")
+    database.set_setting(
+        "cloud_counterfeit_violation_titles",
+        json.dumps(
+            [
+                {
+                    "title": "真实售假商品",
+                    "normalized": "真实售假商品",
+                    "reason": "出售假冒商品",
+                    "source": "cloud_counterfeit",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    controller = NextUiController(database)
+    default_payload = _template_payload("新模板默认值")
+    default_payload.pop("cloud_violation")
+    default_saved = controller.dispatch(
+        "upload.templates.save",
+        {"template": default_payload},
+    )["template"]
+    assert default_saved["cloud_violation"] is True
+    template = controller.dispatch(
+        "upload.templates.save",
+        {
+            "template": _template_payload(
+                "明确关闭云过滤",
+                cloud_violation=False,
+            )
+        },
+    )["template"]
+    imported = controller.dispatch(
+        "upload.batch.import",
+        {
+            "append": False,
+            "files": [
+                {
+                    "name": "counterfeit.json",
+                    "content": json.dumps(
+                        {
+                            "platform": "淘宝",
+                            "productId": "TB-COUNTERFEIT-1",
+                            "productName": "真实售假商品",
+                            "price": 1000,
+                            "stock": 8,
+                            "itemImgs": ["https://img.alicdn.com/main.jpg"],
+                            "skus": [
+                                {"price": "1000", "quantity": "8", "id": "1"}
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+        },
+    )
+    batch_id = imported["batch"][0]["batch_id"]
+    preflight = controller.dispatch(
+        "upload.batch.preflight",
+        {
+            "batch_ids": [batch_id],
+            "template_id": template["id"],
+        },
+    )
+    assert preflight["blocked"] == 1
+    assert "云违规标题过滤命中" in preflight["rows"][0]["issues"][0]
+
+    with pytest.raises(ValueError, match="售假违规库"):
+        controller.dispatch(
+            "upload.tasks.create",
+            {
+                "batch_ids": [batch_id],
+                "store_ids": [store_id],
+                "template_id": template["id"],
+            },
+        )
+
+
+def test_legacy_template_cloud_switch_migrates_without_overwriting_false(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    database.set_setting(
+        "upload_templates",
+        json.dumps(
+            [
+                {
+                    "id": "legacy-missing",
+                    "name": "旧模板缺失字段",
+                },
+                {
+                    "id": "explicit-off",
+                    "name": "用户明确关闭",
+                    "cloud_violation": False,
+                },
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    controller = NextUiController(database)
+
+    listed = controller.dispatch("upload.list", {})
+    by_id = {row["id"]: row for row in listed["templates"]}
+
+    assert by_id["legacy-missing"]["cloud_violation"] is True
+    assert by_id["explicit-off"]["cloud_violation"] is False
+    persisted = {
+        row["id"]: row
+        for row in json.loads(
+            database.get_setting("upload_templates", "[]")
+        )
+    }
+    assert persisted["legacy-missing"]["cloud_violation"] is True
+    assert persisted["explicit-off"]["cloud_violation"] is False
+
+
+def test_cloud_violation_types_exclude_offline_and_demo_reasons(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    real_id = database.add_store("真实店铺", "wx-real", "secret")
+    database.update_web_status(real_id, "已登录", "")
+    demo_id = database.add_store("演示店铺", "demo-store", "local")
+    database.update_web_status(demo_id, "已登录", "")
+    offline_id = database.add_store("离线店铺", "wx-offline", "secret")
+    database.update_web_status(offline_id, "未登录", "失效")
+    database.set_setting(
+        "violation_library",
+        json.dumps(
+            [
+                {
+                    "reason": "出售假冒商品",
+                    "store_id": real_id,
+                    "store_app_id": "wx-real",
+                },
+                {
+                    "reason": "演示违规",
+                    "store_id": demo_id,
+                    "store_app_id": "demo-store",
+                },
+                {
+                    "reason": "离线违规",
+                    "store_id": offline_id,
+                    "store_app_id": "wx-offline",
+                },
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    controller = NextUiController(database)
+
+    listed = controller.dispatch("upload.list", {})
+
+    assert listed["cloud_violation_types"] == ["出售假冒商品"]
 
 
 def test_native_template_folder_picker_returns_path_or_cancel(tmp_path: Path) -> None:

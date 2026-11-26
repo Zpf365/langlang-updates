@@ -13,6 +13,7 @@ const session = readFileSync(new URL("./session.js", root), "utf8");
 describe("commercial entitlement UI gates", () => {
   it("guards every internal route with a capability", () => {
     for (const entitlement of [
+      "feature.procurement_association",
       "module.automation",
       "module.finance",
       "module.storefront",
@@ -34,13 +35,25 @@ describe("commercial entitlement UI gates", () => {
     expect(app).toContain('hasEntitlement("feature.software_update")');
     expect(app).toContain('hasEntitlement("account.view_others")');
     expect(app).toContain('hasEntitlement("module.finance")');
+    expect(app).toContain('hasEntitlement("feature.procurement_association")');
+    expect(app).toContain(
+      '? [["采购账号", "shopping-cart", "/procurement-accounts"]]',
+    );
     expect(more).toContain("hasEntitlement(permission)");
     expect(more).toContain('hasEntitlement("module.runtime_logs")');
     expect(stores).toContain('hasEntitlement("module.store_groups")');
     expect(stores).toContain('v-if="canUseStoreGroups"');
     expect(orders).toContain('hasEntitlement("module.after_sales")');
     expect(orders).toContain('tab.key !== "after_sale"');
+    expect(orders).toContain('hasEntitlement("feature.procurement_association")');
+    expect(orders).toContain('tab.key !== "wait_purchase"');
     expect(orderRow).toContain('v-if="canViewAfterSales"');
+    expect(orderRow).toContain('hasEntitlement("feature.procurement_association")');
+    expect(orderRow).toContain("此功能正在加急开发优化中");
+    expect(orderRow).toContain('v-if="!canUseProcurementAssociation"');
+    expect(orderRow).toMatch(
+      /if \(!canUseProcurementAssociation\.value\) \{\s+procurementUnavailableOpen\.value = true;\s+return;\s+\}\s+procurementDialogOpen\.value = true;/,
+    );
   });
 
   it("keeps required commercial navigation unconditional", () => {

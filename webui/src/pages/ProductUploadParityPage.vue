@@ -6,6 +6,7 @@ import Icon from "../components/Icon.vue";
 import ModalDialog from "../components/ModalDialog.vue";
 import UploadTemplateDialog from "../components/UploadTemplateDialog.vue";
 import UploadStoreSelectionDialog from "../components/UploadStoreSelectionDialog.vue";
+import { mergeUploadStoreOptions } from "../uploadStoreOptions";
 
 const route = useRoute();
 const router = useRouter();
@@ -113,6 +114,7 @@ const riskModal = reactive({
 let noteTimer = 0;
 let unmounted = false;
 let pollingJobId = "";
+const legacyCloudViolationTemplateIds = new Set();
 
 const filteredBatch = computed(() => {
   const keyword = filters.keyword.trim().toLowerCase();
@@ -202,6 +204,129 @@ function showNote(message, tone = "") {
 
 function errorText(cause) {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function isLoggedInUploadStore(store) {
+  return /已登录/.test(`${store?.web_status || ""} ${store?.status || ""}`);
+}
+
+function normalizeViolationTitle(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLocaleLowerCase("zh-CN");
+}
+
+const violationTitleIndex = computed(() => new Map(
+  violationTitles.value
+    .map((row) => [
+      normalizeViolationTitle(row.normalized || row.title),
+      row,
+    ])
+    .filter(([title]) => title),
+));
+
+function violationMatchForTitle(title) {
+  const normalized = normalizeViolationTitle(title);
+  return normalized ? violationTitleIndex.value.get(normalized) || null : null;
+}
+
+function violationIssueText(match) {
+  return `云违规标题过滤命中：${match?.reason || "出售假冒商品"}`;
+}
+
+function applyClientTemplateTitleRules(title, template = {}) {
+  let value = String(title || "").trim();
+  if (template.strip_title_brackets) {
+    value = value.replace(/^【[^】]*】\s*/, "");
+  }
+  for (const line of String(template.title_replace_rules || "").split(/\r?\n/)) {
+    if (!line.includes("=")) continue;
+    const [oldValue, newValue = ""] = line.split("=", 2);
+    if (oldValue.trim()) value = value.replaceAll(oldValue.trim(), newValue.trim());
+  }
+  return `${template.title_prefix || ""}${value}${template.title_suffix || ""}`.trim();
+}
+
+function blockSelectedViolationTitles(items = selectedBatchItems.value, context = "创建任务") {
+  const matched = items.find((row) => (
+    violationMatchForTitle(row.title || row.payload?.title)
+  ));
+  if (!matched) return false;
+  const violation = violationMatchForTitle(matched.title || matched.payload?.title);
+  showNote(
+    `${context}已禁止：${matched.title || matched.source_product_id}；${violationIssueText(violation)}`,
+    "danger",
+  );
+  return true;
+}
+
+function blockTaskViolationTitles(taskIds = runnableTaskIds.value, itemIds = selectedItemIds.value) {
+  const selected = new Set((taskIds || []).map(String));
+  const selectedItems = new Set((itemIds || []).map(String));
+  for (const task of tasks.value) {
+    if (selected.size && !selected.has(String(task.id))) continue;
+    for (const item of task.items || []) {
+      if (
+        selectedItems.size
+        && !selectedItems.has(String(item.item_id))
+      ) continue;
+      const finalTitle = applyClientTemplateTitleRules(
+        item.title || item.payload?.title,
+        task.template || {},
+      );
+      const violation = violationMatchForTitle(finalTitle);
+      if (!violation) continue;
+      showNote(
+        `提交前已禁止：${item.title || item.source_product_id}；${violationIssueText(violation)}`,
+        "danger",
+      );
+      return true;
+    }
+  }
+  return false;
+}
+
+function enforceViolationPreflight(result) {
+  if (!result || !Array.isArray(result.rows)) return 0;
+  let blocked = 0;
+  result.rows = result.rows.map((row) => {
+    const title = row.mapping?.title || row.title;
+    const violation = violationMatchForTitle(title);
+    if (!violation) return row;
+    const issue = violationIssueText(violation);
+    const issues = Array.isArray(row.issues) ? [...row.issues] : [];
+    if (!issues.includes(issue)) issues.push(issue);
+    blocked += 1;
+    return {
+      ...row,
+      ready: false,
+      issues,
+    };
+  });
+  result.ready = result.rows.filter((row) => row.ready).length;
+  result.blocked = result.rows.length - result.ready;
+  return blocked;
+}
+
+async function ensureLegacyTemplateCloudViolation(templateId) {
+  const id = String(templateId || "").trim();
+  if (!id || !legacyCloudViolationTemplateIds.has(id)) return;
+  const template = templates.value.find((row) => String(row.id) === id);
+  if (!template) return;
+  const saved = await call("upload.templates.save", {
+    template: {
+      ...template,
+      cloud_violation: true,
+    },
+  });
+  legacyCloudViolationTemplateIds.delete(id);
+  const index = templates.value.findIndex((row) => String(row.id) === id);
+  if (index >= 0 && saved?.template) {
+    templates.value[index] = saved.template;
+  }
 }
 
 function statusLabel(status) {
@@ -318,6 +443,21 @@ function taskSourceCount(task) {
   return new Set((task.items || []).map((item) => item.source_product_id)).size;
 }
 
+function taskCategoryLabel(task) {
+  const template = task?.template || {};
+  const category = String(
+    template.specified_category_path
+    || template.category_path
+    || "",
+  ).trim();
+  const brand = template.brand_mode === "store"
+    ? `品牌 ${template.brand_id || "未选择"}`
+    : template.brand_mode === "none"
+      ? "无品牌"
+      : "";
+  return [category ? `指定类目 ${category}` : "", brand].filter(Boolean).join(" · ");
+}
+
 function preflightMappingText(row) {
   const mapping = row.mapping || {};
   const price = mapping.price_min == null
@@ -382,17 +522,31 @@ async function load({ keepNote = false } = {}) {
   loading.value = true;
   try {
     const data = await call("upload.list", {});
-    templates.value = data.templates || [];
+    legacyCloudViolationTemplateIds.clear();
+    templates.value = (data.templates || []).map((template) => {
+      if (typeof template.cloud_violation === "boolean") return template;
+      legacyCloudViolationTemplateIds.add(String(template.id || ""));
+      return {
+        ...template,
+        cloud_violation: true,
+      };
+    });
     batch.value = data.batch || [];
     tasks.value = data.tasks || [];
     stores.value = data.stores || [];
     templateDefaults.value = data.template_defaults || {};
     defaultTemplateId.value = data.default_template_id || "";
     cloudViolationTypes.value = data.cloud_violation_types || [];
-    violationTitles.value = data.violation_titles || [];
-    violationTitleCount.value = Number(
-      data.violation_title_count ?? violationTitles.value.length,
+    const activeStoreIds = new Set(
+      stores.value
+        .filter(isLoggedInUploadStore)
+        .map((store) => Number(store.id)),
     );
+    violationTitles.value = (data.violation_titles || []).filter((row) => (
+      row.source === "cloud_counterfeit"
+      || activeStoreIds.has(Number(row.store_id || 0))
+    ));
+    violationTitleCount.value = violationTitles.value.length;
     alignBatchStoreAssignments();
     categoryAutoResumeEnabled.value = (
       data.category_auto_resume_enabled !== false
@@ -570,10 +724,41 @@ async function loadStoreOptions(storeIds) {
   const result = await call("upload.store-options", {
     store_ids: [...new Set(storeIds.map(Number).filter(Boolean))],
   });
-  storeOptions.value = {
-    ...storeOptions.value,
-    ...(result.stores || {}),
-  };
+  storeOptions.value = mergeUploadStoreOptions(
+    storeOptions.value,
+    result.stores || {},
+  );
+}
+
+async function loadStoreCategories(storeIds, refresh = false) {
+  const ids = [...new Set(storeIds.map(Number).filter(Boolean))];
+  if (!ids.length) return;
+  const result = await call("upload.categories", {
+    store_ids: ids,
+    refresh: Boolean(refresh),
+  });
+  const categories = Object.fromEntries(
+    Object.entries(result.stores || {}).map(([storeId, options]) => [
+      storeId,
+      { category_options: options },
+    ]),
+  );
+  storeOptions.value = mergeUploadStoreOptions(
+    storeOptions.value,
+    categories,
+  );
+}
+
+async function dialogStoreCategories(storeId, refresh = false) {
+  if (!storeId) return;
+  try {
+    await loadStoreCategories([storeId], refresh);
+  } catch (cause) {
+    showNote(
+      `官方类目读取失败：${errorText(cause)}`,
+      "danger",
+    );
+  }
 }
 
 async function dialogStoreOptions(storeIds) {
@@ -731,12 +916,20 @@ async function importFiles(event) {
 
 async function preflightBatch() {
   try {
+    const templateId = taskModal.templateId
+      || defaultTemplateId.value
+      || selectedTemplateId.value
+      || templates.value[0]?.id
+      || "";
+    await ensureLegacyTemplateCloudViolation(templateId);
     preflight.value = await call("upload.batch.preflight", {
       batch_ids: selectedBatchIds.value,
-      template_id: taskModal.templateId || "",
+      template_id: templateId,
     });
+    const titleBlocked = enforceViolationPreflight(preflight.value);
     showNote(
-      `本地预检完成：可创建 ${preflight.value.ready} 个，需处理 ${preflight.value.blocked} 个`,
+      `本地预检完成：可创建 ${preflight.value.ready} 个，需处理 ${preflight.value.blocked} 个`
+        + (titleBlocked ? `；其中 ${titleBlocked} 个命中售假标题库` : ""),
       preflight.value.blocked ? "warning" : "success",
     );
   } catch (cause) {
@@ -801,6 +994,7 @@ async function openTaskCreator() {
     showNote("请先勾选要创建任务的商品", "warning");
     return;
   }
+  if (blockSelectedViolationTitles(selectedBatchItems.value, "选择店铺")) return;
   if (!templates.value.length) {
     showNote("请先创建完整的上货模板", "warning");
     return;
@@ -818,6 +1012,7 @@ async function openTaskCreator() {
       String(storeId),
       {
         freight_template_id: "",
+        brand_mode: "none",
         brand_id: "2100000000",
         after_sale_address_id: "",
       },
@@ -827,6 +1022,7 @@ async function openTaskCreator() {
 }
 
 async function createTasks(payload = null) {
+  if (blockSelectedViolationTitles(selectedBatchItems.value, "创建任务")) return;
   const storeIds = (payload?.storeIds || taskModal.storeIds)
     .map(Number)
     .filter(Boolean);
@@ -842,6 +1038,19 @@ async function createTasks(payload = null) {
   taskModal.configs = configs;
   taskModal.busy = true;
   try {
+    await ensureLegacyTemplateCloudViolation(templateId);
+    const titlePreview = await call("upload.batch.preflight", {
+      batch_ids: selectedBatchItems.value.map((row) => row.batch_id),
+      template_id: templateId,
+    });
+    const titleBlocked = enforceViolationPreflight(titlePreview);
+    if (titleBlocked) {
+      showNote(
+        `创建任务已禁止：${titleBlocked} 个商品命中真实售假标题库`,
+        "danger",
+      );
+      return;
+    }
     const assignments = mode === "all"
       ? {}
       : Object.fromEntries(
@@ -863,11 +1072,21 @@ async function createTasks(payload = null) {
       assignments,
       store_options: selectedStoreOptions,
     });
+    const blockedStores = result.blocked_stores || [];
+    if (!result.created && blockedStores.length) {
+      showNote(
+        `未创建任务：${blockedStores.map((row) => row.error || row.store_name).join("；")}`,
+        "danger",
+      );
+      return;
+    }
     taskModal.open = false;
     await load({ keepNote: true });
     showNote(
-      `已创建 ${result.created} 个店铺任务；仅写入本地，尚未提交到平台`,
-      "success",
+      blockedStores.length
+        ? `已创建 ${result.created} 个店铺任务；${blockedStores.map((row) => row.store_name).join("、")} 因指定类目不可用被阻止，请修改模板`
+        : `已创建 ${result.created} 个店铺任务；仅写入本地，尚未提交到平台`,
+      blockedStores.length ? "warning" : "success",
     );
     await goToTasks();
   } catch (cause) {
@@ -895,6 +1114,7 @@ function confirmStartUpload() {
     showNote("请先勾选上传任务或任务中的商品", "warning");
     return;
   }
+  if (blockTaskViolationTitles(runnableTaskIds.value, selectedItemIds.value)) return;
   const itemCount = selectedItemIds.value.length || tasks.value
     .filter((task) => runnableTaskIds.value.includes(task.id))
     .reduce(
@@ -935,6 +1155,7 @@ function confirmStartUpload() {
       "这是真实平台写操作，可能消耗提审额度；结果未知的商品不会自动重复提交。",
     confirmLabel: "开始真实提交",
     action: async () => {
+      if (blockTaskViolationTitles(runnableTaskIds.value, selectedItemIds.value)) return;
       const started = await call("upload.run.start", {
         task_ids: runnableTaskIds.value,
         item_ids: selectedItemIds.value,
@@ -1372,7 +1593,11 @@ onBeforeUnmount(() => {
                 />
                 <span class="task-main">
                   <strong>{{ task.store_name || `店铺 ${task.store_id}` }}</strong>
-                  <small>{{ task.template?.name || "无模板" }} · {{ taskSourceCount(task) }} 个商品 · {{ task.message }}</small>
+                  <small>
+                    {{ task.template?.name || "无模板" }} · {{ taskSourceCount(task) }} 个商品
+                    <template v-if="taskCategoryLabel(task)"> · {{ taskCategoryLabel(task) }}</template>
+                    · {{ task.message }}
+                  </small>
                 </span>
                 <span class="task-state">
                   <em class="status-pill" :class="statusTone(task.status)">{{ statusLabel(task.status) }}</em>
@@ -1445,8 +1670,11 @@ onBeforeUnmount(() => {
       :template="templateModal.template"
       :defaults="templateDefaults"
       :violation-types="cloudViolationTypes"
+      :stores="stores"
+      :store-options="storeOptions"
       :busy="templateModal.busy"
       @close="templateModal.open = false"
+      @load-categories="dialogStoreCategories"
       @save="saveTemplate"
       @toast="showNote"
     />

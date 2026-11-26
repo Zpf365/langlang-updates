@@ -8,6 +8,94 @@ import {
 import { withActionOrigin } from "./api";
 
 export const AUTO_REFRESH_INTERVAL_MS = 600000;
+export const STARTUP_REFRESH_STAGE_TIMEOUT_MS = 600000;
+
+const STARTUP_ACTIVE_STATUSES = new Set(["starting", "running"]);
+const STARTUP_STAGE_TERMINAL_STATUSES = new Set([
+  "completed",
+  "partial",
+  "failed",
+  "timeout",
+  "cancelled",
+]);
+
+export function getStartupRefreshStage(status, name) {
+  const stage = status?.stages?.[name];
+  return stage && typeof stage === "object" ? stage : null;
+}
+
+export async function waitForStartupRefreshStage({
+  name,
+  readStatus,
+  onStatus = () => {},
+  isApplicable = () => true,
+  timeoutMs = STARTUP_REFRESH_STAGE_TIMEOUT_MS,
+  pollIntervalMs = 250,
+  sleep = (delay) => new Promise((resolve) => setTimeout(resolve, delay)),
+  now = () => Date.now(),
+}) {
+  const stageName = String(name || "").trim();
+  if (!stageName) throw new Error("启动刷新阶段名称不能为空");
+  if (typeof readStatus !== "function") {
+    throw new Error("读取启动刷新状态的方法不能为空");
+  }
+
+  const startedAt = now();
+  while (true) {
+    const status = await readStatus();
+    if (!status || typeof status !== "object") {
+      return {
+        available: false,
+        stage: null,
+        status: null,
+        timedOut: false,
+      };
+    }
+    onStatus(status);
+    if (!isApplicable(status)) {
+      return {
+        available: false,
+        stage: getStartupRefreshStage(status, stageName),
+        status,
+        timedOut: false,
+      };
+    }
+    const stage = getStartupRefreshStage(status, stageName);
+    if (
+      stage
+      && STARTUP_STAGE_TERMINAL_STATUSES.has(String(stage.status || ""))
+    ) {
+      return {
+        available: true,
+        stage,
+        status,
+        timedOut: false,
+      };
+    }
+
+    const active = Boolean(status.thread_alive)
+      || STARTUP_ACTIVE_STATUSES.has(String(status.status || ""));
+    if (!active) {
+      return {
+        available: Boolean(stage),
+        stage,
+        status,
+        timedOut: false,
+      };
+    }
+
+    const elapsed = Math.max(0, now() - startedAt);
+    if (elapsed >= timeoutMs) {
+      return {
+        available: Boolean(stage),
+        stage,
+        status,
+        timedOut: true,
+      };
+    }
+    await sleep(Math.min(pollIntervalMs, Math.max(0, timeoutMs - elapsed)));
+  }
+}
 
 export function createAutoRefreshScheduler({
   refresh,

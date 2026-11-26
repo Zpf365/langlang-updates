@@ -3279,7 +3279,7 @@ class UploadPageContractTests(unittest.TestCase):
                 {
                     "name": "云违规标题过滤",
                     "price_multiplier": 1,
-                    "cloud_violation": True,
+                    "cloud_violation": False,
                 },
             )
 
@@ -3329,6 +3329,52 @@ class UploadPageContractTests(unittest.TestCase):
                     "title_prefix": "新品·",
                     "title_suffix": " 热卖",
                     "cloud_violation": True,
+                },
+            )
+
+    def test_cloud_violation_blocks_original_title_after_rewrite(self) -> None:
+        class FakeDb:
+            @staticmethod
+            def violation_blacklist_ids():
+                return set()
+
+            @staticmethod
+            def get_setting(key, default=""):
+                if key == "upload_violation_titles":
+                    return json.dumps(
+                        [
+                            {
+                                "title": "真实售假标题",
+                                "normalized": "真实售假标题",
+                                "reason": "出售假冒商品",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    )
+                return default
+
+        page = object.__new__(UploadPage)
+        page.db = FakeDb()
+        with self.assertRaisesRegex(
+            TemplateRuleSkip,
+            "云违规标题过滤命中：出售假冒商品",
+        ):
+            page._upload_payload(
+                {
+                    "source_product_id": "SOURCE-REWRITTEN",
+                    "title": "真实售假标题",
+                    "price": 100,
+                    "payload": {
+                        "title": "真实售假标题",
+                        "platform": "淘宝",
+                        "cats": [{"cat_id": "10000111"}],
+                        "head_imgs": ["https://example.test/a.jpg"],
+                        "skus": [{"sale_price": 100, "stock_num": 5}],
+                    },
+                },
+                {
+                    "title_replace_rules": "真实售假标题=完全干净标题",
+                    "cloud_violation": False,
                 },
             )
 

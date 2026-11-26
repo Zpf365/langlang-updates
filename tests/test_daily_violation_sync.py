@@ -204,6 +204,8 @@ def test_store_sync_filters_non_actionable_records_and_uses_app_id() -> None:
         id=9,
         name="店铺",
         app_id="wx-store",
+        web_status="已登录",
+        status="正常",
     )
     with patch("weimi_manager.service.ShopPrivateClient", Client):
         result = SyncService(Db()).sync_violation_library(store)
@@ -248,7 +250,13 @@ def test_counterfeit_violation_titles_are_published_to_upload_filter() -> None:
                 }
             ]
 
-    store = SimpleNamespace(id=9, name="店铺", app_id="wx-store")
+    store = SimpleNamespace(
+        id=9,
+        name="店铺",
+        app_id="wx-store",
+        web_status="已登录",
+        status="正常",
+    )
     with patch("weimi_manager.service.ShopPrivateClient", Client):
         SyncService(Db()).sync_violation_library(store)
 
@@ -256,3 +264,45 @@ def test_counterfeit_violation_titles_are_published_to_upload_filter() -> None:
     assert titles[0]["title"] == "毛绒花束捧花｜520生日礼物"
     assert titles[0]["normalized"] == "毛绒花束捧花|520生日礼物"
     assert titles[0]["reason"] == "出售假冒商品"
+
+
+def test_violation_sync_rejects_demo_and_logged_out_stores() -> None:
+    settings: dict[str, str] = {}
+
+    class Db:
+        @staticmethod
+        def get_setting(key, default=""):
+            return settings.get(key, default)
+
+        @staticmethod
+        def set_setting(key, value):
+            settings[key] = value
+
+    for store in (
+        SimpleNamespace(
+            id=1,
+            name="演示店铺",
+            app_id="demo-store",
+            web_status="已登录",
+            status="正常",
+        ),
+        SimpleNamespace(
+            id=2,
+            name="离线店铺",
+            app_id="wx-offline",
+            web_status="未登录",
+            status="正常",
+        ),
+    ):
+        for operation in (
+            "sync_violation_library",
+            "sync_platform_violation_blacklist",
+        ):
+            with patch("weimi_manager.service.ShopPrivateClient") as client:
+                try:
+                    getattr(SyncService(Db()), operation)(store)
+                except ValueError as exc:
+                    assert "已登录真实店铺" in str(exc)
+                else:
+                    raise AssertionError("invalid store must be rejected")
+                client.assert_not_called()

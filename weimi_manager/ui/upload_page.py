@@ -30,9 +30,9 @@ from ..source_1688 import (
     rank_category_candidates,
 )
 from ..upload_violations import (
-    apply_template_title_rules,
-    build_upload_violation_titles,
-    find_upload_violation_title,
+    filter_active_violation_records,
+    load_upload_violation_title_records,
+    mandatory_upload_violation_issue,
 )
 from ..wechat_api import WechatApiError
 from .product_link_dialog import auto_match_skus
@@ -134,6 +134,148 @@ def _stock_int(value: Any) -> int | None:
     if not number.is_finite():
         return None
     return max(0, int(number))
+
+
+def _bounded_image_count(value: Any) -> int:
+    parsed = _stock_int(value)
+    return parsed if parsed is not None else 0
+
+
+def _remove_one_based_index(
+    images: list[str],
+    index: Any,
+) -> list[str]:
+    ordinal = _bounded_image_count(index)
+    if ordinal <= 0 or ordinal > len(images):
+        return images
+    return [*images[: ordinal - 1], *images[ordinal:]]
+
+
+def _apply_template_image_rules(
+    payload: dict[str, Any],
+    template: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply deterministic image trimming without mutating the source payload."""
+    prepared = json.loads(json.dumps(payload, ensure_ascii=False))
+    rules = template or {}
+    rule_values = {
+        "remove_head_index": _bounded_image_count(
+            rules.get("remove_head_index")
+        ),
+        "trim_head": _bounded_image_count(rules.get("trim_head")),
+        "remove_detail_index": _bounded_image_count(
+            rules.get("remove_detail_index")
+        ),
+        "trim_detail": _bounded_image_count(rules.get("trim_detail")),
+        "trim_detail_tail": _bounded_image_count(
+            rules.get("trim_detail_tail")
+        ),
+        "detail_keep_first": _bounded_image_count(
+            rules.get("detail_keep_first")
+        ),
+    }
+    desc_info = prepared.get("desc_info")
+    desc_info = desc_info if isinstance(desc_info, dict) else {}
+    head_images = [
+        str(value).strip()
+        for value in prepared.get("head_imgs") or []
+        if str(value).strip()
+    ]
+    detail_images = [
+        str(value).strip()
+        for value in desc_info.get("imgs") or []
+        if str(value).strip()
+    ]
+    signature = hashlib.sha256(
+        json.dumps(
+            rule_values,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if prepared.get("_template_image_processing") == signature:
+        return prepared
+
+    # Fixed order: one-based index, front count, back count, keep-first count.
+    head_images = _remove_one_based_index(
+        head_images,
+        rule_values["remove_head_index"],
+    )
+    if rule_values["trim_head"]:
+        head_images = head_images[rule_values["trim_head"] :]
+    head_images = list(dict.fromkeys(head_images))
+
+    detail_images = _remove_one_based_index(
+        detail_images,
+        rule_values["remove_detail_index"],
+    )
+    if rule_values["trim_detail"]:
+        detail_images = detail_images[rule_values["trim_detail"] :]
+    if rule_values["trim_detail_tail"]:
+        detail_images = detail_images[
+            : max(0, len(detail_images) - rule_values["trim_detail_tail"])
+        ]
+    if rule_values["detail_keep_first"]:
+        detail_images = detail_images[: rule_values["detail_keep_first"]]
+    detail_images = list(dict.fromkeys(detail_images))
+
+    if not head_images and any(rule_values.values()):
+        raise ValueError("图片处理后主图为空，请调整主图处理规则")
+    if not detail_images and any(
+        rule_values[key]
+        for key in (
+            "remove_detail_index",
+            "trim_detail",
+            "trim_detail_tail",
+            "detail_keep_first",
+        )
+    ):
+        raise ValueError("图片处理后详情图为空，请调整详情图处理规则")
+    prepared["head_imgs"] = head_images
+    desc_info["imgs"] = detail_images
+    prepared["desc_info"] = desc_info
+    prepared["_template_image_processing"] = signature
+    prepared["_source_image_counts"] = {
+        "head": len(
+            [
+                value
+                for value in payload.get("head_imgs") or []
+                if str(value).strip()
+            ]
+        ),
+        "detail": len(
+            [
+                value
+                for value in (
+                    (payload.get("desc_info") or {})
+                    .get("imgs")
+                    or []
+                )
+                if str(value).strip()
+            ]
+        ),
+    }
+    return prepared
+
+
+def _apply_upload_image_rules(
+    payload: dict[str, Any],
+    template: dict[str, Any] | None,
+) -> dict[str, Any]:
+    effective_template = dict(template or {})
+    if payload.get("platform") == "1688":
+        try:
+            source_skip = int(
+                payload.get("detail_skip_first") or 0
+            )
+        except (TypeError, ValueError):
+            source_skip = 0
+        effective_template["trim_detail"] = max(
+            _bounded_image_count(effective_template.get("trim_detail")),
+            max(0, source_skip),
+        )
+    return _apply_template_image_rules(payload, effective_template)
 
 
 def _direct_stock(mapping: dict[str, Any]) -> int | None:
@@ -6202,6 +6344,20 @@ class UploadPage(ttk.Frame):
             None,
         )
 
+    def _mandatory_violation_issue(
+        self,
+        title: Any,
+        template: dict[str, Any],
+    ) -> str:
+        database = getattr(self, "db", None)
+        if database is None:
+            return ""
+        return mandatory_upload_violation_issue(
+            title,
+            template,
+            load_upload_violation_title_records(database),
+        )
+
     def _create_tasks(self) -> None:
         self._sync_batch_selection()
         selected = [
@@ -6237,6 +6393,22 @@ class UploadPage(ttk.Frame):
             messagebox.showinfo(
                 "请选择模板",
                 "请先选择一个上传模板；模板规则会在创建任务时锁定。",
+                parent=self,
+            )
+            return
+        blocked = [
+            row
+            for row in selected
+            if self._mandatory_violation_issue(
+                row.get("title"),
+                template,
+            )
+        ]
+        if blocked:
+            messagebox.showwarning(
+                "售假违规拦截",
+                f"创建任务已禁止：{len(blocked)} 个商品命中真实售假标题库。\n"
+                f"{str(blocked[0].get('title') or blocked[0].get('source_product_id') or '')[:120]}",
                 parent=self,
             )
             return
@@ -7560,8 +7732,20 @@ class UploadPage(ttk.Frame):
                 "express_type": 0,
             }
         brand_id = str(template.get("brand_id") or "").strip()
+        brand_mode = str(template.get("brand_mode") or "").strip()
+        if brand_mode == "none":
+            brand_id = "2100000000"
         if brand_id:
             payload["brand_id"] = brand_id
+        if brand_mode in {"none", "store"}:
+            payload["_brand_mode"] = brand_mode
+        try:
+            payload["_deposit_limit_cents"] = max(
+                0,
+                int(float(template.get("deposit_limit") or 0) * 100),
+            )
+        except (TypeError, ValueError):
+            payload["_deposit_limit_cents"] = 0
         after_sale_address_id = str(
             template.get("after_sale_address_id") or ""
         ).strip()
@@ -7604,59 +7788,60 @@ class UploadPage(ttk.Frame):
         if hit_sku_word:
             raise TemplateRuleSkip(f"模板规格过滤命中：{hit_sku_word}")
 
+        database = getattr(self, "db", None)
+        product_id = str(item.get("source_product_id") or "")
+        records: list[dict[str, Any]] = []
+        title_records: list[dict[str, Any]] = []
+        if database is not None:
+            list_stores = getattr(database, "list_stores", None)
+            stores = list_stores() if callable(list_stores) else None
+            get_setting = getattr(database, "get_setting", None)
+
+            def read_rows(key: str) -> list[dict[str, Any]]:
+                if not callable(get_setting):
+                    return []
+                try:
+                    value = json.loads(get_setting(key, "[]"))
+                except (TypeError, ValueError):
+                    return []
+                return [
+                    row for row in value
+                    if isinstance(row, dict)
+                ] if isinstance(value, list) else []
+
+            raw_records = read_rows("violation_library")
+            records = (
+                filter_active_violation_records(raw_records, stores)
+                if stores is not None
+                else raw_records
+            )
+            title_records = load_upload_violation_title_records(database)
+        violation_issue = mandatory_upload_violation_issue(
+            title,
+            template,
+            title_records,
+        )
+        if violation_issue:
+            raise TemplateRuleSkip(violation_issue)
         if template.get("cloud_violation"):
-            database = getattr(self, "db", None)
-            product_id = str(item.get("source_product_id") or "")
             blocked_ids: set[str] = set()
-            records: list[dict[str, Any]] = []
-            title_records: list[dict[str, Any]] = []
             selected_types = set(
                 rule_words(template.get("cloud_violation_types"))
             ) - {"未设置类型时按本机违规商品 ID 过滤"}
             if database is not None:
                 try:
-                    blocked_ids = database.violation_blacklist_ids()
+                    blacklist = getattr(
+                        database,
+                        "violation_blacklist_ids",
+                        None,
+                    )
+                    blocked_ids = (
+                        blacklist() if callable(blacklist) else set()
+                    )
                 except Exception:
                     blocked_ids = set()
-                try:
-                    raw_records = json.loads(
-                        database.get_setting("violation_library", "[]")
-                    )
-                    records = [
-                        record
-                        for record in raw_records
-                        if isinstance(record, dict)
-                    ] if isinstance(raw_records, list) else []
-                except (TypeError, ValueError):
-                    records = []
-                try:
-                    raw_titles = json.loads(
-                        database.get_setting(
-                            "upload_violation_titles",
-                            "[]",
-                        )
-                    )
-                    title_records = [
-                        record
-                        for record in raw_titles
-                        if isinstance(record, dict)
-                    ] if isinstance(raw_titles, list) else []
-                except (TypeError, ValueError):
-                    title_records = []
-                if not title_records:
-                    title_records = build_upload_violation_titles(records)
             if product_id and product_id in blocked_ids:
                 raise TemplateRuleSkip("模板过滤命中本机违规商品")
-            candidate_title = apply_template_title_rules(title, template)
-            counterfeited = find_upload_violation_title(
-                candidate_title,
-                title_records,
-            )
-            if counterfeited is not None:
-                raise TemplateRuleSkip(
-                    "云违规标题过滤命中："
-                    f"{counterfeited.get('reason') or '出售假冒商品'}"
-                )
             if selected_types:
                 for record in records:
                     if str(record.get("product_id") or "") != product_id:
@@ -7690,6 +7875,36 @@ class UploadPage(ttk.Frame):
                     raise TemplateRuleSkip(
                         f"模板图片过滤命中 {len(matched)} 张图片"
                     )
+
+        image_snapshot = item.get("image_snapshot")
+        if (
+            isinstance(image_snapshot, dict)
+            and isinstance(image_snapshot.get("head_imgs"), list)
+            and isinstance(image_snapshot.get("detail_imgs"), list)
+        ):
+            payload["head_imgs"] = list(image_snapshot["head_imgs"])
+            desc_info = dict(payload.get("desc_info") or {})
+            desc_info["imgs"] = list(image_snapshot["detail_imgs"])
+            payload["desc_info"] = desc_info
+            payload["_source_image_counts"] = {
+                "head": int(
+                    (image_snapshot.get("source_counts") or {}).get(
+                        "head"
+                    )
+                    or 0
+                ),
+                "detail": int(
+                    (image_snapshot.get("source_counts") or {}).get(
+                        "detail"
+                    )
+                    or 0
+                ),
+            }
+        else:
+            payload = _apply_upload_image_rules(
+                payload,
+                template,
+            )
 
         replacement_rules = []
         for line in str(
@@ -7836,6 +8051,35 @@ class UploadPage(ttk.Frame):
                 payload.get("cats_v2")
             )
 
+        specified_ids = [
+            str(value).strip()
+            for value in template.get("specified_category_ids") or []
+            if str(value).strip().isdigit()
+        ]
+        if specified_ids:
+            specified_leaf = str(
+                template.get("specified_category_id")
+                or specified_ids[-1]
+            ).strip()
+            if not specified_leaf.isdigit() or specified_leaf != specified_ids[-1]:
+                raise ValueError("指定商品类目快照无效，请重新选择叶子类目")
+            specified_path = str(
+                template.get("specified_category_path") or ""
+            ).strip()
+            if not specified_path:
+                raise ValueError("指定商品类目缺少可回显路径，请重新选择类目")
+            payload["cats"] = []
+            payload["cats_v2"] = category_objects(specified_ids)
+            payload["category_path"] = specified_path
+            payload.pop("category_apply_ids", None)
+            payload.pop("category_hint", None)
+            payload.pop("category_name", None)
+            payload["_specified_category_id"] = specified_leaf
+            payload["_specified_category_path"] = specified_path
+            payload["_specified_category_version"] = str(
+                template.get("specified_category_version") or ""
+            )
+
         if template.get("enable_custom_attributes"):
             attrs = payload.get("attrs")
             if not isinstance(attrs, list):
@@ -7863,27 +8107,9 @@ class UploadPage(ttk.Frame):
             "delivery_time",
             template.get("delivery_time") or "48小时内发货",
         )
-        if payload.get("platform") == "1688":
-            desc_info = payload.get("desc_info")
-            if isinstance(desc_info, dict):
-                images = desc_info.get("imgs")
-                if isinstance(images, list):
-                    try:
-                        template_skip = int(template.get("trim_detail") or 0)
-                    except (TypeError, ValueError):
-                        template_skip = 0
-                    try:
-                        source_skip = int(
-                            payload.get("detail_skip_first") or 0
-                        )
-                    except (TypeError, ValueError):
-                        source_skip = 0
-                    skip_count = max(template_skip, source_skip)
-                    if skip_count:
-                        desc_info["imgs"] = images[skip_count:]
-            payload.pop("detail_skip_first", None)
-            payload.pop("detail_images_before_skip", None)
-            payload.pop("detail_images_after_skip", None)
+        payload.pop("detail_skip_first", None)
+        payload.pop("detail_images_before_skip", None)
+        payload.pop("detail_images_after_skip", None)
         required = ("head_imgs", "skus")
         missing = [key for key in required if not payload.get(key)]
         if not any(

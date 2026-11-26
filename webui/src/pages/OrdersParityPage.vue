@@ -10,7 +10,10 @@ import {
 } from "vue";
 import { useRoute } from "vue-router";
 import { call, formatDateTime } from "../api";
-import { useAutoRefresh } from "../autoRefresh";
+import {
+  useAutoRefresh,
+  waitForStartupRefreshStage,
+} from "../autoRefresh";
 import { copyText } from "../clipboard";
 import Icon from "../components/Icon.vue";
 import ModalDialog from "../components/ModalDialog.vue";
@@ -136,11 +139,22 @@ const allTabs = [
   { key: "after_sale", label: "售后订单", tone: "after-sale" },
   { key: "marked", label: "标记", tone: "marked" },
 ];
+const canUseProcurementAssociation = computed(() => (
+  hasEntitlement("feature.procurement_association")
+));
 const tabs = computed(() => (
   allTabs.filter((tab) => (
-    tab.key !== "after_sale"
-    || hasEntitlement("module.after_sales")
+    (tab.key !== "wait_purchase" || canUseProcurementAssociation.value)
+    && (
+      tab.key !== "after_sale"
+      || hasEntitlement("module.after_sales")
+    )
   ))
+));
+const orderSearchPlaceholder = computed(() => (
+  canUseProcurementAssociation.value
+    ? "订单号、采购单号、物流单号；多个完整单号用空格分隔"
+    : "订单号、物流单号；多个完整单号用空格分隔"
 ));
 
 const tabScopeOrders = computed(() => (
@@ -425,37 +439,189 @@ async function runOrderContextAction(action) {
   else if (action === "export") exportOrders(true);
 }
 
-async function load() {
+async function loadStores() {
+  const storeData = await call("stores.list", { search: "" });
+  stores.value = storeData.stores || [];
+  const validStoreIds = new Set(stores.value.map((store) => String(store.id)));
+  if (filters.store_id && !validStoreIds.has(String(filters.store_id))) {
+    filters.store_id = "";
+  }
+  return stores.value;
+}
+
+function loadErrorText(label, result) {
+  if (result.status === "fulfilled") return "";
+  const cause = result.reason;
+  return `${label}：${cause instanceof Error ? cause.message : String(cause)}`;
+}
+
+async function load({ storesLoaded = false } = {}) {
   loading.value = true;
   note.value = "";
+  const failures = [];
   try {
-    const [orderData, storeData, filterData, settingsData] = await Promise.all([
+    if (!storesLoaded) {
+      try {
+        await loadStores();
+      } catch (cause) {
+        failures.push(
+          `店铺筛选加载失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+    }
+    const [orderResult, filterResult, settingsResult] = await Promise.allSettled([
       call("orders.list", { limit: 100000 }),
-      call("stores.list", {}),
       call("orders.filters.get", {}),
       call("orders.settings.get", {}),
     ]);
-    countdownClock.setServerTime(orderData.server_time);
-    orders.value = orderData.orders || [];
-    ordersTotal.value = Number(orderData.total || orders.value.length);
-    ordersTruncated.value = Boolean(orderData.truncated);
-    stores.value = storeData.stores || [];
-    hiddenProductIds.value = (filterData.hidden_product_ids || []).join("\n");
-    const settings = settingsData.settings || {};
-    printMode.value = settings.print_mode || "代发打单";
-    giftSettings.gift_auto_reship = settings.gift_auto_reship !== false;
-    Object.assign(giftSettings.gift_sender, settings.gift_sender || {});
-    selectedOrderIds.value = selectedOrderIds.value.filter((id) => (
-      orders.value.some((order) => order.order_id === id)
-    ));
-    if (ordersTruncated.value) {
-      note.value = `当前显示 ${orders.value.length} / ${ordersTotal.value} 条订单；超过单次加载范围，请使用店铺或筛选条件缩小后查询。`;
+    const orderFailure = loadErrorText("订单列表加载失败", orderResult);
+    if (orderFailure) failures.push(orderFailure);
+    else {
+      const orderData = orderResult.value;
+      countdownClock.setServerTime(orderData.server_time);
+      orders.value = orderData.orders || [];
+      ordersTotal.value = Number(orderData.total || orders.value.length);
+      ordersTruncated.value = Boolean(orderData.truncated);
+      selectedOrderIds.value = selectedOrderIds.value.filter((id) => (
+        orders.value.some((order) => order.order_id === id)
+      ));
+      if (ordersTruncated.value) {
+        failures.push(
+          `当前显示 ${orders.value.length} / ${ordersTotal.value} 条订单；超过单次加载范围，请使用店铺或筛选条件缩小后查询。`,
+        );
+      }
     }
-  } catch (cause) {
-    note.value = cause instanceof Error ? cause.message : String(cause);
+    const filterFailure = loadErrorText("订单过滤条件加载失败", filterResult);
+    if (filterFailure) failures.push(filterFailure);
+    else {
+      hiddenProductIds.value = (
+        filterResult.value.hidden_product_ids || []
+      ).join("\n");
+    }
+    const settingsFailure = loadErrorText("订单设置加载失败", settingsResult);
+    if (settingsFailure) failures.push(settingsFailure);
+    else {
+      const settings = settingsResult.value.settings || {};
+      printMode.value = settings.print_mode || "代发打单";
+      giftSettings.gift_auto_reship = settings.gift_auto_reship !== false;
+      Object.assign(giftSettings.gift_sender, settings.gift_sender || {});
+    }
+    if (failures.length) note.value = failures.join("；");
+    return { failures };
   } finally {
     loading.value = false;
   }
+}
+
+function startupOrderProgressText(status, storeCount) {
+  const ordersStage = status?.stages?.orders;
+  if (ordersStage?.status === "running") {
+    return `启动刷新：正在更新 ${storeCount} 家店铺的最近订单…`;
+  }
+  const storesStage = status?.stages?.stores;
+  if (storesStage && storesStage.status !== "completed") {
+    return "启动刷新：正在准备店铺数据，订单刷新将随后执行…";
+  }
+  if (status?.stage === "products") {
+    return "启动刷新：订单阶段已完成，正在整理结果…";
+  }
+  return "启动刷新：等待订单刷新阶段…";
+}
+
+function startupOrderResultMessage(result, storeCount) {
+  const stage = result?.stage || {};
+  const details = stage.result || {};
+  const succeeded = Number(details.succeeded || 0);
+  const updated = Number(details.updated || 0);
+  const errors = details.errors || [];
+  if (stage.status === "completed" || stage.status === "partial") {
+    const message = (
+      `启动刷新完成：成功 ${succeeded}/${Number(details.total || storeCount)} 家，`
+      + `读取 ${updated} 条最近订单`
+    );
+    return errors.length
+      ? `${message}；${errors.slice(0, 2).join("；")}`
+      : message;
+  }
+  return `启动订单刷新失败：${details.message || errors[0] || "未知错误"}`;
+}
+
+async function refreshOrdersAfterStartup() {
+  if (!stores.value.length) {
+    quickRefresh.visible = true;
+    quickRefresh.status = "failed";
+    quickRefresh.message = "未加载到可刷新的店铺，订单联网刷新未执行";
+    note.value = quickRefresh.message;
+    return;
+  }
+  Object.assign(quickRefresh, {
+    visible: true,
+    status: "starting",
+    current: 0,
+    total: stores.value.length,
+    succeeded: 0,
+    failed: 0,
+    updated: 0,
+    message: "正在检查软件启动订单刷新…",
+    logs: [],
+  });
+  let startupResult = null;
+  try {
+    startupResult = await waitForStartupRefreshStage({
+      name: "orders",
+      readStatus: () => call("startup.refresh.status", {}),
+      isApplicable: (status) => status?.enabled?.orders !== false,
+      onStatus: (status) => {
+        const stageResult = status?.stages?.orders?.result || {};
+        quickRefresh.current = Number(stageResult.current || 0);
+        quickRefresh.total = Number(stageResult.total || stores.value.length);
+        quickRefresh.succeeded = Number(stageResult.succeeded || 0);
+        quickRefresh.failed = Number(stageResult.failed || 0);
+        quickRefresh.message = startupOrderProgressText(
+          status,
+          stores.value.length,
+        );
+      },
+    });
+  } catch (cause) {
+    appendQuickLog(
+      `读取启动刷新状态失败：${cause instanceof Error ? cause.message : String(cause)}`,
+      "error",
+    );
+  }
+
+  if (startupResult?.available && startupResult.stage) {
+    await load({ storesLoaded: true });
+    const resultDetails = startupResult.stage.result || {};
+    quickRefresh.current = Number(resultDetails.current || stores.value.length);
+    quickRefresh.total = Number(resultDetails.total || stores.value.length);
+    quickRefresh.succeeded = Number(resultDetails.succeeded || 0);
+    quickRefresh.failed = Number(resultDetails.failed || 0);
+    quickRefresh.updated = Number(resultDetails.updated || 0);
+    quickRefresh.status = startupResult.stage.status;
+    quickRefresh.message = startupOrderResultMessage(
+      startupResult,
+      stores.value.length,
+    );
+    appendQuickLog(
+      quickRefresh.message,
+      startupResult.stage.status === "failed" ? "error" : "info",
+    );
+    if (startupResult.stage.status !== "failed") {
+      note.value = quickRefresh.message;
+      return;
+    }
+  }
+
+  if (startupResult?.timedOut) {
+    quickRefresh.status = "failed";
+    quickRefresh.message = "等待启动订单刷新超时，暂未重复发起联网刷新";
+    note.value = quickRefresh.message;
+    appendQuickLog(quickRefresh.message, "error");
+    return;
+  }
+
+  await syncOrders({ automatic: true, storesLoaded: true });
 }
 
 function startOrderCountdownClock() {
@@ -474,7 +640,7 @@ function handleOrderCountdownVisibility() {
   }
 }
 
-async function syncOrders({ automatic = false } = {}) {
+async function syncOrders({ automatic = false, storesLoaded = false } = {}) {
   if (syncing.value) {
     return { ok: false, message: "订单同步正在进行" };
   }
@@ -493,9 +659,19 @@ async function syncOrders({ automatic = false } = {}) {
     logs: [],
   });
   try {
+    if (!storesLoaded && !stores.value.length) {
+      await loadStores();
+    }
     const targetStores = filters.store_id
       ? stores.value.filter((store) => String(store.id) === String(filters.store_id))
       : stores.value;
+    if (!targetStores.length) {
+      throw new Error(
+        filters.store_id
+          ? "当前店铺筛选没有匹配到可刷新店铺"
+          : "店铺筛选列表为空，未发起订单联网刷新",
+      );
+    }
     const tracked = orders.value.filter((order) => (
       targetStores.some((store) => String(store.id) === String(order.store_id))
     ));
@@ -555,6 +731,9 @@ async function syncOrders({ automatic = false } = {}) {
   } catch (cause) {
     const errorMessage = cause instanceof Error ? cause.message : String(cause);
     if (!automatic) note.value = errorMessage;
+    quickRefresh.status = "failed";
+    quickRefresh.message = errorMessage;
+    appendQuickLog(errorMessage, "error");
     return { ok: false, message: errorMessage };
   } finally {
     syncing.value = false;
@@ -579,6 +758,10 @@ async function manualSyncOrders() {
 
 async function quickRefreshOrders() {
   if (quickRefreshing.value) return;
+  if (syncing.value) {
+    note.value = "订单同步正在进行，请等待本轮结束";
+    return;
+  }
   if (!autoRefresh.beginManual()) {
     note.value = "自动刷新正在进行，请等待本轮结束";
     return;
@@ -592,18 +775,23 @@ async function quickRefreshOrders() {
     succeeded: 0,
     failed: 0,
     updated: 0,
-    message: "开始快速刷新最近订单...",
+    message: "正在加载全部店铺...",
     logs: [],
   });
-  appendQuickLog("开始快速刷新最近订单...");
+  appendQuickLog("开始快速刷新全部店铺最近订单...");
   try {
+    if (!stores.value.length) await loadStores();
+    if (!stores.value.length) {
+      throw new Error("店铺筛选列表为空，快速刷新未执行");
+    }
+    quickRefresh.total = stores.value.length;
+    quickRefresh.message = `开始快速刷新全部店铺（${stores.value.length} 家）...`;
     const started = await call("orders.quick-refresh.start", {
-      store_id: filters.store_id || undefined,
       current_order_ids: Object.fromEntries(
-        [...new Set(visibleOrders.value.map((order) => String(order.store_id)))]
+        [...new Set(orders.value.map((order) => String(order.store_id)))]
           .map((storeId) => [
             storeId,
-            visibleOrders.value
+            orders.value
               .filter((order) => String(order.store_id) === storeId)
               .map((order) => order.order_id),
           ]),
@@ -1068,7 +1256,24 @@ onMounted(async () => {
   window.addEventListener("resize", closeOrderContextMenu);
   window.addEventListener("blur", closeOrderContextMenu);
   startOrderCountdownClock();
-  await load();
+  Object.assign(quickRefresh, {
+    visible: true,
+    status: "starting",
+    current: 0,
+    total: 0,
+    succeeded: 0,
+    failed: 0,
+    updated: 0,
+    message: "正在加载店铺筛选列表…",
+    logs: [],
+  });
+  let storeLoadError = "";
+  try {
+    await loadStores();
+  } catch (cause) {
+    storeLoadError = cause instanceof Error ? cause.message : String(cause);
+  }
+  await load({ storesLoaded: true });
   if (String(route.query.after_sales || "") === "1") {
     activeTab.value = "after_sale";
     page.value = 1;
@@ -1077,7 +1282,13 @@ onMounted(async () => {
   await nextTick();
   measureHorizontalScroll();
   bindTableResizeObserver();
-  await syncOrders({ automatic: true });
+  if (storeLoadError) {
+    quickRefresh.status = "failed";
+    quickRefresh.message = `店铺筛选列表加载失败：${storeLoadError}`;
+    note.value = quickRefresh.message;
+    return;
+  }
+  await refreshOrdersAfterStartup();
 });
 watch(activeTab, async (value) => {
   page.value = 1;
@@ -1225,10 +1436,10 @@ watch(note, (value) => {
       <input
         v-model="filters.search"
         class="input a-search"
-        placeholder="订单号、采购单号、物流单号；多个完整单号用空格分隔"
+        :placeholder="orderSearchPlaceholder"
       />
       <button class="btn soft" type="button" :disabled="quickRefreshing" @click="quickRefreshOrders">
-        {{ quickRefreshing ? "刷新中..." : "快速刷新" }}
+        {{ quickRefreshing ? "刷新中..." : "快速刷新全部店铺" }}
       </button>
       <button class="btn" type="button" @click="resetFilters">重置</button>
     </div>

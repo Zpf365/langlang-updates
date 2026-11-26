@@ -336,7 +336,7 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
     assert len(geometry["columns"]) == 16
     assert geometry["salesLines"]
     assert all(
-        line["fontSize"] == "11px"
+        line["fontSize"] == "13px"
         and line["scrollWidth"] <= line["clientWidth"] + 1
         for line in geometry["salesLines"]
     )
@@ -633,7 +633,7 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                 first_cell["lineStyles"]
                 + second_cell["lineStyles"]
             ):
-                assert line["fontSize"] == "11px"
+                assert line["fontSize"] == "12px"
                 assert line["scrollWidth"] <= line["clientWidth"] + 1
     assert snapshots[1440]["appIdLeft"] < snapshots[1440]["secretLeft"]
     assert snapshots[1440]["secretLeft"] < snapshots[1440]["loginLeft"]

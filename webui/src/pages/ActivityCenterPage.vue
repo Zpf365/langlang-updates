@@ -1654,7 +1654,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="store-renewal-grid">
         <article v-for="store in renewal.stores" :key="store.store_id">
-          <label><input v-model="renewalStoreConfigs[store.store_id].enabled" type="checkbox" /> {{ store.store_name }}</label>
+          <label><input v-model="renewalStoreConfigs[store.store_id].enabled" type="checkbox" :disabled="renewalBusy" @change="saveRenewalConfig" /> {{ store.store_name }}</label>
           <span>网页：{{ store.web_status }} · API：{{ store.api_status }}</span>
           <label>提前 <input v-model.number="renewalStoreConfigs[store.store_id].hours_before" class="input tiny" type="number" min="1" max="168" /> 小时进入续期检查</label>
           <label>续期 <input v-model.number="renewalStoreConfigs[store.store_id].duration_days" class="input tiny" type="number" min="1" max="7" /> 天</label>

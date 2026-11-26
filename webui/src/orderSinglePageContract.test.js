@@ -54,10 +54,14 @@ describe("single-page order workspace contract", () => {
     expect(procurementDialog).toContain("orders.procurement.purchase-open");
     expect(procurementDialog).toContain("打开购买");
     expect(procurementDialog).not.toContain("已完成采购，开始核验");
-    expect(procurementDialog).toContain(
+    expect(procurementDialog).not.toContain(
       "orders.procurement.purchase-confirm",
     );
-    expect(procurementDialog).toContain("确认已付款并回读");
+    expect(procurementDialog).not.toContain("确认已付款并回读");
+    expect(procurementDialog).not.toContain("请手动点击");
+    expect(procurementDialog).toContain(
+      "orders.procurement.purchase-auto-verify.status",
+    );
     expect(procurementDialog).toContain("purchase_attempt_status");
     expect(procurementDialog).not.toContain("setInterval(");
     expect(procurementDialog).toContain(

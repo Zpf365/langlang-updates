@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
-  canRequestPurchaseReadback,
   confirmedPurchaseSummary,
   isOfficialDeliveryCode,
   officialDeliveryAction,
   purchaseGate,
-  purchaseReadbackPayload,
   scopePurchaseEvidenceToLinks,
   supplierShipments,
 } from "./orderProcurementFlow";
@@ -40,7 +38,7 @@ describe("order procurement flow gates", () => {
     expect(blocked.reason).toContain("采购地址不完整");
   });
 
-  it("rejects invalid links and exposes the exact purchase readback payload", () => {
+  it("rejects invalid links before an official purchase page can open", () => {
     const rejected = purchaseGate({
       url: "https://example.com/item?id=1",
       accounts,
@@ -48,32 +46,6 @@ describe("order procurement flow gates", () => {
     });
     expect(rejected.valid).toBe(false);
     expect(rejected.reason).toContain("链接不是有效");
-
-    expect(purchaseReadbackPayload(
-      { store_id: 9, order_id: "WX-1" },
-      { id: 18, product_id: "P-1", account_id: 2 },
-      2,
-    )).toEqual({
-      store_id: 9,
-      order_id: "WX-1",
-      product_id: "P-1",
-      link_id: 18,
-      account_id: 2,
-    });
-  });
-
-  it("offers one readback step only after the official page was opened", () => {
-    expect(canRequestPurchaseReadback({
-      purchase_attempt_status: "page_open_pending_payment",
-    })).toBe(true);
-    expect(canRequestPurchaseReadback({
-      purchase_attempt_status: "verification_pending",
-    })).toBe(true);
-    expect(canRequestPurchaseReadback({
-      purchase_attempt_status: "page_open_pending_payment",
-      purchase_confirmed: true,
-    })).toBe(false);
-    expect(canRequestPurchaseReadback({})).toBe(false);
   });
 });
 

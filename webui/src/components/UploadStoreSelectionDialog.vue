@@ -21,7 +21,12 @@ const props = defineProps({
   productCount: { type: Number, default: 0 },
   busy: { type: Boolean, default: false },
 });
-const emit = defineEmits(["close", "load-options", "submit", "toast"]);
+const emit = defineEmits([
+  "close",
+  "load-options",
+  "submit",
+  "toast",
+]);
 
 const selectedStoreIds = ref([]);
 const selectedTemplateId = ref("");
@@ -69,6 +74,11 @@ const canSubmit = computed(() => (
   selectedStoreIds.value.length > 0
   && Boolean(selectedTemplateId.value)
   && !props.busy
+  && selectedStores.value.every((store) => {
+    const source = optionFor(store.id);
+    const mode = configValue(store.id, "brand_mode");
+    return mode !== "store" || source.has_store_brands;
+  })
 ));
 const batchOptions = computed(() => {
   if (!batchPanel.field) return [];
@@ -105,24 +115,17 @@ function fieldOptions(storeId, field) {
   }
   if (field === "brand_id") {
     const rows = uniqueOptions(source.brands, true);
-    return rows.length
-      ? rows
-      : [{ id: "2100000000", label: "无品牌" }];
+    return rows.length ? rows : [{ id: "2100000000", label: "无品牌" }];
   }
   return uniqueOptions(source.after_sale_addresses);
 }
 
 function defaultConfig(storeId) {
   const source = optionFor(storeId);
-  const brands = fieldOptions(storeId, "brand_id");
   return {
     freight_template_id: String(source.default_freight_template_id || ""),
-    brand_id: String(
-      source.default_brand_id
-      || brands.find((item) => item.id === "2100000000")?.id
-      || brands[0]?.id
-      || "2100000000",
-    ),
+    brand_mode: "none",
+    brand_id: "2100000000",
     after_sale_address_id: String(source.default_after_sale_address_id || ""),
   };
 }
@@ -164,6 +167,18 @@ function setConfig(storeId, field, value) {
   if (!configs[key]) configs[key] = defaultConfig(storeId);
   configs[key][field] = value;
   touchedConfigKeys.add(`${storeId}:${field}`);
+}
+
+function setBrandMode(storeId, mode) {
+  setConfig(storeId, "brand_mode", mode);
+  if (mode === "none") {
+    setConfig(storeId, "brand_id", "2100000000");
+    return;
+  }
+  const first = fieldOptions(storeId, "brand_id").find(
+    (item) => item.id !== "2100000000",
+  );
+  setConfig(storeId, "brand_id", first?.id || "");
 }
 
 function initialize() {
@@ -328,7 +343,9 @@ function applyBatchOption() {
       (item) => item.label === batchPanel.label,
     );
     if (!match) continue;
-    const key = String(store.id);
+    if (batchPanel.field === "brand_id") {
+      setBrandMode(store.id, match.id === "2100000000" ? "none" : "store");
+    }
     setConfig(store.id, batchPanel.field, match.id);
   }
   batchPanel.open = false;
@@ -347,6 +364,7 @@ function submit() {
         String(id),
         {
           freight_template_id: configValue(id, "freight_template_id"),
+          brand_mode: configValue(id, "brand_mode"),
           brand_id: configValue(id, "brand_id"),
           after_sale_address_id: configValue(id, "after_sale_address_id"),
         },
@@ -404,7 +422,7 @@ onBeforeUnmount(() => {
       <header class="upload-store-head">
         <div>
           <h2 id="upload-store-title">选择分配店铺</h2>
-          <p>先选择店铺，再分别设置该店铺的运费模板、品牌和售后地址。</p>
+          <p>先选择店铺，再分别设置运费模板、售后地址和店铺品牌；指定类目统一在上货模板中配置。</p>
         </div>
         <span>{{ selectedCountText }}</span>
       </header>
@@ -518,24 +536,47 @@ onBeforeUnmount(() => {
                   >{{ option.label }}</option>
                 </select>
               </label>
-              <label class="field brand-field">
-                <span>品牌</span>
+              <div class="field brand-field">
+                <span>品牌设置</span>
+                <div class="brand-mode-row" role="radiogroup" :aria-label="`${store.name} 品牌设置`">
+                  <label>
+                    <input
+                      type="radio"
+                      :checked="configValue(store.id, 'brand_mode') === 'none'"
+                      @change="setBrandMode(store.id, 'none')"
+                    />
+                    <span>无品牌</span>
+                  </label>
+                  <label :class="{ disabled: !optionFor(store.id).has_store_brands }">
+                    <input
+                      type="radio"
+                      :checked="configValue(store.id, 'brand_mode') === 'store'"
+                      :disabled="!optionFor(store.id).has_store_brands"
+                      @change="setBrandMode(store.id, 'store')"
+                    />
+                    <span>店铺品牌</span>
+                  </label>
+                </div>
                 <select
+                  v-if="configValue(store.id, 'brand_mode') === 'store'"
                   class="select"
                   :value="configValue(store.id, 'brand_id')"
                   @change="setConfig(store.id, 'brand_id', $event.target.value)"
                 >
                   <option
-                    v-for="option in fieldOptions(store.id, 'brand_id')"
+                    v-for="option in fieldOptions(store.id, 'brand_id').filter((item) => item.id !== '2100000000')"
                     :key="option.id"
                     :value="option.id"
                   >{{ option.label }}</option>
                 </select>
-              </label>
+                <small v-else-if="!optionFor(store.id).has_store_brands">
+                  当前店铺暂无生效品牌，真实提交只能使用无品牌
+                </small>
+              </div>
             </div>
 
             <div v-else class="store-config-placeholder">
-              勾选后展开运费模板、品牌和售后地址
+              勾选后展开运费模板、售后地址和品牌
             </div>
           </div>
           <div v-if="!stores.length" class="store-empty">暂无可分配店铺</div>
@@ -881,6 +922,31 @@ onBeforeUnmount(() => {
 
 .brand-field {
   grid-column: 1 / -1;
+}
+
+.brand-field .select,
+.brand-field small {
+  grid-column: 2;
+}
+
+.brand-mode-row {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.brand-mode-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #40576b;
+  font-size: 11px;
+}
+
+.brand-mode-row label.disabled {
+  color: #9aa6b1;
+  cursor: not-allowed;
 }
 
 .store-config-placeholder {

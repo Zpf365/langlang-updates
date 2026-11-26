@@ -24,6 +24,7 @@ class FakeSnapupService:
         activities_by_store,
         *,
         missing_create_readback=False,
+        readback_failures_after_create=0,
         create_fail_store_ids=(),
     ):
         self.activities_by_store = {
@@ -33,10 +34,17 @@ class FakeSnapupService:
         self.scan_calls = []
         self.create_calls = []
         self.missing_create_readback = missing_create_readback
+        self.readback_failures_after_create = int(
+            readback_failures_after_create
+        )
+        self._readback_failure_pending = False
         self.create_fail_store_ids = set(create_fail_store_ids)
 
     def snapup_activities(self, store):
         self.scan_calls.append(store.id)
+        if self._readback_failure_pending:
+            self._readback_failure_pending = False
+            raise RuntimeError("官方活动列表读取暂时失败")
         return [dict(row) for row in self.activities_by_store.get(store.id, [])]
 
     def create_snapup_activity(
@@ -83,6 +91,9 @@ class FakeSnapupService:
                     },
                 }
             )
+        if self.readback_failures_after_create > 0:
+            self.readback_failures_after_create -= 1
+            self._readback_failure_pending = True
         return {
             "activity_id": activity_id,
             "activity_count": 1,
@@ -781,6 +792,310 @@ def test_auto_create_missing_readback_enters_verification_pending(
     row = result["stores"][0]["auto_create"]["outcomes"][0]
     assert row["status"] == "verification_pending"
     assert "未确认新活动生效" in row["error"]
+    assert len(service.create_calls) == 1
+
+
+def test_auto_create_reconciles_verification_pending_without_duplicate_write(
+    tmp_path: Path,
+) -> None:
+    database, manager, service, store_id = _auto_manager(
+        tmp_path,
+        missing_readback=True,
+    )
+    _seed_new_product(
+        database,
+        store_id,
+        "VERIFY-LATER",
+        first_seen=NOW,
+    )
+    first = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW,
+    )
+    pending = first["stores"][0]["auto_create"]["outcomes"][0]
+    assert pending["status"] == "verification_pending"
+
+    service.activities_by_store[store_id].append(
+        {
+            "activity_id": "auto-1-1",
+            "status": 0,
+            "start_time": int(pending["start_time"]),
+            "end_time": int(pending["end_time"]),
+            "extra": {
+                "snapupProducts": [{"productId": "VERIFY-LATER"}]
+            },
+        }
+    )
+    second = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert second["stores"][0]["auto_create"]["outcomes"][0]["status"] == (
+        "success"
+    )
+    assert len(service.create_calls) == 1
+    run = database.get_activity_auto_create_run(
+        store_id,
+        "VERIFY-LATER",
+        NOW.date().isoformat(),
+        manager.auto_create_rules()["rule_version"],
+    )
+    assert run is not None
+    assert run["status"] == "success"
+    assert run["activity_id"] == "auto-1-1"
+
+
+def test_auto_create_reconciles_interrupted_running_run_on_restart(
+    tmp_path: Path,
+) -> None:
+    database, manager, service, store_id = _auto_manager(tmp_path)
+    _seed_new_product(
+        database,
+        store_id,
+        "RUNNING-CRASH",
+        first_seen=NOW,
+    )
+    version = manager.auto_create_rules()["rule_version"]
+    start_time = int(NOW.timestamp()) + 300
+    end_time = start_time + 7 * 86400
+    database.save_activity_auto_create_run(
+        store_id,
+        "RUNNING-CRASH",
+        NOW.date().isoformat(),
+        version,
+        status="running",
+        attempts=1,
+        start_time=start_time,
+        end_time=end_time,
+        last_checked_at=int(NOW.timestamp()),
+    )
+    service.activities_by_store[store_id].append(
+        {
+            "activity_id": "auto-crashed-created",
+            "status": 0,
+            "start_time": start_time,
+            "end_time": end_time,
+            "extra": {
+                "snapupProducts": [{"productId": "RUNNING-CRASH"}]
+            },
+        }
+    )
+
+    result = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert result["stores"][0]["auto_create"]["outcomes"][0]["status"] == (
+        "success"
+    )
+    assert service.create_calls == []
+
+
+def test_auto_create_rechecks_product_once_it_becomes_eligible(
+    tmp_path: Path,
+) -> None:
+    database, manager, service, store_id = _auto_manager(tmp_path)
+    _seed_new_product(
+        database,
+        store_id,
+        "BECOMES-ELIGIBLE",
+        first_seen=NOW,
+        stock=0,
+    )
+    first = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW,
+    )
+    assert (
+        first["stores"][0]["auto_create"]["outcomes"][0]["status"]
+        == "skipped"
+    )
+    assert service.create_calls == []
+
+    _seed_new_product(
+        database,
+        store_id,
+        "BECOMES-ELIGIBLE",
+        first_seen=NOW,
+        stock=10,
+    )
+    second = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert (
+        second["stores"][0]["auto_create"]["outcomes"][0]["status"]
+        == "success"
+    )
+    assert len(service.create_calls) == 1
+
+
+def test_auto_create_retries_after_unconfirmed_readback_cooldown(
+    tmp_path: Path,
+) -> None:
+    database, manager, service, store_id = _auto_manager(
+        tmp_path,
+        missing_readback=True,
+    )
+    _seed_new_product(
+        database,
+        store_id,
+        "VERIFY-RETRY",
+        first_seen=NOW,
+    )
+    first = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW,
+    )
+    assert (
+        first["stores"][0]["auto_create"]["outcomes"][0]["status"]
+        == "verification_pending"
+    )
+
+    second = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW + timedelta(minutes=31),
+    )
+
+    assert (
+        second["stores"][0]["auto_create"]["outcomes"][0]["status"]
+        == "verification_pending"
+    )
+    assert len(service.create_calls) == 2
+    run = database.get_activity_auto_create_run(
+        store_id,
+        "VERIFY-RETRY",
+        NOW.date().isoformat(),
+        manager.auto_create_rules()["rule_version"],
+    )
+    assert run is not None
+    assert run["attempts"] == 2
+    assert run["next_retry_at"] > int(
+        (NOW + timedelta(minutes=31)).timestamp()
+    )
+
+
+def test_auto_create_readback_exception_is_pending_then_reconciled(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "readback-exception.db")
+    store_id = database.add_store("回读异常店", "wx-readback-error", "secret")
+    database.update_web_status(store_id, "已登录", "")
+    database.save_activity_renewal_config(store_id, enabled=1)
+    database.set_setting("activity_auto_renewal_enabled", "1")
+    service = FakeSnapupService(
+        {store_id: []},
+        readback_failures_after_create=1,
+    )
+    manager = ActivityAutoRenewalManager(
+        database,
+        service,
+        FakeWebSession(service),
+        now_provider=lambda: NOW,
+    )
+    manager.save_auto_create_rules(
+        {
+            "start_delay_minutes": 5,
+            "duration_seconds": 7 * 86400,
+            "discount": 0.85,
+            "min_discount_cents": 100,
+            "stock_limit_per_sku": 0,
+            "limit_purchase_num": 0,
+        }
+    )
+    _seed_new_product(
+        database,
+        store_id,
+        "READBACK-EXCEPTION",
+        first_seen=NOW,
+    )
+
+    first = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW,
+    )
+    pending = first["stores"][0]["auto_create"]["outcomes"][0]
+    assert pending["status"] == "verification_pending"
+    assert "官方活动列表读取暂时失败" in pending["error"]
+
+    second = manager.run_due(
+        store_ids=[store_id],
+        force=True,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert second["stores"][0]["auto_create"]["outcomes"][0]["status"] == (
+        "success"
+    )
+    assert len(service.create_calls) == 1
+
+
+def test_auto_create_requires_global_and_store_switches(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "both-switches.db")
+    store_id = database.add_store("双开关店", "wx-both-switches", "secret")
+    database.update_web_status(store_id, "已登录", "")
+    service = FakeSnapupService({store_id: []})
+    manager = ActivityAutoRenewalManager(
+        database,
+        service,
+        FakeWebSession(service),
+        now_provider=lambda: NOW,
+    )
+    manager.save_auto_create_rules(
+        {
+            "start_delay_minutes": 5,
+            "duration_seconds": 7 * 86400,
+            "discount": 0.85,
+            "min_discount_cents": 100,
+            "stock_limit_per_sku": 0,
+            "limit_purchase_num": 0,
+        }
+    )
+    _seed_new_product(database, store_id, "BOTH-1", first_seen=NOW)
+
+    default_result = manager.run_due(
+        store_ids=[store_id],
+        now=NOW,
+    )
+    assert default_result["status"] == "disabled"
+    assert service.create_calls == []
+
+    manager.save_global_config(enabled=True, interval_minutes=10)
+    store_disabled = manager.run_due(
+        store_ids=[store_id],
+        now=NOW,
+    )
+    assert store_disabled["stores"][0]["status"] == "disabled"
+    assert service.create_calls == []
+
+    manager.save_store_config(store_id, enabled=True)
+    restored = ActivityAutoRenewalManager(
+        database,
+        service,
+        FakeWebSession(service),
+        now_provider=lambda: NOW,
+    )
+    assert restored.snapshot()["stores"][0]["enabled"] == 1
+    enabled_result = restored.run_due(
+        store_ids=[store_id],
+        now=NOW,
+    )
+    assert (
+        enabled_result["stores"][0]["auto_create"]["outcomes"][0]["status"]
+        == "success"
+    )
     assert len(service.create_calls) == 1
 
 

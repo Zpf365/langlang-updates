@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import requests
 
@@ -71,6 +71,10 @@ FREIGHT_TEMPLATE_DETAIL_PATH = "/channels/ec/merchant/getfreighttemplatedetail"
 MERCHANT_ADDRESS_LIST_PATH = "/channels/ec/merchant/address/list"
 MERCHANT_ADDRESS_GET_PATH = "/channels/ec/merchant/address/get"
 CATEGORY_PRODUCT_RULE_PATH = "/shop/ec/category/getcategoryproductrule"
+CATEGORY_ALL_PATH = "/shop/ec/category/all"
+CATEGORY_RELATION_LIST_PATH = "/shop/ec/category/get_category_relation_list"
+CATEGORY_RULE_PATH = "/shop/ec/category/getcategoryrule"
+BRAND_VALID_LIST_PATH = "/channels/ec/brand/valid/list/get"
 COUPON_LIST_PATH = "/channels/ec/coupon/get_list"
 COUPON_DETAIL_PATH = "/channels/ec/coupon/get"
 COUPON_CREATE_PATH = "/channels/ec/coupon/create"
@@ -1321,6 +1325,102 @@ class WechatShopClient:
         )
         return result if isinstance(result, dict) else {}
 
+    def fetch_all_categories(self) -> dict[str, Any]:
+        result = self._post_api(CATEGORY_ALL_PATH, {})
+        categories = result.get("cats_v2")
+        if not isinstance(categories, list) or not categories:
+            raise WechatApiError("官方类目树没有返回 cats_v2")
+        return result
+
+    def fetch_effective_category_relations(self) -> list[str]:
+        result = self._post_api(
+            CATEGORY_RELATION_LIST_PATH,
+            {
+                "is_filter_status": True,
+                "status": 1,
+            },
+        )
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            raise WechatApiError(
+                "店铺类目权限列表缺少必要字段 list"
+            )
+        category_ids: list[str] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            category_id = str(item.get("id") or "").strip()
+            if not category_id:
+                continue
+            try:
+                status = int(item.get("status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status == 1:
+                category_ids.append(category_id)
+        return list(dict.fromkeys(category_ids))
+
+    def fetch_valid_brands(self) -> list[dict[str, Any]]:
+        brands: list[dict[str, Any]] = []
+        seen_brand_ids: set[str] = set()
+        next_key = ""
+        seen_keys: set[str] = set()
+        for _page_number in range(1, MAX_LIST_PAGES + 1):
+            payload: dict[str, Any] = {"page_size": 50}
+            if next_key:
+                payload["next_key"] = next_key
+            result = self._post_api(BRAND_VALID_LIST_PATH, payload)
+            rows = result.get("brands")
+            if not isinstance(rows, list):
+                raise WechatApiError(
+                    "店铺生效品牌列表缺少必要字段 brands"
+                )
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                brand_id = str(item.get("brand_id") or "").strip()
+                if not brand_id or brand_id in seen_brand_ids:
+                    continue
+                seen_brand_ids.add(brand_id)
+                try:
+                    status = int(item.get("status") or 0)
+                except (TypeError, ValueError):
+                    status = 0
+                brands.append(
+                    {
+                        **item,
+                        "brand_id": brand_id,
+                        "status": status,
+                        "expiring": status == 5,
+                    }
+                )
+            next_key = str(result.get("next_key") or "")
+            if not next_key:
+                break
+            if next_key in seen_keys:
+                raise WechatApiError(
+                    "店铺生效品牌分页游标重复，已停止读取"
+                )
+            seen_keys.add(next_key)
+        else:
+            raise WechatApiError(
+                f"店铺生效品牌分页超过最大页数 {MAX_LIST_PAGES}"
+            )
+        return brands
+
+    def fetch_category_rule(
+        self,
+        category_id: str,
+        *,
+        rule_id: int,
+    ) -> dict[str, Any]:
+        result = self._post_api(
+            CATEGORY_RULE_PATH,
+            {"category_id": int(category_id)},
+            query={"rule_id": int(rule_id)},
+        )
+        return result if isinstance(result, dict) else {}
+
     def upload_product_image(self, path: str | Path) -> str:
         if callable(self.write_authorizer):
             self.write_authorizer(self.app_id, "product_image_upload")
@@ -1663,9 +1763,16 @@ class WechatShopClient:
             action="order_delivery_send",
         )
 
-    def _post_api(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_api(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         token = self.get_access_token()
-        url = f"{API_ROOT}{path}?access_token={token}"
+        params = {"access_token": token, **(query or {})}
+        url = f"{API_ROOT}{path}?{urlencode(params)}"
         last_error: WechatApiError | None = None
         token_refreshed = False
         for attempt in range(3):

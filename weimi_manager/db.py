@@ -35,6 +35,7 @@ STORE_SCOPED_SETTING_PREFIXES = (
     "hosted_listing_mode_",
     "orders_day_backfill_",
     "product_quota_",
+    "upload_category_cache_",
     "store_metrics_",
     "webui_previous_store_metrics_",
     "webui_store_score_state_",
@@ -4886,6 +4887,7 @@ class Database:
                OR key LIKE 'hosted_listing_mode_%'
                OR key LIKE 'orders_day_backfill_%'
                OR key LIKE 'product_quota_%'
+               OR key LIKE 'upload_category_cache_%'
                OR key LIKE 'store_metrics_%'
                OR key LIKE 'webui_previous_store_metrics_%'
                OR key LIKE 'webui_store_score_state_%'

@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -21,6 +21,26 @@ from weimi_manager.procurement import (
 )
 from weimi_manager.service import SyncService
 from weimi_manager.webui.controller import NextUiController
+
+
+def _zpfly_controller(database: Database, **kwargs) -> NextUiController:
+    context = SimpleNamespace(
+        account_id="local-zpfly-test",
+        username="zpfly",
+        email="",
+        offline=False,
+        organization_name="test",
+        member_role="owner",
+        permissions={},
+        entitlements={},
+        license=None,
+        tokens=SimpleNamespace(access_token="test-token"),
+    )
+    return NextUiController(
+        database,
+        auth_context=context,
+        **kwargs,
+    )
 
 
 def test_chinese_taobao_platform_maps_to_official_login_key() -> None:
@@ -581,7 +601,7 @@ def test_procurement_page_accepts_two_platforms_with_empty_passwords(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "webui.db")
-    controller = NextUiController(database)
+    controller = _zpfly_controller(database)
     created = []
     for platform in ("淘宝", "1688"):
         created.append(
@@ -717,7 +737,7 @@ def test_webui_procurement_login_job_returns_before_browser_closes(
         "fixture-buyer",
     )
     service = _LoginService()
-    controller = NextUiController(database, product_service=service)
+    controller = _zpfly_controller(database, product_service=service)
 
     started = controller.dispatch(
         "procurement.login.start",
@@ -740,7 +760,7 @@ def test_webui_procurement_login_rejects_duplicate_window(
         "fixture-buyer",
     )
     service = _LoginService(block=True)
-    controller = NextUiController(database, product_service=service)
+    controller = _zpfly_controller(database, product_service=service)
 
     started = controller.dispatch(
         "procurement.login.start",
@@ -775,7 +795,7 @@ def test_webui_procurement_open_backend_uses_saved_session(
         "",
     )
     service = _LoginService()
-    controller = NextUiController(database, product_service=service)
+    controller = _zpfly_controller(database, product_service=service)
 
     started = controller.dispatch(
         "procurement.open-backend.start",
@@ -798,7 +818,7 @@ def test_webui_procurement_open_backend_requires_login(
         "fixture-buyer",
         "fixture-buyer",
     )
-    controller = NextUiController(
+    controller = _zpfly_controller(
         database,
         product_service=_LoginService(),
     )
@@ -829,7 +849,7 @@ def test_webui_procurement_open_backend_rejects_duplicate_window(
         "",
     )
     service = _LoginService(block=True)
-    controller = NextUiController(database, product_service=service)
+    controller = _zpfly_controller(database, product_service=service)
     started = controller.dispatch(
         "procurement.open-backend.start",
         {"account_id": account_id},

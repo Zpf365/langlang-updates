@@ -7,10 +7,8 @@ import {
 } from "vue";
 import { call, formatMoney } from "../api";
 import {
-  canRequestPurchaseReadback,
   confirmedPurchaseSummary,
   purchaseGate,
-  purchaseReadbackPayload,
   scopePurchaseEvidenceToLinks,
 } from "../orderProcurementFlow";
 import {
@@ -42,6 +40,8 @@ const productPreview = ref(null);
 const productPreviewStage = ref(0);
 const draftSequence = ref(0);
 const saveTimers = new Map();
+const verificationJobs = ref(new Map());
+const verificationTimers = new Map();
 
 const items = computed(() => detail.value?.items || []);
 const accounts = computed(() => (
@@ -271,6 +271,16 @@ function canOpenLink(link) {
 }
 
 function purchaseStatusLabel(link) {
+  const verification = verificationJobs.value.get(String(link.id));
+  if (verification?.status === "waiting") {
+    return "采购页已打开 / 等待付款，付款后自动核对";
+  }
+  if (verification?.status === "checking") {
+    return verification.message || "自动核对中 / 稍后自动重试";
+  }
+  if (["pending", "error"].includes(verification?.status)) {
+    return "采购结果待核实";
+  }
   if (link.purchase_confirmed || link.purchase_attempt_status === "confirmed") {
     return "采购已确认";
   }
@@ -440,10 +450,13 @@ async function openPurchase(link) {
     });
     link.purchase_attempt_status = String(result.status || "page_opened_pending_payment");
     link.purchase_opened_at = String(result.opened_at || "");
+    if (result.verification_job_id) {
+      startAutoVerification(link, result.verification_job_id);
+    }
     notify(
       result.reused
         ? "该采购账号已打开此商品受控页面，请勿重复打开"
-        : "采购商品页已打开，左侧采购订单栏会持续显示到结算页",
+        : "采购商品页已打开；付款完成后软件会自动有限次核对，无需手动确认",
     );
   } catch (cause) {
     notify(errorText(cause));
@@ -452,36 +465,82 @@ async function openPurchase(link) {
   }
 }
 
-async function confirmPurchase(link) {
-  if (
-    busyKey.value
-    || !canRequestPurchaseReadback(link)
-    || !canOpenLink(link)
-  ) return;
-  const gate = linkGate(link);
-  link.account_id = gate.accountId;
-  busyKey.value = link._key;
-  try {
-    const result = await call("orders.procurement.purchase-confirm", {
-      ...purchaseReadbackPayload(props.order, link, gate.accountId),
-    });
-    if (result.detail) applyDetail(result.detail);
-    if (result.status === "confirmed") {
-      notify(
-        result.reused
-          ? "该采购单已回读确认，未重复写入"
-          : "已从官方采购订单回读并保存真实采购信息",
+function updateVerificationState(link, state) {
+  const key = String(link.id);
+  verificationJobs.value = new Map([
+    ...verificationJobs.value,
+    [key, state],
+  ]);
+}
+
+function stopVerificationPolling(linkId) {
+  const timer = verificationTimers.get(String(linkId));
+  if (timer) clearTimeout(timer);
+  verificationTimers.delete(String(linkId));
+}
+
+function startAutoVerification(link, jobId) {
+  if (!jobId) return;
+  stopVerificationPolling(link.id);
+  let statusFailures = 0;
+  updateVerificationState(link, {
+    jobId,
+    status: "waiting",
+    message: "采购页已打开，等待付款完成",
+  });
+
+  const poll = async () => {
+    try {
+      const result = await call(
+        "orders.procurement.purchase-auto-verify.status",
+        { job_id: jobId },
       );
-      emit("changed");
-    } else {
-      notify(result.reason || "官方暂未返回可唯一确认的采购订单，请稍后重试");
-      if (result.detail) emit("changed");
+      statusFailures = 0;
+      updateVerificationState(link, result);
+      if (result.detail) applyDetail(result.detail);
+      if (result.status === "confirmed") {
+        stopVerificationPolling(link.id);
+        emit("changed");
+        notify("已自动回读并保存唯一匹配的采购订单");
+        return;
+      }
+      if (["pending", "error"].includes(result.status)) {
+        stopVerificationPolling(link.id);
+        emit("changed");
+        notify(
+          result.reason
+          || "自动核对未找到唯一采购订单，已标记待核实",
+        );
+        return;
+      }
+      const delay = result.status === "checking" ? 700 : 2500;
+      verificationTimers.set(
+        String(link.id),
+        setTimeout(poll, delay),
+      );
+    } catch (cause) {
+      statusFailures += 1;
+      if (statusFailures < 3) {
+        verificationTimers.set(
+          String(link.id),
+          setTimeout(poll, 1500),
+        );
+        return;
+      }
+      updateVerificationState(link, {
+        jobId,
+        status: "error",
+        reason: errorText(cause),
+        message: "自动核对状态读取失败",
+      });
+      stopVerificationPolling(link.id);
+      notify(errorText(cause));
     }
-  } catch (cause) {
-    notify(errorText(cause));
-  } finally {
-    busyKey.value = "";
-  }
+  };
+  verificationTimers.set(
+    String(link.id),
+    setTimeout(poll, 300),
+  );
 }
 
 watch(
@@ -498,6 +557,9 @@ watch(
 
 onBeforeUnmount(() => {
   for (const key of saveTimers.keys()) clearSaveTimer(key);
+  for (const linkId of verificationTimers.keys()) {
+    stopVerificationPolling(linkId);
+  }
 });
 </script>
 
@@ -604,7 +666,7 @@ onBeforeUnmount(() => {
         <header class="pane-header">
           <div>
             <strong>采购链接与官方下单</strong>
-            <small>多个链接可分别保存；付款后点击一次“确认已付款并回读”，以官方采购订单为唯一成功依据。</small>
+            <small>多个链接可分别保存；付款完成后软件会自动有限次核对官方采购订单，以唯一匹配结果为唯一成功依据。</small>
           </div>
           <button class="btn" type="button" @click="addLink">添加采购链接</button>
         </header>
@@ -661,15 +723,6 @@ onBeforeUnmount(() => {
                 @click="openPurchase(link)"
               >
                 {{ busyKey === link._key ? "处理中…" : (link.purchase_opened_at ? "重新打开购买" : "打开购买") }}
-              </button>
-              <button
-                v-if="canRequestPurchaseReadback(link)"
-                class="btn readback"
-                type="button"
-                :disabled="busyKey === link._key || !canOpenLink(link)"
-                @click="confirmPurchase(link)"
-              >
-                {{ busyKey === link._key ? "回读中…" : "确认已付款并回读" }}
               </button>
             </div>
             <button
@@ -825,7 +878,6 @@ onBeforeUnmount(() => {
 .link-actions { grid-column: 3 / 4; }
 .link-delete { grid-column: 4 / 5; padding: 0 10px; white-space: nowrap; }
 .link-actions { display: grid; gap: 5px; }
-.link-actions .readback { border-color: #8ac4ad; color: #126548; background: #eaf8f0; }
 .link-match-fields { grid-column: 1 / -1; display: grid; grid-template-columns: 180px 220px minmax(0, 1fr); gap: 7px; align-items: end; padding-top: 3px; }
 .link-match-fields label { display: grid; gap: 3px; color: #6f7f8c; font-size: 9px; }
 .link-match-fields > span { padding-bottom: 7px; color: #84929e; font-size: 9px; }

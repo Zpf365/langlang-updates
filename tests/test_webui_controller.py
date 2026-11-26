@@ -53,7 +53,10 @@ def _internal_auth_context() -> SimpleNamespace:
 
 
 def test_bootstrap_matches_reference_navigation_and_isolates_dongxiao(tmp_path: Path) -> None:
-    controller = NextUiController(Database(tmp_path / "webui.db"))
+    controller = NextUiController(
+        Database(tmp_path / "webui.db"),
+        auth_context=_internal_auth_context(),
+    )
 
     payload = controller.dispatch("bootstrap", {})
 
@@ -1374,7 +1377,10 @@ def test_product_list_does_not_mix_two_stores(tmp_path: Path) -> None:
 
 
 def test_procurement_account_crud_is_available_to_web_ui(tmp_path: Path) -> None:
-    controller = NextUiController(Database(tmp_path / "webui.db"))
+    controller = NextUiController(
+        Database(tmp_path / "webui.db"),
+        auth_context=_internal_auth_context(),
+    )
 
     created = controller.dispatch(
         "procurement.create",
@@ -1406,7 +1412,11 @@ def test_procurement_login_and_sync_use_existing_service(tmp_path: Path) -> None
         "buyer-login",
     )
     service = FakeProductService()
-    controller = NextUiController(database, product_service=service)
+    controller = NextUiController(
+        database,
+        product_service=service,
+        auth_context=_internal_auth_context(),
+    )
 
     login = controller.dispatch(
         "procurement.login",
@@ -1917,7 +1927,11 @@ def test_order_workbench_manual_purchase_and_detail_are_persisted(
         )
     )
     service = FakeProductService()
-    controller = NextUiController(database, product_service=service)
+    controller = NextUiController(
+        database,
+        product_service=service,
+        auth_context=_internal_auth_context(),
+    )
 
     saved = controller.dispatch(
         "orders.workbench.manual-purchase",
@@ -2111,7 +2125,11 @@ def test_profit_report_uses_real_purchase_cost_and_flags_pending_orders(
             )
         )
     service = FakeProductService()
-    controller = NextUiController(database, product_service=service)
+    controller = NextUiController(
+        database,
+        product_service=service,
+        auth_context=_internal_auth_context(),
+    )
     controller.dispatch(
         "orders.workbench.manual-purchase",
         {
@@ -2174,6 +2192,7 @@ def test_profit_report_uses_real_purchase_cost_and_flags_pending_orders(
 def test_violation_list_and_refresh_use_persisted_records(tmp_path: Path) -> None:
     database = Database(tmp_path / "webui.db")
     store_id = database.add_store("违规店铺", "wx-violation", "secret")
+    database.update_web_status(store_id, "已登录", "")
     database.set_setting(
         "violation_library",
         json.dumps(
@@ -2209,6 +2228,12 @@ def test_upload_preflight_blocks_exact_counterfeit_violation_title(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "webui.db")
+    store_id = database.add_store(
+        "违规预检店铺",
+        "wx-counterfeit-preflight",
+        "secret",
+    )
+    database.update_web_status(store_id, "已登录", "")
     database.set_setting(
         "upload_batch",
         json.dumps(
@@ -2250,6 +2275,8 @@ def test_upload_preflight_blocks_exact_counterfeit_violation_title(
                     "title": "毛绒花束捧花｜520生日礼物",
                     "normalized": "毛绒花束捧花｜520生日礼物",
                     "reason": "出售假冒商品",
+                    "store_id": store_id,
+                    "store_app_id": "wx-counterfeit-preflight",
                 }
             ],
             ensure_ascii=False,
@@ -2432,6 +2459,14 @@ def test_webui_upload_task_creation_snapshot_isolation_retry_and_logs(
                                     "itemImgs": [
                                         "https://img.alicdn.com/task-1.jpg"
                                     ],
+                                        "desc": [
+                                            "https://img.alicdn.com/detail-1.jpg",
+                                            "https://img.alicdn.com/detail-2.jpg",
+                                            "https://img.alicdn.com/detail-3.jpg",
+                                            "https://img.alicdn.com/detail-4.jpg",
+                                            "https://img.alicdn.com/detail-5.jpg",
+                                            "https://img.alicdn.com/detail-6.jpg",
+                                        ],
                                     "skus": [
                                         {
                                             "price": "1000",
@@ -2449,6 +2484,25 @@ def test_webui_upload_task_creation_snapshot_isolation_retry_and_logs(
                                     "headImg": [
                                         "https://wst.example.test/task-2.jpg"
                                     ],
+                                        "desc": [
+                                            "https://wst.example.test/detail-1.jpg",
+                                            "https://wst.example.test/detail-2.jpg",
+                                            "https://wst.example.test/detail-3.jpg",
+                                            "https://wst.example.test/detail-4.jpg",
+                                            "https://wst.example.test/detail-5.jpg",
+                                            "https://wst.example.test/detail-6.jpg",
+                                        ],
+                                        "desc_info": {
+                                            "imgs": [
+                                                "https://wst.example.test/detail-1.jpg",
+                                                "https://wst.example.test/detail-2.jpg",
+                                                "https://wst.example.test/detail-3.jpg",
+                                                "https://wst.example.test/detail-4.jpg",
+                                                "https://wst.example.test/detail-5.jpg",
+                                                "https://wst.example.test/detail-6.jpg",
+                                            ],
+                                            "desc": "",
+                                        },
                                     "skus": [
                                         {
                                             "sale_price": 2000,
@@ -2572,7 +2626,11 @@ def test_procurement_login_scan_only_does_not_autofill_saved_credentials(
             return {"status": "待验证"}
 
     service = FakeService()
-    controller = NextUiController(database, product_service=service)
+    controller = NextUiController(
+        database,
+        product_service=service,
+        auth_context=_internal_auth_context(),
+    )
     result = controller.dispatch(
         "procurement.login",
         {"account_id": account_id, "scan_only": True},

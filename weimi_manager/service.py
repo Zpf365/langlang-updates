@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -33,7 +34,12 @@ from .procurement import (
 )
 from .shop_private import ShopPrivateClient, ShopPrivateError
 from .source_1688 import rank_category_candidates
-from .upload_violations import build_upload_violation_titles
+from .upload_violations import (
+    build_upload_violation_titles,
+    is_real_logged_in_store,
+    load_upload_violation_title_records,
+    mandatory_upload_violation_issue,
+)
 from .wechat_api import (
     WechatApiError,
     WechatShopClient,
@@ -60,6 +66,9 @@ GIFT_UNCLAIMED_MAX_AGE_SECONDS = 24 * 60 * 60
 AFTER_SALE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 AFTER_SALE_FULL_SYNC_MAX_AGE_SECONDS = 24 * 60 * 60
 AFTER_SALE_FULL_SYNC_DAYS = 30
+UPLOAD_CATEGORY_CACHE_SCHEMA = 1
+UPLOAD_CATEGORY_CACHE_TTL_SECONDS = 24 * 60 * 60
+UPLOAD_CATEGORY_REFRESH_COOLDOWN_SECONDS = 60 * 60
 
 
 def _gift_exclusion_for_period(
@@ -323,6 +332,16 @@ class SyncService:
         self._product_payload_defaults_cache: dict[int, dict[str, Any]] = {}
         self._category_rule_cache: dict[tuple[int, str, str], dict[str, Any]] = {}
         self._category_catalog_cache: dict[int, list[dict[str, Any]]] = {}
+        self._upload_category_tree_cache: dict[
+            tuple[int, str],
+            dict[str, Any],
+        ] = {}
+        self._upload_category_refresh_lock = threading.RLock()
+        self._upload_category_refresh_inflight: set[int] = set()
+        self._store_valid_brands_cache: dict[
+            int,
+            tuple[float, list[dict[str, Any]]],
+        ] = {}
         self._store_freight_template_ids_cache: dict[int, set[str]] = {}
         self._store_merchant_address_ids_cache: dict[int, set[str]] = {}
         self._procurement_windows: dict[int, ControlledPurchaseWindow] = {}
@@ -848,6 +867,704 @@ class SyncService:
             return False
         address_id = str(value.get("after_sale_address_id") or "").strip()
         return bool(address_id and address_id != "0")
+
+    @staticmethod
+    def _category_leaf_index(
+        options: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        leaves: dict[str, dict[str, Any]] = {}
+
+        def walk(nodes: list[dict[str, Any]]) -> None:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if node.get("leaf"):
+                    category_id = str(
+                        node.get("category_id") or ""
+                    ).strip()
+                    if category_id:
+                        leaves[category_id] = node
+                walk(node.get("children") or [])
+
+        walk(options.get("roots") or [])
+        return leaves
+
+    @staticmethod
+    def _upload_category_cache_key(store: Store) -> str:
+        return f"upload_category_cache_{store.id}"
+
+    def _read_upload_category_cache(
+        self,
+        store: Store,
+    ) -> dict[str, Any] | None:
+        raw = self.db.get_setting(
+            self._upload_category_cache_key(store),
+            "",
+        )
+        if not raw:
+            return None
+        try:
+            cached = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(cached, dict):
+            return None
+        if (
+            str(cached.get("store_id") or "") != str(store.id)
+            or str(cached.get("store_app_id") or "") != store.app_id
+            or not isinstance(cached.get("roots"), list)
+            or not str(cached.get("version") or "")
+        ):
+            return None
+        return cached
+
+    def _write_upload_category_cache(
+        self,
+        store: Store,
+        payload: dict[str, Any],
+        *,
+        touch_saved_at: bool = True,
+    ) -> dict[str, Any]:
+        saved = deepcopy(payload)
+        saved.update(
+            {
+                "schema": UPLOAD_CATEGORY_CACHE_SCHEMA,
+                "store_id": store.id,
+                "store_app_id": store.app_id,
+                "saved_at": (
+                    float(time.time())
+                    if touch_saved_at
+                    else float(saved.get("saved_at") or 0)
+                ),
+                "cache_key": (
+                    str(saved.get("cache_key") or "")
+                    or f"{store.id}:{saved.get('version') or ''}"
+                ),
+            }
+        )
+        self.db.set_setting(
+            self._upload_category_cache_key(store),
+            json.dumps(saved, ensure_ascii=False),
+        )
+        if saved.get("version"):
+            self._upload_category_tree_cache[
+                (store.id, str(saved["version"]))
+            ] = deepcopy(saved)
+        return saved
+
+    @staticmethod
+    def _decorate_upload_category_cache(
+        cached: dict[str, Any],
+        *,
+        now_ts: float,
+        refresh_pending: bool = False,
+    ) -> dict[str, Any]:
+        result = deepcopy(cached)
+        saved_at = float(result.get("saved_at") or 0)
+        age = max(0, int(now_ts - saved_at)) if saved_at else 0
+        result.update(
+            {
+                "cached": True,
+                "stale": (
+                    not saved_at
+                    or age >= UPLOAD_CATEGORY_CACHE_TTL_SECONDS
+                ),
+                "age_seconds": age,
+                "refresh_pending": bool(refresh_pending),
+                "expires_at": (
+                    datetime.fromtimestamp(
+                        saved_at + UPLOAD_CATEGORY_CACHE_TTL_SECONDS
+                    ).isoformat(timespec="seconds")
+                    if saved_at
+                    else ""
+                ),
+            }
+        )
+        return result
+
+    def _record_upload_category_refresh_failure(
+        self,
+        store: Store,
+        cached: dict[str, Any],
+        error: Exception | str,
+        *,
+        attempted_at: float | None = None,
+    ) -> dict[str, Any]:
+        failed = deepcopy(cached)
+        failed.update(
+            {
+                "last_refresh_attempt_at": float(
+                    attempted_at or time.time()
+                ),
+                "refresh_error": str(error)[:1000],
+            }
+        )
+        return self._write_upload_category_cache(
+            store,
+            failed,
+            touch_saved_at=False,
+        )
+
+    def _schedule_upload_category_refresh(
+        self,
+        store: Store,
+        client: WechatShopClient | MockShopClient | None,
+        cached: dict[str, Any],
+    ) -> bool:
+        now_ts = time.time()
+        try:
+            last_attempt = float(
+                cached.get("last_refresh_attempt_at") or 0
+            )
+        except (TypeError, ValueError):
+            last_attempt = 0.0
+        if (
+            last_attempt
+            and now_ts - last_attempt
+            < UPLOAD_CATEGORY_REFRESH_COOLDOWN_SECONDS
+        ):
+            return False
+        with self._upload_category_refresh_lock:
+            if store.id in self._upload_category_refresh_inflight:
+                return False
+            self._upload_category_refresh_inflight.add(store.id)
+
+        def worker() -> None:
+            try:
+                fresh = self._fetch_upload_category_options(
+                    store,
+                    client,
+                )
+                fresh["last_refresh_attempt_at"] = time.time()
+                fresh["refresh_error"] = ""
+                self._write_upload_category_cache(store, fresh)
+            except Exception as exc:
+                latest = self._read_upload_category_cache(store) or cached
+                self._record_upload_category_refresh_failure(
+                    store,
+                    latest,
+                    exc,
+                )
+            finally:
+                with self._upload_category_refresh_lock:
+                    self._upload_category_refresh_inflight.discard(
+                        store.id
+                    )
+
+        refresh_thread = threading.Thread(
+            target=worker,
+            name=f"upload-category-refresh-{store.id}",
+            daemon=True,
+        )
+        refresh_thread.start()
+        return True
+
+    def upload_category_options(
+        self,
+        store: Store,
+        client: WechatShopClient | MockShopClient | None = None,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Return a persistent per-store category snapshot.
+
+        Fresh cache is returned without network access. Expired cache is
+        returned immediately while one background refresh is started.
+        Manual refresh is synchronous and falls back to the previous snapshot
+        if the official read fails.
+        """
+        client = client or self.client_for(store)
+        cached = self._read_upload_category_cache(store)
+        if cached is not None and not refresh:
+            result = self._decorate_upload_category_cache(
+                cached,
+                now_ts=time.time(),
+            )
+            if result["stale"]:
+                scheduled = self._schedule_upload_category_refresh(
+                    store,
+                    client,
+                    cached,
+                )
+                result["refresh_pending"] = scheduled
+                if not scheduled and cached.get("refresh_error"):
+                    result["error"] = (
+                        "类目缓存已过期，后台刷新失败："
+                        + str(cached.get("refresh_error") or "")
+                    )
+            return result
+        try:
+            fresh = self._fetch_upload_category_options(store, client)
+        except Exception as exc:
+            if cached is None:
+                raise
+            failed = self._record_upload_category_refresh_failure(
+                store,
+                cached,
+                exc,
+            )
+            result = self._decorate_upload_category_cache(
+                failed,
+                now_ts=time.time(),
+            )
+            result.update(
+                {
+                    "manual_refresh_failed": bool(refresh),
+                    "refresh_error": str(exc)[:1000],
+                    "error": f"类目刷新失败，继续使用旧缓存：{str(exc)[:500]}",
+                }
+            )
+            return result
+        fresh["last_refresh_attempt_at"] = time.time()
+        fresh["refresh_error"] = ""
+        saved = self._write_upload_category_cache(store, fresh)
+        result = self._decorate_upload_category_cache(
+            saved,
+            now_ts=time.time(),
+        )
+        result["cached"] = False
+        result["stale"] = False
+        result["refresh_pending"] = False
+        return result
+
+    def _fetch_upload_category_options(
+        self,
+        store: Store,
+        client: WechatShopClient | MockShopClient | None = None,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Read an official category tree filtered by this store's permissions."""
+        client = client or self.client_for(store)
+        if isinstance(client, MockShopClient):
+            result = {
+                "roots": [],
+                "leaf_count": 0,
+                "version": "",
+                "cache_key": "",
+                "source": "演示店铺无官方类目",
+                "refreshed_at": datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+            }
+            return result
+        fetch_all = getattr(client, "fetch_all_categories", None)
+        fetch_relations = getattr(
+            client,
+            "fetch_effective_category_relations",
+            None,
+        )
+        if not callable(fetch_all) or not callable(fetch_relations):
+            raise RuntimeError("当前店铺接口不支持官方类目读取")
+        raw = fetch_all()
+        raw_v2 = raw.get("cats_v2") if isinstance(raw, dict) else None
+        if not isinstance(raw_v2, list) or not raw_v2:
+            raise ValueError("官方类目树没有返回 cats_v2")
+        version = hashlib.sha256(
+            json.dumps(
+                raw_v2,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        cache_key = (store.id, version)
+        relation_ids = {
+            str(value).strip()
+            for value in fetch_relations()
+            if str(value).strip()
+        }
+        permission_version = hashlib.sha256(
+            json.dumps(
+                sorted(relation_ids),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:8]
+        version = f"{version}-{permission_version}"
+        cache_key = (store.id, version)
+        tree_payload = None
+        if tree_payload is None:
+            roots_by_id: dict[str, dict[str, Any]] = {}
+            paths: list[list[dict[str, Any]]] = []
+            for group in raw_v2:
+                if not isinstance(group, dict):
+                    continue
+                entries = [
+                    item
+                    for item in group.get("cat_and_qua") or []
+                    if isinstance(item, dict)
+                    and isinstance(item.get("cat"), dict)
+                ]
+                leaf_entry = next(
+                    (
+                        item
+                        for item in entries
+                        if bool(item["cat"].get("leaf"))
+                    ),
+                    None,
+                )
+                if leaf_entry is None:
+                    continue
+                leaf_id = str(
+                    leaf_entry["cat"].get("cat_id") or ""
+                ).strip()
+                if not leaf_id:
+                    continue
+                path = sorted(
+                    entries,
+                    key=lambda item: int(
+                        item["cat"].get("level") or 0
+                    ),
+                )
+                path_nodes = [item["cat"] for item in path]
+                if not path_nodes:
+                    continue
+                paths.append(path_nodes)
+
+            for path_nodes in paths:
+                parent_id = ""
+                target = roots_by_id
+                for index, source in enumerate(path_nodes):
+                    category_id = str(
+                        source.get("cat_id") or ""
+                    ).strip()
+                    if not category_id:
+                        break
+                    if (
+                        index
+                        and str(source.get("f_cat_id") or "")
+                        != parent_id
+                    ):
+                        break
+                    node = target.get(category_id)
+                    if node is None:
+                        node = {
+                            "category_id": category_id,
+                            "name": str(source.get("name") or ""),
+                            "level": int(source.get("level") or index + 1),
+                            "leaf": bool(source.get("leaf")),
+                            "available": (
+                                category_id in relation_ids
+                                if bool(source.get("leaf"))
+                                else None
+                            ),
+                            "_children": {},
+                        }
+                        target[category_id] = node
+                    else:
+                        node["leaf"] = bool(source.get("leaf"))
+                        if node["leaf"]:
+                            node["available"] = category_id in relation_ids
+                    parent_id = category_id
+                    target = node["_children"]
+
+            def materialize(
+                nodes: dict[str, dict[str, Any]],
+                parents: list[str] | None = None,
+                parent_names: list[str] | None = None,
+            ) -> list[dict[str, Any]]:
+                output: list[dict[str, Any]] = []
+                parents = parents or []
+                parent_names = parent_names or []
+                for node in nodes.values():
+                    id_path = [
+                        *parents,
+                        str(node.get("category_id") or ""),
+                    ]
+                    names = [
+                        *parent_names,
+                        str(node.get("name") or ""),
+                    ]
+                    children = materialize(
+                        node.get("_children") or {},
+                        id_path,
+                        names,
+                    )
+                    output.append(
+                        {
+                            key: value
+                            for key, value in node.items()
+                            if key != "_children"
+                        }
+                        | {
+                            "id_path": id_path,
+                            "path": " / ".join(
+                                value for value in names if value
+                            ),
+                            "children": children,
+                        }
+                    )
+                return output
+
+            roots = materialize(roots_by_id)
+            leaf_count = len(self._category_leaf_index({"roots": roots}))
+            available_leaf_count = sum(
+                bool(node.get("available"))
+                for node in self._category_leaf_index({"roots": roots}).values()
+            )
+            tree_payload = {
+                "roots": roots,
+                "leaf_count": leaf_count,
+                "available_leaf_count": available_leaf_count,
+                "version": version,
+                "cache_key": f"{store.id}:{version}",
+                "source": "微信小店官方类目树 + 本店生效类目权限",
+                "refreshed_at": datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+                "cached": False,
+            }
+            if not roots:
+                tree_payload["error"] = "店铺暂无生效类目权限"
+            elif not available_leaf_count:
+                tree_payload["warning"] = "店铺暂无生效类目权限，请先申请类目"
+            self._upload_category_tree_cache[cache_key] = deepcopy(tree_payload)
+        return deepcopy(tree_payload)
+
+    def valid_store_brands(
+        self,
+        store: Store,
+        client: WechatShopClient | MockShopClient | None = None,
+        *,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        cached = self._store_valid_brands_cache.get(store.id)
+        if (
+            cached is not None
+            and not refresh
+            and now - float(cached[0]) < 600
+        ):
+            return deepcopy(cached[1])
+        client = client or self.client_for(store)
+        if isinstance(client, MockShopClient):
+            return []
+        fetch_brands = getattr(client, "fetch_valid_brands", None)
+        if not callable(fetch_brands):
+            raise RuntimeError("当前店铺接口不支持官方品牌读取")
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in fetch_brands() or []:
+            if not isinstance(item, dict):
+                continue
+            brand_id = str(item.get("brand_id") or "").strip()
+            if not brand_id or brand_id in seen:
+                continue
+            seen.add(brand_id)
+            rows.append({**item, "brand_id": brand_id})
+        self._store_valid_brands_cache[store.id] = (
+            now,
+            deepcopy(rows),
+        )
+        return rows
+
+    def validate_category_selection(
+        self,
+        store: Store,
+        category_ids: list[str],
+        category_id: str = "",
+        client: WechatShopClient | MockShopClient | None = None,
+    ) -> dict[str, Any]:
+        normalized_ids = [
+            str(value).strip()
+            for value in category_ids
+            if str(value).strip().isdigit()
+        ]
+        leaf_id = str(
+            category_id
+            or (normalized_ids[-1] if normalized_ids else "")
+        ).strip()
+        if not normalized_ids or not leaf_id.isdigit():
+            raise ValueError("指定类目缺少有效叶子 ID")
+        if normalized_ids[-1] != leaf_id:
+            raise ValueError("指定类目的叶子 ID 与类目路径末级不一致")
+        options = self.upload_category_options(
+            store,
+            client,
+            refresh=False,
+        )
+        leaf = self._category_leaf_index(options).get(leaf_id)
+        if leaf is None or leaf.get("available") is not True:
+            options = self.upload_category_options(
+                store,
+                client,
+                refresh=True,
+            )
+            leaf = self._category_leaf_index(options).get(leaf_id)
+        if leaf is None or leaf.get("available") is not True:
+            detail = str(
+                options.get("refresh_error")
+                or options.get("error")
+                or ""
+            ).strip()
+            suffix = f"；刷新结果：{detail}" if detail else ""
+            raise ValueError(
+                f"{store.name} 指定类目 {leaf_id} 已失效、被冻结或不存在，"
+                f"请修改模板{suffix}"
+            )
+        current_ids = [
+            str(value)
+            for value in leaf.get("id_path") or []
+            if str(value).strip()
+        ]
+        if current_ids != normalized_ids:
+            raise ValueError(
+                f"{store.name} 指定类目路径已变化，请重新选择模板类目"
+            )
+        return {
+            "category_id": leaf_id,
+            "category_ids": current_ids,
+            "path": str(leaf.get("path") or ""),
+            "version": str(options.get("version") or ""),
+            "cache_key": str(options.get("cache_key") or ""),
+        }
+
+    def _validate_specified_product_category(
+        self,
+        store: Store,
+        client: WechatShopClient,
+        payload: dict[str, Any],
+    ) -> None:
+        category_id = str(
+            payload.get("_specified_category_id") or ""
+        ).strip()
+        if not category_id:
+            return
+        category_ids = [
+            str(item.get("cat_id") or "").strip()
+            for item in payload.get("cats_v2") or []
+            if isinstance(item, dict)
+            and str(item.get("cat_id") or "").strip().isdigit()
+        ]
+        validated = self.validate_category_selection(
+            store,
+            category_ids,
+            category_id,
+            client,
+        )
+        payload["category_path"] = validated["path"]
+        brand_mode = str(payload.get("_brand_mode") or "").strip()
+        brand_id = str(payload.get("brand_id") or "").strip()
+        if brand_mode == "none":
+            brand_id = "2100000000"
+            payload["brand_id"] = brand_id
+        elif brand_mode == "store":
+            valid_ids = {
+                str(item.get("brand_id") or "").strip()
+                for item in self.valid_store_brands(store, client)
+            }
+            if not brand_id or brand_id not in valid_ids:
+                raise ValueError(
+                    f"{store.name} 店铺品牌 {brand_id or '未选择'} "
+                    "不存在、未生效或已过期"
+                )
+        category_rule_key = (
+            store.id,
+            category_id,
+            brand_id or "2100000000",
+        )
+        rule = self._category_rule_cache.get(category_rule_key)
+        if not isinstance(rule, dict):
+            rule = client.fetch_category_product_rule(
+                category_id,
+                brand_id=brand_id or "2100000000",
+            )
+            self._category_rule_cache[category_rule_key] = rule
+        brand_info = rule.get("brand_info")
+        brand_info = brand_info if isinstance(brand_info, dict) else {}
+        if (
+            brand_mode == "store"
+            and brand_info.get("is_brand_authorized") is False
+        ):
+            raise ValueError(
+                f"{store.name} 所选品牌未获得指定类目的品牌授权"
+            )
+        if (
+            bool(rule.get("is_directed_category"))
+            or bool(rule.get("restricted_brand_list"))
+        ) and brand_mode == "none":
+            raise ValueError(
+                f"{store.name} 指定类目为品牌定向类目，"
+                "必须选择当前店铺生效品牌"
+            )
+        restricted_brand_ids = {
+            str(item.get("brand_id") or "").strip()
+            for item in rule.get("restricted_brand_list") or []
+            if isinstance(item, dict)
+        }
+        if (
+            brand_mode == "store"
+            and restricted_brand_ids
+            and brand_id not in restricted_brand_ids
+        ):
+            raise ValueError(
+                f"{store.name} 所选品牌不在指定类目的可售品牌范围内"
+            )
+        provided_qualifications = {
+            str(item.get("qua_id") or "").strip()
+            for item in payload.get("product_qua_infos") or []
+            if isinstance(item, dict)
+        }
+        for item in rule.get("product_qua_list") or []:
+            if not isinstance(item, dict):
+                continue
+            required = item.get("required_rule") or {}
+            if int(required.get("rule_type") or 0) != 1:
+                continue
+            qualification_id = str(
+                item.get("id") or item.get("qua_id") or ""
+            ).strip()
+            if (
+                qualification_id
+                and qualification_id not in provided_qualifications
+            ):
+                raise ValueError(
+                    f"{store.name} 指定类目缺少必填商品资质："
+                    f"{item.get('name') or qualification_id}"
+                )
+        provided_attrs = {
+            str(item.get("attr_key") or "").strip(): str(
+                item.get("attr_value") or ""
+            ).strip()
+            for item in payload.get("attrs") or []
+            if isinstance(item, dict)
+        }
+        for item in rule.get("product_attr_list") or []:
+            if not isinstance(item, dict):
+                continue
+            required_rule = item.get("required_rule") or {}
+            is_required = bool(
+                item.get("is_required")
+                or int(required_rule.get("rule_type") or 0) == 1
+            )
+            if not is_required:
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and not provided_attrs.get(name):
+                raise ValueError(
+                    f"{store.name} 指定类目缺少必填商品属性：{name}"
+                )
+        deposit_rule = client.fetch_category_rule(
+            category_id,
+            rule_id=1,
+        )
+        required_deposit = max(
+            0,
+            int(deposit_rule.get("deposit") or 0),
+        )
+        try:
+            deposit_limit = max(
+                0,
+                int(payload.get("_deposit_limit_cents") or 0),
+            )
+        except (TypeError, ValueError):
+            deposit_limit = 0
+        if deposit_limit and required_deposit > deposit_limit:
+            raise ValueError(
+                f"{store.name} 指定类目需要保证金 "
+                f"{required_deposit} 分，超过模板上限 {deposit_limit} 分"
+            )
 
     def _product_payload_defaults(
         self,
@@ -1460,6 +2177,12 @@ class SyncService:
             client,
             prepared,
         )
+        if prepared.get("_specified_category_id"):
+            self._validate_specified_product_category(
+                store,
+                client,
+                prepared,
+            )
 
         image_cache: dict[str, str] = {}
 
@@ -1507,6 +2230,16 @@ class SyncService:
             detail_images = prepared["head_imgs"][:1]
         desc_info["imgs"] = list(dict.fromkeys(detail_images))[:50]
         prepared["desc_info"] = desc_info
+        for key in (
+            "_template_image_processing",
+            "_source_image_counts",
+            "_specified_category_id",
+            "_specified_category_path",
+            "_specified_category_version",
+            "_brand_mode",
+            "_deposit_limit_cents",
+        ):
+            prepared.pop(key, None)
         return prepared
 
     def _ensure_product_category(
@@ -1835,6 +2568,27 @@ class SyncService:
                 product_id,
                 client,
             )
+        if action in {"add", "update"}:
+            payload_data = payload or {}
+            title_records = load_upload_violation_title_records(self.db)
+            for title in (
+                payload_data.get("title"),
+                (
+                    payload_data.get("product")
+                    if isinstance(payload_data.get("product"), dict)
+                    else {}
+                ).get("title"),
+            ):
+                violation_issue = mandatory_upload_violation_issue(
+                    title,
+                    {},
+                    title_records,
+                )
+                if violation_issue:
+                    raise ValueError(
+                        "商品标题命中售假违规库，禁止提交微信平台："
+                        f"{str(title or '')[:120]}；{violation_issue}"
+                    )
         client = client or self.client_for(store)
         if isinstance(client, MockShopClient):
             return {"errcode": 0, "demo": True}
@@ -5524,6 +6278,21 @@ class SyncService:
         account_id: int,
         expected: dict[str, Any],
     ) -> dict[str, Any]:
+        upstream_order_id = str(
+            expected.get("upstream_order_id") or ""
+        ).strip()
+        if upstream_order_id:
+            account = self.db.get_procurement_account(account_id)
+            if account is None:
+                return {
+                    "status": "error",
+                    "reason": "采购账号不存在",
+                    "read_attempts": 0,
+                }
+            return ProcurementWebSession(
+                self.db,
+                self.db.path.parent,
+            ).read_order_by_id(account, upstream_order_id)
         with self._procurement_windows_lock:
             window = self._procurement_windows.get(account_id)
         if window is None or window.closed.is_set():
@@ -5535,6 +6304,56 @@ class SyncService:
         result = window.verify_once(expected)
         result["read_attempts"] = 1
         return result
+
+    def wait_for_procurement_purchase_signal(
+        self,
+        account_id: int,
+        *,
+        timeout_seconds: int = 30 * 60,
+    ) -> dict[str, Any]:
+        """Wait for a payment/return signal from the controlled purchase page."""
+
+        with self._procurement_windows_lock:
+            window = self._procurement_windows.get(account_id)
+        if window is None:
+            return {
+                "status": "closed",
+                "reason": "采购页面已关闭，无法读取付款结果",
+            }
+        deadline = time.monotonic() + max(1, int(timeout_seconds))
+        while time.monotonic() < deadline:
+            if window.purchase_observed.is_set():
+                result = {
+                    "status": "payment_observed",
+                    "reason": window.purchase_signal_reason,
+                }
+                purchase_order_id = str(
+                    getattr(window, "purchase_order_id", "") or ""
+                )
+                if purchase_order_id:
+                    result["upstream_order_id"] = (
+                        purchase_order_id
+                    )
+                try:
+                    self.close_procurement_window(account_id)
+                except Exception:
+                    pass
+                return result
+            if window.returned_to_software.is_set():
+                return {
+                    "status": "returned_to_software",
+                    "reason": "采购窗口已关闭，开始自动核对",
+                }
+            if window.closed.is_set():
+                return {
+                    "status": "closed",
+                    "reason": "采购页面已关闭，未捕获付款完成信号",
+                }
+            time.sleep(0.25)
+        return {
+            "status": "timeout",
+            "reason": "采购页面仍打开，尚未检测到付款完成",
+        }
 
     def close_procurement_window(self, account_id: int) -> bool:
         with self._procurement_windows_lock:
@@ -6083,6 +6902,11 @@ class SyncService:
         self,
         store: Store,
     ) -> SyncResult:
+        if not is_real_logged_in_store(store):
+            raise ValueError(
+                "违规同步只允许已登录真实店铺，"
+                "不允许演示店或未登录店铺"
+            )
         products = ShopPrivateClient(
             self.db,
             store,
@@ -6124,6 +6948,11 @@ class SyncService:
         )
 
     def sync_violation_library(self, store: Store) -> SyncResult:
+        if not is_real_logged_in_store(store):
+            raise ValueError(
+                "违规同步只允许已登录真实店铺，"
+                "不允许演示店或未登录店铺"
+            )
         records = [
             record
             for record in ShopPrivateClient(

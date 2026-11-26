@@ -13,9 +13,11 @@ const props = defineProps({
   template: { type: Object, default: null },
   defaults: { type: Object, default: () => ({}) },
   violationTypes: { type: Array, default: () => [] },
+  stores: { type: Array, default: () => [] },
+  storeOptions: { type: Object, default: () => ({}) },
   busy: Boolean,
 });
-const emit = defineEmits(["close", "save", "toast"]);
+const emit = defineEmits(["close", "save", "toast", "load-categories"]);
 
 const form = reactive({});
 const sourceTemplate = ref({});
@@ -28,6 +30,10 @@ const ladderOpen = ref(false);
 const ladderRows = ref([]);
 const cloudTypesOpen = ref(false);
 const selectedCloudTypes = ref([]);
+const categoryPickerOpen = ref(false);
+const categoryContextStoreId = ref("");
+const categoryRootId = ref("");
+const categoryParentId = ref("");
 
 const isEditing = computed(() => Boolean(props.template?.id));
 const listingLabel = computed(() => ({
@@ -48,6 +54,30 @@ const availableCloudTypes = computed(() => (
     ...props.violationTypes,
     ...String(form.cloud_violation_types || "").split(/\r?\n/),
   ].map((value) => String(value || "").trim()).filter(Boolean))]
+));
+const categoryRoots = computed(() => (
+  props.storeOptions?.[String(categoryContextStoreId.value)]
+    ?.category_options?.roots || []
+));
+const categoryOptions = computed(() => (
+  props.storeOptions?.[String(categoryContextStoreId.value)]
+    ?.category_options || {}
+));
+const categoryRoot = computed(() => (
+  categoryRoots.value.find(
+    (node) => String(node.category_id) === String(categoryRootId.value),
+  ) || null
+));
+const categoryParents = computed(() => categoryRoot.value?.children || []);
+const categoryParent = computed(() => (
+  categoryParents.value.find(
+    (node) => String(node.category_id) === String(categoryParentId.value),
+  ) || null
+));
+const categoryLeaves = computed(() => flattenCategoryLeaves(categoryParent.value));
+const categoryDisplay = computed(() => (
+  String(form.specified_category_path || "").trim()
+  || "请选择要指定的类目"
 ));
 
 function clone(value) {
@@ -82,6 +112,12 @@ function hydrate() {
     support_exchange: false,
     auto_open_category: true,
     force_fallback_category: false,
+    category_mode: "auto",
+    specified_category_id: "",
+    specified_category_ids: [],
+    specified_category_path: "",
+    specified_category_version: "",
+    specified_category_store_id: "",
     distributor_name: "",
     distributor_contact: "",
     delivery_type: "现货",
@@ -95,8 +131,12 @@ function hydrate() {
     low_price_multiplier: 2,
     low_price_action: "跳过商品",
     trim_head: 0,
-    trim_detail: 0,
-    cloud_violation: false,
+    remove_head_index: 0,
+    remove_detail_index: 0,
+    trim_detail: 2,
+    trim_detail_tail: 2,
+    detail_keep_first: 0,
+    cloud_violation: true,
     cloud_violation_types: "",
     strip_title_brackets: false,
     title_rules: "",
@@ -110,13 +150,109 @@ function hydrate() {
     ...clone(props.defaults),
     ...clone(props.template),
   };
+  if (typeof props.template?.cloud_violation !== "boolean") {
+    base.cloud_violation = true;
+  }
   for (const key of Object.keys(form)) delete form[key];
   Object.assign(form, base);
   sourceTemplate.value = clone(props.template || {});
   priceOffsetYuan.value = (Number(base.price_offset || 0) / 100).toFixed(2);
   fixedPriceYuan.value = (Number(base.fixed_price || 0) / 100).toFixed(2);
+  categoryContextStoreId.value = String(
+    base.specified_category_store_id
+    || defaultCategoryStoreId()
+  );
+  categoryPickerOpen.value = false;
+  categoryRootId.value = "";
+  categoryParentId.value = "";
+  if (base.specified_category_id) {
+    resetCategoryColumns();
+  }
   validationMessage.value = "";
   activeSection.value = "basic";
+}
+
+function defaultCategoryStoreId() {
+  const store = props.stores.find((row) => (
+    String(row?.web_status || "").includes("已登录")
+  )) || props.stores[0];
+  return store ? String(store.id) : "";
+}
+
+function selectedCategoryIds() {
+  const value = form.specified_category_ids;
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+function flattenCategoryLeaves(node) {
+  if (!node) return [];
+  const children = Array.isArray(node.children) ? node.children : [];
+  if (!children.length) return node.leaf ? [node] : [];
+  return children.flatMap((child) => flattenCategoryLeaves(child));
+}
+
+function loadCategoryOptions(refresh = false) {
+  const storeId = Number(categoryContextStoreId.value || 0);
+  if (!storeId) return;
+  emit("load-categories", storeId, Boolean(refresh));
+}
+
+function changeCategoryContext() {
+  categoryRootId.value = "";
+  categoryParentId.value = "";
+  loadCategoryOptions(false);
+}
+
+function resetCategoryColumns() {
+  const ids = selectedCategoryIds();
+  categoryRootId.value = ids[0] || "";
+  categoryParentId.value = ids[1] || "";
+}
+
+function toggleCategoryPicker() {
+  categoryPickerOpen.value = !categoryPickerOpen.value;
+  if (!categoryPickerOpen.value) return;
+  if (!categoryContextStoreId.value) {
+    categoryContextStoreId.value = defaultCategoryStoreId();
+  }
+  resetCategoryColumns();
+  if (!categoryRoots.value.length && !categoryOptions.value.error) {
+    loadCategoryOptions(false);
+  }
+}
+
+function selectCategoryRoot(node) {
+  categoryRootId.value = String(node.category_id);
+  categoryParentId.value = "";
+}
+
+function selectCategoryParent(node) {
+  categoryParentId.value = String(node.category_id);
+}
+
+function chooseCategory(node) {
+  if (node.available === false) return;
+  form.category_mode = "specified";
+  form.specified_category_store_id = String(categoryContextStoreId.value);
+  form.specified_category_ids = (
+    Array.isArray(node.id_path)
+      ? node.id_path
+      : [node.category_id]
+  ).map(String);
+  form.specified_category_id = String(node.category_id);
+  form.specified_category_path = String(node.path || "");
+  form.specified_category_version = String(categoryOptions.value.version || "");
+  categoryPickerOpen.value = false;
+}
+
+function clearSpecifiedCategory() {
+  form.category_mode = "auto";
+  form.specified_category_id = "";
+  form.specified_category_ids = [];
+  form.specified_category_path = "";
+  form.specified_category_version = "";
+  form.specified_category_store_id = "";
+  categoryPickerOpen.value = false;
 }
 
 watch(
@@ -233,6 +369,7 @@ function submit() {
         <button type="button" :class="{ active: activeSection === 'basic' }" @click="activeSection = 'basic'">基础设置</button>
         <button type="button" :class="{ active: activeSection === 'filters' }" @click="activeSection = 'filters'">商品过滤</button>
         <button type="button" :class="{ active: activeSection === 'attributes' }" @click="activeSection = 'attributes'">属性设置</button>
+        <button type="button" :class="{ active: activeSection === 'images' }" @click="activeSection = 'images'">图片/视频处理</button>
       </nav>
 
       <div v-show="activeSection === 'basic'" class="template-scroll">
@@ -283,19 +420,8 @@ function submit() {
         </section>
 
         <section class="template-section">
-          <h3>视频来源</h3>
-          <div class="folder-row">
-            <input v-model="form.video_folder" class="input" placeholder="文件夹内放商品ID.mp4，或按商品ID建子文件夹" />
-            <button class="btn" type="button" :disabled="folderBusy" @click="selectVideoFolder">
-              <Icon name="folder" :size="15" />{{ folderBusy ? "选择中…" : "选择文件夹" }}
-            </button>
-          </div>
-        </section>
-
-        <section class="template-section">
           <h3>服务与发布方式</h3>
           <div class="template-checks">
-            <label><input v-model="form.main_image_video" type="checkbox" />主图生视频</label>
             <label><input v-model="form.use_package_tags" type="checkbox" />使用数据包标签</label>
             <label><input v-model="form.read_packaging_labels" type="checkbox" />读取包装标签图（较慢）</label>
             <label><input v-model="form.clothing_mode" type="checkbox" />服装模式（同色尺码统一最高价）</label>
@@ -382,6 +508,142 @@ function submit() {
           <p class="template-help">
             默认保留数据包已有的官方类目；缺失时才使用可信的官方自动匹配。最高保证金仅用于合规候选排序和提示，不会在本地阻止上传，最终由微信平台申请与提交结果决定。保证金上限填 0 表示不限制。
           </p>
+          <div class="category-override">
+            <div class="category-override-head">
+              <div>
+                <strong>指定商品类目</strong>
+                <small>保留来源类目；来源缺失时使用官方自动匹配</small>
+              </div>
+              <div class="category-override-actions">
+                <button
+                  v-if="form.category_mode === 'specified'"
+                  type="button"
+                  class="inline-link danger-text"
+                  @click="clearSpecifiedCategory"
+                >清除指定</button>
+              </div>
+            </div>
+            <div class="category-trigger-row">
+              <span>目标类目</span>
+              <input
+                class="input category-trigger"
+                :value="categoryDisplay"
+                readonly
+                @click="toggleCategoryPicker"
+              />
+              <button type="button" class="btn" @click="toggleCategoryPicker">
+                {{ categoryPickerOpen ? "收起类目" : "选择类目" }}
+              </button>
+            </div>
+
+            <div v-if="categoryPickerOpen" class="category-picker">
+              <div class="category-context">
+                <label>
+                  <span>类目读取店铺</span>
+                  <select
+                    v-model="categoryContextStoreId"
+                    class="select"
+                    @change="changeCategoryContext"
+                  >
+                    <option value="">请选择店铺</option>
+                    <option
+                      v-for="store in stores"
+                      :key="store.id"
+                      :value="String(store.id)"
+                    >{{ store.name }} · {{ store.web_status || "状态未知" }}</option>
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  class="inline-link"
+                  :disabled="!categoryContextStoreId"
+                  @click="loadCategoryOptions(true)"
+                >重新读取</button>
+              </div>
+
+              <p
+                v-if="categoryOptions.refresh_pending"
+                class="category-cache-note"
+              >
+                类目缓存已过期，正在后台更新；当前继续显示上次缓存。
+              </p>
+              <p
+                v-else-if="categoryOptions.refresh_error"
+                class="category-cache-note danger-text"
+              >
+                类目刷新失败，继续使用旧缓存：{{ categoryOptions.refresh_error }}
+              </p>
+              <p
+                v-else-if="categoryOptions.stale"
+                class="category-cache-note"
+              >
+                当前显示过期类目缓存；可手动重新读取。
+              </p>
+
+              <div v-if="!categoryContextStoreId" class="category-empty">
+                请先选择用于读取官方类目的店铺。
+              </div>
+              <div
+                v-else-if="!categoryRoots.length && categoryOptions.error"
+                class="category-empty danger-text"
+              >
+                {{ categoryOptions.error }}
+              </div>
+              <div
+                v-else-if="!categoryRoots.length"
+                class="category-empty"
+              >
+                正在读取本店官方生效类目…
+              </div>
+              <div v-else class="category-columns">
+                <div class="category-column">
+                  <span class="category-column-title">一级大类</span>
+                  <button
+                    v-for="root in categoryRoots"
+                    :key="root.category_id"
+                    type="button"
+                    :class="{ active: String(root.category_id) === String(categoryRoot?.category_id) }"
+                    @click="selectCategoryRoot(root)"
+                  >{{ root.name }}</button>
+                </div>
+                <div class="category-column">
+                  <span class="category-column-title">二级类目</span>
+                  <button
+                    v-for="parent in categoryParents"
+                    :key="parent.category_id"
+                    type="button"
+                    :class="{ active: String(parent.category_id) === String(categoryParent?.category_id) }"
+                    @click="selectCategoryParent(parent)"
+                  >{{ parent.name }}</button>
+                  <span
+                    v-if="!categoryParents.length"
+                    class="category-column-empty"
+                  >请选择一级类目</span>
+                </div>
+                <div class="category-column">
+                  <span class="category-column-title">三级叶子</span>
+                  <button
+                    v-for="leaf in categoryLeaves"
+                    :key="leaf.category_id"
+                    type="button"
+                    :disabled="leaf.available === false"
+                    :class="{ active: String(leaf.category_id) === String(form.specified_category_id) }"
+                    @click="chooseCategory(leaf)"
+                  >
+                    <span>
+                      {{ leaf.name }}
+                      <small v-if="leaf.available === false">未生效</small>
+                    </span>
+                    <i v-if="String(leaf.category_id) === String(form.specified_category_id)">✓</i>
+                  </button>
+                  <span
+                    v-if="!categoryLeaves.length"
+                    class="category-column-empty"
+                  >请选择二级类目</span>
+                </div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="template-section">
@@ -393,8 +655,6 @@ function submit() {
               <span>低价规格处理</span>
               <select v-model="form.low_price_action" class="select"><option>跳过商品</option><option>删除最低价</option></select>
             </label>
-            <label><span>删除前主图</span><input v-model.number="form.trim_head" class="input" type="number" min="0" /></label>
-            <label><span>删除前详情图</span><input v-model.number="form.trim_detail" class="input" type="number" min="0" /></label>
           </div>
         </section>
       </div>
@@ -405,7 +665,7 @@ function submit() {
           <div class="ladder-row">
             <label class="inline-check"><input v-model="form.cloud_violation" type="checkbox" /><span>启用云违规商品过滤</span></label>
             <button class="btn" type="button" @click="openCloudViolationEditor">云违规设置</button>
-            <small>{{ String(form.cloud_violation_types || "").split(/\r?\n/).filter(Boolean).length }} 个类型；留空时按本机违规商品 ID 过滤。</small>
+            <small>{{ String(form.cloud_violation_types || "").split(/\r?\n/).filter(Boolean).length }} 个类型；售假标题库始终强制阻断，留空时按本机违规商品 ID 过滤。</small>
           </div>
           <label class="inline-check standalone-check"><input v-model="form.strip_title_brackets" type="checkbox" /><span>删除商品标题开头【】中的内容</span></label>
         </section>
@@ -450,6 +710,49 @@ function submit() {
           <textarea v-model="form.attribute_rules" class="input template-attribute-area" />
         </section>
       </div>
+
+      <div v-show="activeSection === 'images'" class="template-scroll">
+        <section class="template-section">
+          <h3>图片/视频处理</h3>
+          <p class="template-help">
+            图片规则按固定顺序执行：移除指定索引 → 移除前 N 张 → 移除后 N 张 → 只保留前 N 张。同一规则重复执行不会再次删除。
+          </p>
+          <div class="template-grid image-rule-grid">
+            <label>
+              <span>主图：移除第 N 张</span>
+              <input v-model.number="form.remove_head_index" class="input" type="number" min="0" step="1" />
+              <small>编号从 1 开始；0 表示不额外移除。</small>
+            </label>
+            <label>
+              <span>详情图：移除第 N 张</span>
+              <input v-model.number="form.remove_detail_index" class="input" type="number" min="0" step="1" />
+              <small>编号从 1 开始；0 表示不额外移除。</small>
+            </label>
+            <label><span>移除前 N 张主图</span><input v-model.number="form.trim_head" class="input" type="number" min="0" step="1" /></label>
+            <label><span>移除前 N 张详情图</span><input v-model.number="form.trim_detail" class="input" type="number" min="0" step="1" /></label>
+            <label><span>移除后 N 张详情图</span><input v-model.number="form.trim_detail_tail" class="input" type="number" min="0" step="1" /></label>
+            <label>
+              <span>只保留前 N 张详情图</span>
+              <input v-model.number="form.detail_keep_first" class="input" type="number" min="0" step="1" />
+              <small>0 表示不启用只保留规则。</small>
+            </label>
+          </div>
+          <p class="template-help">
+            顺序执行后才能得到最终图片列表。主图至少保留 1 张；详情图处理后为空时任务会明确阻断。
+          </p>
+        </section>
+
+        <section class="template-section">
+          <h3>视频来源</h3>
+          <div class="folder-row">
+            <input v-model="form.video_folder" class="input" placeholder="文件夹内放商品ID.mp4，或按商品ID建子文件夹" />
+            <button class="btn" type="button" :disabled="folderBusy" @click="selectVideoFolder">
+              <Icon name="folder" :size="15" />{{ folderBusy ? "选择中…" : "选择文件夹" }}
+            </button>
+          </div>
+          <label class="inline-check standalone-check"><input v-model="form.main_image_video" type="checkbox" /><span>主图生视频</span></label>
+        </section>
+      </div>
     </div>
     <template #footer>
       <span class="template-footer-note">所有规则随模板快照保存，历史上传任务不会被后续修改覆盖。</span>
@@ -478,7 +781,7 @@ function submit() {
   </ModalDialog>
 
   <ModalDialog :open="cloudTypesOpen" title="云违规设置" width="620px" :z-index="130" @close="cloudTypesOpen = false">
-    <p class="template-help">选项来自本机违规中心“出售假冒商品”等真实违规原因，不使用样例数据。</p>
+    <p class="template-help">选项来自本机违规中心“出售假冒商品”等真实违规原因，不使用样例数据；真实售假标题始终强制阻断。</p>
     <div v-if="availableCloudTypes.length" class="cloud-type-list">
       <label v-for="reason in availableCloudTypes" :key="reason">
         <input v-model="selectedCloudTypes" type="checkbox" :value="reason" />
@@ -516,6 +819,7 @@ function submit() {
 .template-grid.one-wide { grid-template-columns: minmax(280px, 560px); }
 .template-grid.three-wide { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .template-grid.price-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+ .template-grid.image-rule-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .template-grid label { display: grid; gap: 4px; color: #586b7b; font-size: 10px; }
 .template-grid label > span { font-weight: 500; }
 .template-grid small,
@@ -543,6 +847,139 @@ function submit() {
 .ladder-input-row button { height: 28px; border: 0; color: #b34651; background: transparent; font-size: 9px; }
 .cloud-type-list { max-height: 330px; padding: 4px 2px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; overflow-y: auto; }
 .empty-cloud-types { padding: 26px 12px; color: #82919d; background: #f7f9fa; text-align: center; font-size: 10px; }
+ .category-override {
+   margin-top: 10px;
+   padding-top: 10px;
+   border-top: 1px solid #e3eaef;
+ }
+ .category-override-head,
+ .category-context {
+   display: flex;
+   align-items: center;
+   justify-content: space-between;
+   gap: 12px;
+ }
+ .category-override-head > div:first-child {
+   min-width: 0;
+   display: grid;
+   gap: 3px;
+ }
+ .category-override-head strong {
+   color: #40576b;
+   font-size: 10px;
+ }
+ .category-override-head small {
+   color: #8493a0;
+   font-size: 9px;
+ }
+ .category-override-actions {
+   display: flex;
+   align-items: center;
+   gap: 10px;
+ }
+ .category-trigger-row {
+   margin-top: 8px;
+   display: grid;
+   grid-template-columns: 92px minmax(0, 1fr) auto;
+   align-items: center;
+   gap: 8px;
+   color: #586b7b;
+   font-size: 10px;
+ }
+ .category-trigger {
+   color: #40576b;
+   cursor: pointer;
+ }
+ .category-context {
+   margin-top: 9px;
+ }
+ .category-context label {
+   flex: 1;
+   display: grid;
+   grid-template-columns: 92px minmax(0, 1fr);
+   align-items: center;
+   gap: 8px;
+   color: #586b7b;
+   font-size: 10px;
+ }
+ .category-cache-note {
+   margin: 8px 0 0;
+   color: #7b6b36;
+   font-size: 9px;
+ }
+ .category-picker {
+   margin-top: 9px;
+   border: 1px solid #d8e2ea;
+   border-radius: 7px;
+   background: #fff;
+   overflow: hidden;
+ }
+ .category-columns {
+   display: grid;
+   grid-template-columns: repeat(3, minmax(0, 1fr));
+   min-height: 160px;
+   border-top: 1px solid #e4ebf0;
+ }
+ .category-column {
+   min-width: 0;
+   max-height: 250px;
+   padding: 5px;
+   overflow-y: auto;
+   border-right: 1px solid #e4ebf0;
+ }
+ .category-column:last-child {
+   border-right: 0;
+ }
+ .category-column-title {
+   display: block;
+   padding: 5px 7px 7px;
+   color: #8a98a4;
+   font-size: 9px;
+   font-weight: 600;
+ }
+ .category-column button {
+   width: 100%;
+   min-height: 30px;
+   padding: 5px 7px;
+   display: flex;
+   align-items: center;
+   justify-content: space-between;
+   gap: 6px;
+   border: 0;
+   border-radius: 4px;
+   color: #42586b;
+   background: transparent;
+   font-size: 10px;
+   text-align: left;
+ }
+ .category-column button:hover,
+ .category-column button:focus-visible,
+ .category-column button.active {
+   color: #176bc1;
+   background: #edf5ff;
+ }
+ .category-column button:disabled {
+   color: #9aa6b1;
+   cursor: not-allowed;
+ }
+ .category-column button small {
+   margin-left: 5px;
+   color: #aa6970;
+   font-size: 8px;
+ }
+ .category-column button i {
+   color: #2f80c8;
+   font-size: 11px;
+   font-style: normal;
+ }
+ .category-column-empty,
+ .category-empty {
+   display: block;
+   padding: 24px 12px;
+   color: #8b99a5;
+   font-size: 9px;
+   text-align: center;
+ }
 @media (max-width: 900px) {
   .template-grid,
   .template-grid.price-grid,

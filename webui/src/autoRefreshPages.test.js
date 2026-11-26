@@ -13,7 +13,9 @@ const orders = readFileSync(
 describe("store and order auto refresh integration", () => {
   it("uses the shared composable with persisted independent switches", () => {
     expect(stores).toContain('import { useAutoRefresh } from "../autoRefresh";');
-    expect(orders).toContain('import { useAutoRefresh } from "../autoRefresh";');
+    expect(orders).toMatch(
+      /import \{\s*useAutoRefresh[\s\S]*?\} from "\.\.\/autoRefresh";/,
+    );
     expect(stores).toContain('storageKey: "langlang.auto-refresh.stores"');
     expect(orders).toContain('storageKey: "langlang.auto-refresh.orders"');
     expect(stores).toContain("autoRefresh.beginManual()");

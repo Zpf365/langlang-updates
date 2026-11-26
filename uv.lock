@@ -1048,7 +1048,7 @@ wheels = [
 
 [[package]]
 name = "weimi-manager"
-version = "1.8.98.6"
+version = "1.9.00"
 source = { virtual = "." }
 dependencies = [
     { name = "cryptography" },

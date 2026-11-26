@@ -55,6 +55,7 @@ const detailLoading = ref(false);
 const menuOpen = ref(false);
 const purchaseOpen = ref(false);
 const procurementDialogOpen = ref(false);
+const procurementUnavailableOpen = ref(false);
 const deliveryOpen = ref(false);
 const addressOpen = ref(false);
 const priceOpen = ref(false);
@@ -156,6 +157,9 @@ const supplierShippingRows = computed(() => supplierShipments(props.order));
 const deliveryAction = computed(() => officialDeliveryAction(props.order));
 const afterSaleCount = computed(() => Number(props.order.after_sale_count || props.order.after_sales?.length || 0));
 const canViewAfterSales = computed(() => hasEntitlement("module.after_sales"));
+const canUseProcurementAssociation = computed(() => (
+  hasEntitlement("feature.procurement_association")
+));
 const waybill = computed(() => props.order.waybill_id || "");
 const carrier = computed(() => (
   props.order.carrier
@@ -427,6 +431,10 @@ async function preparePurchase() {
 
 function openProcurementDialog() {
   menuOpen.value = false;
+  if (!canUseProcurementAssociation.value) {
+    procurementUnavailableOpen.value = true;
+    return;
+  }
   procurementDialogOpen.value = true;
 }
 
@@ -436,6 +444,10 @@ async function refreshAfterProcurement() {
 }
 
 async function syncProcurement() {
+  if (!canUseProcurementAssociation.value) {
+    openProcurementDialog();
+    return;
+  }
   const data = await ensureDetail();
   if (!data) return;
   const accounts = data.procurement_accounts || [];
@@ -459,6 +471,10 @@ async function syncProcurement() {
 }
 
 async function openProcurementPlatform() {
+  if (!canUseProcurementAssociation.value) {
+    openProcurementDialog();
+    return;
+  }
   const data = await ensureDetail();
   const accounts = data?.procurement_accounts || [];
   const account = accounts.find((item) => item.status === "已登录") || accounts[0];
@@ -479,6 +495,10 @@ async function openProcurementPlatform() {
 }
 
 function syncPurchaseNote() {
+  if (!canUseProcurementAssociation.value) {
+    openProcurementDialog();
+    return;
+  }
   askConfirmation({
     title: "同步采购备注",
     description: "将把当前订单的采购信息追加到微信店铺备注。",
@@ -1134,7 +1154,16 @@ function runMenuAction(action) {
       </div>
     </td>
     <td class="col-purchase">
-      <div class="purchase-stack">
+      <div v-if="!canUseProcurementAssociation" class="purchase-stack">
+        <span class="procurement-state state-pending">功能暂未开放</span>
+        <span>订单管理采购关联正在集中优化</span>
+        <button
+          class="btn blue"
+          type="button"
+          @click="openProcurementDialog"
+        >关联采购订单</button>
+      </div>
+      <div v-else class="purchase-stack">
         <span class="procurement-state" :class="`state-${displayProcurementState || 'not_required'}`">{{ procurementStateLabel }}</span>
         <template v-if="firstPurchase">
           <strong>{{ firstPurchase.platform || "采购平台" }} · {{ firstPurchase.account_label || "采购账号" }}</strong>
@@ -1162,7 +1191,7 @@ function runMenuAction(action) {
           {{ shippingCountdown(order, nowSeconds) || (Number(order.status) === 20 ? "—" : `店铺：${displayStatus}`) }}
         </strong>
         <span>{{ fulfillmentStageLabel(order) || "履约状态暂无" }}</span>
-        <span>{{ order.purchase_order_no ? `采购 ${order.purchase_order_no}` : "采购未关联" }}</span>
+        <span v-if="canUseProcurementAssociation">{{ order.purchase_order_no ? `采购 ${order.purchase_order_no}` : "采购未关联" }}</span>
         <span v-if="order.pickup_code">取件码 <b class="mono">{{ order.pickup_code }}</b></span>
       </div>
     </td>
@@ -1277,7 +1306,12 @@ function runMenuAction(action) {
       <button type="button" @click="runMenuAction('price')"><b>修改价格</b><span>修改商品价格或运费</span></button>
       <button type="button" @click="runMenuAction('decrypt')"><b>解密收货信息</b><span>解密并保存到本机</span></button>
       <button
-        v-if="procurementActionLabel"
+        v-if="!canUseProcurementAssociation"
+        type="button"
+        @click="openProcurementDialog"
+      ><b>关联采购订单</b><span>功能正在加急开发优化中</span></button>
+      <button
+        v-else-if="procurementActionLabel"
         type="button"
         @click="openProcurementDialog"
       ><b>{{ procurementActionLabel }}</b><span>关联商品SKU、打开官方采购页或核实异常</span></button>
@@ -1552,6 +1586,23 @@ function runMenuAction(action) {
       <button class="btn primary" type="button" :disabled="confirmBusy" @click="confirmPendingAction">
         {{ confirmBusy ? "处理中…" : confirmDialog.confirmLabel }}
       </button>
+    </template>
+  </ModalDialog>
+
+  <ModalDialog
+    :open="procurementUnavailableOpen"
+    title="功能提示"
+    :subtitle="`${order.store_name} · ${order.order_id}`"
+    width="480px"
+    @close="procurementUnavailableOpen = false"
+  >
+    <p class="dialog-copy">此功能正在加急开发优化中</p>
+    <template #footer>
+      <button
+        class="btn primary"
+        type="button"
+        @click="procurementUnavailableOpen = false"
+      >知道了</button>
     </template>
   </ModalDialog>
 

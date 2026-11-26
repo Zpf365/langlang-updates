@@ -79,11 +79,13 @@ from .clipboard import write_clipboard_text
 from .store_import import parse_store_import_source
 from ..team_service import TeamService
 from ..upload_violations import (
-    apply_template_title_rules,
     build_cloud_counterfeit_rows,
     build_upload_violation_titles,
-    find_upload_violation_title,
-    merge_cloud_counterfeit_titles,
+    filter_active_violation_records,
+    is_real_logged_in_store,
+    load_upload_violation_title_records,
+    mandatory_upload_violation_issue,
+    real_logged_in_stores,
 )
 
 
@@ -116,7 +118,13 @@ MORE_NAV = (
     ("delivery_ledger", "未完成", "clipboard", "/more/delivery-ledger"),
 )
 
+PROCUREMENT_AUTO_VERIFY_MAX_ATTEMPTS = 4
+PROCUREMENT_AUTO_VERIFY_RETRY_SECONDS = 2.0
+PROCUREMENT_AUTO_VERIFY_POST_TRIGGER_SECONDS = 0.8
+PROCUREMENT_AUTO_VERIFY_WAIT_SECONDS = 30 * 60
+
 INTERNAL_MODULE_ENTITLEMENTS = {
+    "procurement": "feature.procurement_association",
     "delivery_ledger": "module.delivery_ledger",
     "team": "module.team",
     "after_sales": "module.after_sales",
@@ -130,6 +138,24 @@ INTERNAL_CAPABILITIES = (
     *INTERNAL_MODULE_ENTITLEMENTS.values(),
     "feature.software_update",
     "account.view_others",
+)
+PROCUREMENT_ASSOCIATION_ENTITLEMENT = "feature.procurement_association"
+LOCAL_PROCUREMENT_ASSOCIATION_SETTING = (
+    "local_experiment.procurement_association_enabled"
+)
+LOCAL_PROCUREMENT_ASSOCIATION_USERNAMES = frozenset({"zpfly"})
+PROCUREMENT_ASSOCIATION_ACTIONS = frozenset(
+    {
+        "orders.workbench.manual-purchase",
+        "orders.workbench.purchase-focus",
+        "orders.workbench.browse-procurement",
+        "orders.workbench.sync-procurement",
+        "orders.workbench.sync-procurement-note",
+    }
+)
+PROCUREMENT_ASSOCIATION_ACTION_PREFIXES = (
+    "orders.procurement.",
+    "procurement.",
 )
 ACTION_ENTITLEMENTS = {
     "delivery.ledger": "module.delivery_ledger",
@@ -253,6 +279,11 @@ UPLOAD_DEFAULT_TEMPLATE: dict[str, Any] = {
     "category_business_type": "individual",
     "category_mode": "auto",
     "fallback_category": "",
+    "specified_category_id": "",
+    "specified_category_ids": [],
+    "specified_category_path": "",
+    "specified_category_version": "",
+    "specified_category_store_id": "",
     "force_fallback_category": False,
     "deposit_limit": 0,
     "category_brand_ids": "",
@@ -276,6 +307,8 @@ UPLOAD_DEFAULT_TEMPLATE: dict[str, Any] = {
     "low_price_multiplier": 2,
     "low_price_action": "跳过商品",
     "trim_head": 0,
+    "remove_head_index": 0,
+    "remove_detail_index": 0,
     "title_rules": "",
     "sku_rules": "",
     "image_rules": "",
@@ -283,9 +316,11 @@ UPLOAD_DEFAULT_TEMPLATE: dict[str, Any] = {
     "head_action": "删除违规图片",
     "detail_action": "删除违规图片",
     "attribute_rules": "",
-    "trim_detail": 0,
+    "trim_detail": 2,
+    "trim_detail_tail": 2,
+    "detail_keep_first": 0,
     "strip_title_brackets": False,
-    "cloud_violation": False,
+    "cloud_violation": True,
     "cloud_violation_types": "",
     "enable_custom_attributes": False,
     "is_default": False,
@@ -491,6 +526,12 @@ class NextUiController:
         self._procurement_verify_in_progress: set[
             tuple[int, str, str, int]
         ] = set()
+        self._procurement_purchase_baselines: dict[
+            tuple[int, str, str, int],
+            set[str],
+        ] = {}
+        self._procurement_auto_verify_jobs: dict[str, dict[str, Any]] = {}
+        self._procurement_auto_verify_jobs_lock = threading.Lock()
         self._procurement_preview_cache_lock = threading.RLock()
         self._procurement_preview_cache: dict[
             tuple[int, str, str, str],
@@ -720,6 +761,9 @@ class NextUiController:
             "orders.procurement.link-delete": self._procurement_link_delete,
             "orders.procurement.link-open": self._procurement_link_open,
             "orders.procurement.purchase-confirm": self._procurement_purchase_confirm,
+            "orders.procurement.purchase-auto-verify.status": (
+                self._procurement_purchase_auto_verify_status
+            ),
             "orders.procurement.product-preview": self._procurement_product_preview,
             "orders.procurement.link-save": self._procurement_link_save,
             "orders.procurement.purchase-open": self._procurement_link_open,
@@ -811,6 +855,7 @@ class NextUiController:
             "upload.templates.set-default": self._set_default_upload_template,
             "upload.templates.delete": self._delete_upload_template,
             "upload.templates.select-folder": self._select_upload_template_folder,
+            "upload.categories": self._upload_categories,
             "upload.store-options": self._upload_store_options,
             "upload.tasks.create": self._create_upload_tasks,
             "upload.tasks.retry": self._retry_upload_tasks,
@@ -871,8 +916,19 @@ class NextUiController:
         entitlement = ACTION_ENTITLEMENTS.get(action)
         if action.startswith(AFTER_SALE_ACTION_PREFIX):
             entitlement = "module.after_sales"
+        procurement_action = (
+            action in PROCUREMENT_ASSOCIATION_ACTIONS
+            or action.startswith(
+                PROCUREMENT_ASSOCIATION_ACTION_PREFIXES
+            )
+        )
+        if procurement_action:
+            entitlement = PROCUREMENT_ASSOCIATION_ENTITLEMENT
         if entitlement:
-            self._require_entitlement(entitlement)
+            if procurement_action:
+                self._require_procurement_association()
+            else:
+                self._require_entitlement(entitlement)
         started = time.perf_counter()
         manager = get_runtime_log_manager()
         summary = (
@@ -2026,6 +2082,7 @@ class NextUiController:
             "accessible_modules": [
                 key
                 for key, _label, _icon, _path in PRIMARY_NAV
+                if self._module_entitlement_allowed(key, entitlements)
             ] + [
                 key
                 for key, _label, _icon, _path in MORE_NAV
@@ -2044,6 +2101,7 @@ class NextUiController:
                     "enabled": bool(path),
                 }
                 for key, label, icon, path in PRIMARY_NAV
+                if self._module_entitlement_allowed(key, entitlements)
             ],
             "more_nav": [
                 {
@@ -2163,7 +2221,50 @@ class NextUiController:
                 and trusted_role
                 and (internal or granted)
             )
+        if PROCUREMENT_ASSOCIATION_ENTITLEMENT in result:
+            result[PROCUREMENT_ASSOCIATION_ENTITLEMENT] = bool(
+                not offline
+                and trusted_role
+                and self._procurement_local_experiment_enabled()
+            )
         return result
+
+    def _procurement_local_experiment_enabled(self) -> bool:
+        # Unknown accounts are closed by default; the named local experiment
+        # account is enabled unless its local switch explicitly says off.
+        context = self.auth_context
+        username = str(
+            getattr(context, "username", "") or self.account_label or ""
+        ).strip().casefold()
+        if username not in LOCAL_PROCUREMENT_ASSOCIATION_USERNAMES:
+            return False
+        setting = str(
+            self.db.get_setting(
+                LOCAL_PROCUREMENT_ASSOCIATION_SETTING,
+                "1",
+            )
+            or ""
+        ).strip().casefold()
+        return setting not in {"", "0", "false", "off", "disabled"}
+
+    def _procurement_association_enabled(self) -> bool:
+        role, permissions = self._current_member_permissions(
+            refresh=False,
+            fail_closed=False,
+        )
+        self._pull_server_capabilities(force=False)
+        entitlements = self._current_entitlements(role, permissions)
+        return bool(
+            entitlements.get(
+                PROCUREMENT_ASSOCIATION_ENTITLEMENT,
+                False,
+            )
+        )
+
+    def _require_procurement_association(self) -> None:
+        if not self._procurement_association_enabled():
+            raise PermissionError("此功能正在加急开发优化中")
+        self._require_entitlement(PROCUREMENT_ASSOCIATION_ENTITLEMENT)
 
     @staticmethod
     def _module_entitlement_allowed(
@@ -4467,12 +4568,21 @@ class NextUiController:
         software_notes = self._read_dict_setting(ORDER_SOFTWARE_NOTES_SETTING)
         flags = self._read_dict_setting(ORDER_FLAGS_SETTING)
         workbench_rows = self.db.get_order_workbench()
-        procurement_orders = {
-            int(row.get("id") or 0): row
-            for row in self.db.list_procurement_orders()
-        }
+        procurement_enabled = self._procurement_association_enabled()
+        procurement_orders = (
+            {
+                int(row.get("id") or 0): row
+                for row in self.db.list_procurement_orders()
+            }
+            if procurement_enabled
+            else {}
+        )
         procurement_links: dict[tuple[int, str], list[dict[str, Any]]] = {}
-        for link in self.db.list_procurement_links():
+        for link in (
+            self.db.list_procurement_links()
+            if procurement_enabled
+            else ()
+        ):
             key = (int(link.get("store_id") or 0), str(link.get("order_id") or ""))
             procurement_orders_row = procurement_orders.get(
                 int(link.get("procurement_order_id") or 0),
@@ -4542,8 +4652,16 @@ class NextUiController:
                     "update_time": int(after_sale.get("update_time") or 0),
                 }
             )
-        dispatch_by_order = self.db.order_dispatch_map()
-        product_link_map = self.db.product_purchase_link_map()
+        dispatch_by_order = (
+            self.db.order_dispatch_map()
+            if procurement_enabled
+            else {}
+        )
+        product_link_map = (
+            self.db.product_purchase_link_map()
+            if procurement_enabled
+            else {}
+        )
         product_ids_by_order: dict[tuple[int, str], set[str]] = {}
         for item in self.db.list_order_product_links():
             key = (
@@ -4702,34 +4820,35 @@ class NextUiController:
                     if fallback_start:
                         shipping_deadline_at = fallback_start + 48 * 3600
             procurement_state = "not_required"
-            if after_sale_rows:
-                procurement_state = "aftersale"
-            elif any(
-                int(task.get("result_unknown") or 0)
-                or str(task.get("status") or "")
-                in {"error", "verification_pending"}
-                for task in dispatch_tasks
-            ):
-                procurement_state = "error"
-            elif purchase_rows or any(
-                int(task.get("procurement_order_id") or 0)
-                for task in dispatch_tasks
-            ):
-                if numeric_status in {21, 30, 100}:
-                    procurement_state = "shipped"
+            if procurement_enabled:
+                if after_sale_rows:
+                    procurement_state = "aftersale"
                 elif any(
-                    str(task.get("tracking_no") or "").strip()
+                    int(task.get("result_unknown") or 0)
+                    or str(task.get("status") or "")
+                    in {"error", "verification_pending"}
                     for task in dispatch_tasks
                 ):
-                    procurement_state = "auto_filling"
-                else:
-                    procurement_state = "wait_supplier"
-            elif numeric_status in {17, 20}:
-                procurement_state = (
-                    "wait_purchase"
-                    if has_product_links
-                    else "unlinked"
-                )
+                    procurement_state = "error"
+                elif purchase_rows or any(
+                    int(task.get("procurement_order_id") or 0)
+                    for task in dispatch_tasks
+                ):
+                    if numeric_status in {21, 30, 100}:
+                        procurement_state = "shipped"
+                    elif any(
+                        str(task.get("tracking_no") or "").strip()
+                        for task in dispatch_tasks
+                    ):
+                        procurement_state = "auto_filling"
+                    else:
+                        procurement_state = "wait_supplier"
+                elif numeric_status in {17, 20}:
+                    procurement_state = (
+                        "wait_purchase"
+                        if has_product_links
+                        else "unlinked"
+                    )
             cached_address = self.db.get_order_address_cache(
                 int(row.get("store_id") or 0),
                 str(row.get("order_id") or ""),
@@ -4799,21 +4918,33 @@ class NextUiController:
                         note_color_code if note_color_known else None
                     ),
                     "official_flag_present": official_flag_present,
-                    "purchase_order_no": str(
-                        workbench_row.get("purchase_order_no")
-                        or (purchase_rows[0]["external_order_id"] if purchase_rows else "")
-                        or ""
-                    ),
-                    "pickup_code": str(
-                        workbench_row.get("pickup_code")
-                        or next(
-                            (
-                                item["pickup_code"]
-                                for item in purchase_rows
-                                if item["pickup_code"]
-                            ),
-                            "",
+                    "purchase_order_no": (
+                        str(
+                            workbench_row.get("purchase_order_no")
+                            or (
+                                purchase_rows[0]["external_order_id"]
+                                if purchase_rows
+                                else ""
+                            )
+                            or ""
                         )
+                        if procurement_enabled
+                        else ""
+                    ),
+                    "pickup_code": (
+                        str(
+                            workbench_row.get("pickup_code")
+                            or next(
+                                (
+                                    item["pickup_code"]
+                                    for item in purchase_rows
+                                    if item["pickup_code"]
+                                ),
+                                "",
+                            )
+                        )
+                        if procurement_enabled
+                        else ""
                     ),
                     "purchase_orders": purchase_rows,
                     "procurement_count": len(purchase_rows),
@@ -4824,10 +4955,20 @@ class NextUiController:
                         "wait_purchase",
                         "error",
                     },
-                    "cost": int(workbench_row.get("cost") or 0),
-                    "profit": int(workbench_row.get("profit") or 0),
-                    "fulfillment_stage": str(
-                        workbench_row.get("fulfillment_stage") or ""
+                    "cost": (
+                        int(workbench_row.get("cost") or 0)
+                        if procurement_enabled
+                        else 0
+                    ),
+                    "profit": (
+                        int(workbench_row.get("profit") or 0)
+                        if procurement_enabled
+                        else 0
+                    ),
+                    "fulfillment_stage": (
+                        str(workbench_row.get("fulfillment_stage") or "")
+                        if procurement_enabled
+                        else ""
                     ),
                     "is_marked_sent": bool(workbench_row.get("is_marked_sent")),
                     "after_sales": after_sale_rows,
@@ -4869,6 +5010,7 @@ class NextUiController:
         )
         if order_payload is None:
             raise ValueError("订单不存在")
+        procurement_enabled = self._procurement_association_enabled()
         order_record = self.db.get_order(store.id, order_id)
         raw_address = (
             order_record.raw.get("order_detail", {})
@@ -4885,12 +5027,12 @@ class NextUiController:
         )
         procurement_address = {}
         procurement_address_source = ""
-        if cached_address:
+        if procurement_enabled and cached_address:
             procurement_address = dict(cached_address["address"])
             procurement_address_source = str(
                 cached_address.get("source") or ""
             )
-        if not procurement_address:
+        if procurement_enabled and not procurement_address:
             (
                 procurement_address,
                 procurement_address_source,
@@ -4899,12 +5041,19 @@ class NextUiController:
                 order_id,
                 order_record,
             )
-        if address_is_complete(procurement_address):
+        if procurement_enabled and address_is_complete(procurement_address):
             raw_address = procurement_address
-        address_ready = address_is_complete(procurement_address)
+        address_ready = bool(
+            procurement_enabled
+            and address_is_complete(procurement_address)
+        )
         workbench = self.db.get_order_workbench_row(store.id, order_id) or {}
         procurement_links = []
-        for link in self.db.list_procurement_links(store.id, order_id):
+        for link in (
+            self.db.list_procurement_links(store.id, order_id)
+            if procurement_enabled
+            else ()
+        ):
             procurement = self.db.get_procurement_order(
                 int(link.get("procurement_order_id") or 0)
             ) or {}
@@ -4949,10 +5098,14 @@ class NextUiController:
             for row in self.db.list_after_sales(store.id)
             if str(row.get("order_id") or "") == order_id
         ]
-        accounts = [
-            self._public_procurement_account(row)
-            for row in self.db.list_procurement_accounts()
-        ]
+        accounts = (
+            [
+                self._public_procurement_account(row)
+                for row in self.db.list_procurement_accounts()
+            ]
+            if procurement_enabled
+            else []
+        )
         account_labels = {
             int(account["id"]): str(account.get("label") or "")
             for account in accounts
@@ -4970,7 +5123,7 @@ class NextUiController:
                 if str(item.product_id or "").strip()
             }
         )
-        for product_id in product_ids:
+        for product_id in (product_ids if procurement_enabled else ()):
             purchase_records = self.db.list_procurement_purchase_records(
                 store.id,
                 order_id,
@@ -5100,17 +5253,33 @@ class NextUiController:
                 for item in (order_record.items if order_record is not None else [])
             ],
             "workbench": {
-                "purchase_order_no": str(
-                    workbench.get("purchase_order_no") or ""
+                "purchase_order_no": (
+                    str(workbench.get("purchase_order_no") or "")
+                    if procurement_enabled
+                    else ""
                 ),
-                "pickup_code": str(workbench.get("pickup_code") or ""),
+                "pickup_code": (
+                    str(workbench.get("pickup_code") or "")
+                    if procurement_enabled
+                    else ""
+                ),
                 "note": str(workbench.get("note") or ""),
-                "profit": int(workbench.get("profit") or 0),
-                "cost": int(workbench.get("cost") or 0),
+                "profit": (
+                    int(workbench.get("profit") or 0)
+                    if procurement_enabled
+                    else 0
+                ),
+                "cost": (
+                    int(workbench.get("cost") or 0)
+                    if procurement_enabled
+                    else 0
+                ),
                 "is_marked": bool(workbench.get("is_marked")),
                 "is_marked_sent": bool(workbench.get("is_marked_sent")),
-                "fulfillment_stage": str(
-                    workbench.get("fulfillment_stage") or ""
+                "fulfillment_stage": (
+                    str(workbench.get("fulfillment_stage") or "")
+                    if procurement_enabled
+                    else ""
                 ),
                 "last_error": str(workbench.get("last_error") or ""),
                 "flag_color": str(workbench.get("flag_color") or ""),
@@ -5126,7 +5295,11 @@ class NextUiController:
             "procurement_address_ready": address_ready,
             "procurement_address_source": procurement_address_source,
             "after_sales": after_sales,
-            "dispatch_tasks": self.db.list_order_dispatch_tasks(store.id, order_id),
+            "dispatch_tasks": (
+                self.db.list_order_dispatch_tasks(store.id, order_id)
+                if procurement_enabled
+                else []
+            ),
             "shipment": self.db.get_shipment(store.id, order_id) or {},
         }
 
@@ -5152,6 +5325,16 @@ class NextUiController:
             for key in allowed
             if key in payload
         }
+        if (
+            {
+                "purchase_order_no",
+                "profit",
+                "cost",
+                "fulfillment_stage",
+            }.intersection(changes)
+            and not self._procurement_association_enabled()
+        ):
+            raise PermissionError("此功能正在加急开发优化中")
         row = self.db.update_order_workbench(store.id, order_id, **changes)
         return {"store_id": store.id, "order_id": order_id, "workbench": row}
 
@@ -5686,6 +5869,17 @@ class NextUiController:
                 "display_address": display_address,
             },
         }
+        verify_key = (store.id, order_id, product_id, link_id)
+        before_order_ids = {
+            str(row.get("external_order_id") or "")
+            for row in self.db.list_procurement_orders(
+                account_id=account_id
+            )
+        }
+        with self._procurement_verify_lock:
+            self._procurement_purchase_baselines[
+                verify_key
+            ] = before_order_ids
         open_window = getattr(
             service,
             "open_procurement_window",
@@ -5728,6 +5922,15 @@ class NextUiController:
                 "last_error": "",
             },
         )
+        verification_job = self._start_procurement_purchase_auto_verify(
+            {
+                "store_id": store.id,
+                "order_id": order_id,
+                "product_id": product_id,
+                "link_id": link_id,
+                "account_id": account_id,
+            }
+        )
         return {
             "status": "page_opened_pending_payment",
             "link_id": link_id,
@@ -5738,7 +5941,303 @@ class NextUiController:
             "opened_at": opened_at,
             "reused": bool(result.get("reused")),
             "opened": result,
+            "verification_job_id": str(
+                verification_job.get("job_id") or ""
+            ),
         }
+
+    def _start_procurement_purchase_auto_verify(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        service = self._require_product_service()
+        verify = getattr(
+            service,
+            "verify_procurement_purchase",
+            None,
+        )
+        confirm = getattr(
+            service,
+            "confirm_procurement_purchase",
+            None,
+        )
+        wait_for_signal = getattr(
+            service,
+            "wait_for_procurement_purchase_signal",
+            None,
+        )
+        if (
+            not callable(wait_for_signal)
+            or (not callable(verify) and not callable(confirm))
+        ):
+            return {}
+        key = (
+            int(payload.get("store_id") or 0),
+            str(payload.get("order_id") or ""),
+            str(payload.get("product_id") or ""),
+            int(payload.get("link_id") or 0),
+        )
+        with self._procurement_auto_verify_jobs_lock:
+            for existing in self._procurement_auto_verify_jobs.values():
+                if (
+                    tuple(existing.get("key") or ())
+                    == key
+                    and existing.get("status") in {"waiting", "checking"}
+                ):
+                    return dict(existing)
+            job_id = uuid.uuid4().hex
+            job = {
+                "job_id": job_id,
+                "key": key,
+                "status": "waiting",
+                "message": "采购页已打开，等待用户完成付款",
+                "attempt": 0,
+                "max_attempts": PROCUREMENT_AUTO_VERIFY_MAX_ATTEMPTS,
+                "reason": "",
+                "detail": None,
+                "created_at": datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+                "updated_at": datetime.now().isoformat(
+                    timespec="seconds"
+                ),
+            }
+            self._procurement_auto_verify_jobs[job_id] = job
+
+        def update(**changes: Any) -> None:
+            with self._procurement_auto_verify_jobs_lock:
+                current = self._procurement_auto_verify_jobs.get(job_id)
+                if current is not None:
+                    current.update(changes)
+                    current["updated_at"] = datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+
+        def mark_pending(reason: str) -> dict[str, Any]:
+            store_id = key[0]
+            order_id = key[1]
+            product_id = key[2]
+            link_id = key[3]
+            account_id = int(payload.get("account_id") or 0)
+            attempt = self.db.get_procurement_purchase_attempt(
+                store_id,
+                order_id,
+                product_id,
+                link_id,
+            ) or {}
+            self.db.upsert_procurement_purchase_attempt(
+                store_id,
+                order_id,
+                {
+                    "product_id": product_id,
+                    "link_id": link_id,
+                    "account_id": account_id,
+                    "platform": str(attempt.get("platform") or ""),
+                    "source_url": str(attempt.get("source_url") or ""),
+                    "status": "verification_pending",
+                    "opened_at": str(attempt.get("opened_at") or ""),
+                    "last_error": reason,
+                },
+            )
+            self.db.update_order_workbench(
+                store_id,
+                order_id,
+                last_error=f"采购结果待核实：{reason}",
+            )
+            for task in self.db.list_order_dispatch_tasks(
+                store_id,
+                order_id,
+            ):
+                if str(task.get("product_id") or "") != product_id:
+                    continue
+                self.db.update_order_dispatch_task(
+                    int(task.get("id") or 0),
+                    status="verification_pending",
+                    result_unknown=1,
+                    error=reason,
+                    last_checked_at=datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                )
+            return self._order_workbench_detail(
+                {"store_id": store_id, "order_id": order_id}
+            )
+
+        def worker() -> None:
+            try:
+                signal = wait_for_signal(
+                    int(payload.get("account_id") or 0),
+                    timeout_seconds=PROCUREMENT_AUTO_VERIFY_WAIT_SECONDS,
+                )
+                if not isinstance(signal, dict):
+                    signal = {
+                        "status": "error",
+                        "reason": "采购页面付款信号无效",
+                    }
+                signal_status = str(signal.get("status") or "")
+                if signal_status in {"timeout", "closed"}:
+                    reason = str(
+                        signal.get("reason")
+                        or "未获取到采购付款完成信号"
+                    )
+                    detail = mark_pending(reason)
+                    update(
+                        status="pending",
+                        reason=reason,
+                        message="自动核对未取得结果，已标记待核实",
+                        detail=detail,
+                    )
+                    return
+                if signal_status not in {
+                    "payment_observed",
+                    "returned_to_software",
+                }:
+                    reason = str(
+                        signal.get("reason")
+                        or "采购页面付款监听失败"
+                    )
+                    update(
+                        status="error",
+                        reason=reason,
+                        message="自动核对失败，已标记待核实",
+                    )
+                    return
+                upstream_order_id = str(
+                    signal.get("upstream_order_id") or ""
+                ).strip()
+                close_window = getattr(
+                    service,
+                    "close_procurement_window",
+                    None,
+                )
+                if callable(close_window):
+                    try:
+                        close_window(int(payload.get("account_id") or 0))
+                    except Exception:
+                        pass
+                update(
+                    status="checking",
+                    upstream_order_id=upstream_order_id,
+                    message=(
+                        (
+                            "已识别 1688 下单成功页，"
+                            f"正在按订单号 {upstream_order_id} 精确回读"
+                        )
+                        if upstream_order_id
+                        else "已检测到付款完成/返回软件，正在自动核对采购订单"
+                    ),
+                )
+                if PROCUREMENT_AUTO_VERIFY_POST_TRIGGER_SECONDS > 0:
+                    time.sleep(
+                        PROCUREMENT_AUTO_VERIFY_POST_TRIGGER_SECONDS
+                    )
+                max_attempts = PROCUREMENT_AUTO_VERIFY_MAX_ATTEMPTS
+                last_reason = ""
+                last_detail = None
+                for attempt_number in range(1, max_attempts + 1):
+                    update(
+                        status="checking",
+                        attempt=attempt_number,
+                        message=(
+                            f"自动核对中 / 稍后自动重试"
+                            f"（{attempt_number}/{max_attempts}）"
+                        ),
+                    )
+                    result = self._procurement_purchase_confirm(
+                        {
+                            **payload,
+                            **(
+                                {"upstream_order_id": upstream_order_id}
+                                if upstream_order_id
+                                else {}
+                            ),
+                            "_auto_verify": True,
+                            "_auto_attempt": attempt_number,
+                            "_auto_max_attempts": max_attempts,
+                        }
+                    )
+                    result_status = str(
+                        result.get("status") or ""
+                    )
+                    last_reason = str(
+                        result.get("reason") or ""
+                    )
+                    last_detail = result.get("detail")
+                    if result_status == "confirmed":
+                        update(
+                            status="confirmed",
+                            attempt=attempt_number,
+                            message="已自动回读并保存唯一匹配的采购订单",
+                            reason="",
+                            detail=last_detail,
+                        )
+                        return
+                    retryable = result_status in {
+                        "not_found",
+                        "in_progress",
+                    }
+                    if (
+                        retryable
+                        and attempt_number < max_attempts
+                    ):
+                        if PROCUREMENT_AUTO_VERIFY_RETRY_SECONDS > 0:
+                            time.sleep(
+                                PROCUREMENT_AUTO_VERIFY_RETRY_SECONDS
+                            )
+                        continue
+                    if not retryable:
+                        break
+                reason = (
+                    last_reason
+                    or "自动核对达到次数上限，未发现唯一采购订单"
+                )
+                update(
+                    status="pending",
+                    reason=reason,
+                    message="自动核对结束，采购结果待核实",
+                    detail=last_detail,
+                )
+            except Exception as exc:
+                reason = _safe_error_message(exc)
+                try:
+                    detail = mark_pending(reason)
+                except Exception:
+                    detail = None
+                update(
+                    status="error",
+                    reason=reason,
+                    message="自动核对异常，采购结果待核实",
+                    detail=detail,
+                )
+            finally:
+                with self._procurement_verify_lock:
+                    self._procurement_purchase_baselines.pop(
+                        key,
+                        None,
+                    )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"procurement-auto-verify-{job_id[:8]}",
+        ).start()
+        return dict(job)
+
+    def _procurement_purchase_auto_verify_status(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("job_id 不能为空")
+        with self._procurement_auto_verify_jobs_lock:
+            job = self._procurement_auto_verify_jobs.get(job_id)
+            if job is None:
+                raise ValueError("采购自动核对任务不存在或已过期")
+            return {
+                key: copy.deepcopy(value)
+                for key, value in job.items()
+            }
 
     def _procurement_purchase_confirm(
         self,
@@ -5748,6 +6247,9 @@ class NextUiController:
         store = self._require_store(self._store_id(payload))
         order_id = str(payload.get("order_id") or "").strip()
         product_id = str(payload.get("product_id") or "").strip()
+        upstream_order_id = str(
+            payload.get("upstream_order_id") or ""
+        ).strip()
         try:
             link_id = int(payload.get("link_id"))
         except (TypeError, ValueError) as exc:
@@ -5782,13 +6284,36 @@ class NextUiController:
             product_id,
             link_id=link_id,
         )
-        if existing_records:
+        matching_records = [
+            record
+            for record in existing_records
+            if (
+                not upstream_order_id
+                or str(record.get("upstream_order_id") or "")
+                == upstream_order_id
+            )
+        ]
+        if matching_records:
             return {
                 "status": "confirmed",
                 "reused": True,
                 "page_closed": False,
                 "read_attempts": 0,
-                "record": existing_records[0],
+                "record": matching_records[0],
+                "detail": self._order_workbench_detail(
+                    {"store_id": store.id, "order_id": order_id}
+                ),
+            }
+        if upstream_order_id and existing_records:
+            return {
+                "status": "conflict",
+                "reused": False,
+                "page_closed": False,
+                "read_attempts": 0,
+                "reason": (
+                    "该采购链接已关联其它上游订单 "
+                    f"{existing_records[0].get('upstream_order_id') or ''}"
+                ),
                 "detail": self._order_workbench_detail(
                     {"store_id": store.id, "order_id": order_id}
                 ),
@@ -5809,8 +6334,10 @@ class NextUiController:
             product_id,
             link_id,
         )
+        verify_key = (store.id, order_id, product_id, link_id)
         if (
             callable(verify)
+            and not upstream_order_id
             and (
                 attempt is None
                 or str(attempt.get("status") or "")
@@ -5859,25 +6386,69 @@ class NextUiController:
             max(0, int(item.sku_count or 0))
             for item in items
         )
-        expected_sku = str(payload.get("expected_sku") or "").strip()
-        expected_amount = int(payload.get("expected_amount_cents") or 0)
-        before_order_ids = {
-            str(row.get("external_order_id") or "")
-            for row in self.db.list_procurement_orders(
-                account_id=account_id
+        sku_mappings = [
+            row
+            for row in self.db.list_product_sku_mappings(
+                store.id,
+                product_id,
             )
-        }
+            if int(row.get("purchase_link_id") or 0) == link_id
+        ]
+        expected_sku = str(
+            payload.get("expected_sku")
+            or " ".join(
+                str(row.get("purchase_sku_id") or "").strip()
+                for row in sku_mappings
+                if str(row.get("purchase_sku_id") or "").strip()
+            )
+            or " ".join(
+                str(item.sku_attributes or "").strip()
+                for item in items
+                if str(item.sku_attributes or "").strip()
+            )
+        ).strip()
+        expected_amount = int(payload.get("expected_amount_cents") or 0)
+        if expected_amount <= 0:
+            expected_amount = sum(
+                int(row.get("purchase_price") or 0)
+                * sum(
+                    max(0, int(item.sku_count or 0))
+                    for item in items
+                    if str(item.sku_id or "")
+                    == str(row.get("store_sku_id") or "")
+                )
+                for row in sku_mappings
+            )
+        with self._procurement_verify_lock:
+            before_order_ids = set(
+                self._procurement_purchase_baselines.get(
+                    verify_key,
+                    set(),
+                )
+            )
+        opened_at_seconds = 0
+        if attempt and attempt.get("opened_at"):
+            try:
+                opened_at_seconds = int(
+                    datetime.fromisoformat(
+                        str(attempt["opened_at"]).replace("Z", "+00:00")
+                    ).timestamp()
+                )
+            except (TypeError, ValueError):
+                opened_at_seconds = 0
+        if not opened_at_seconds:
+            opened_at_seconds = int(time.time())
         expected = {
             "source_product_id": source_product_id,
             "quantity": expected_quantity,
             "amount_cents": expected_amount,
             "sku_tokens": [expected_sku] if expected_sku else [],
-            "started_after": int(time.time()),
+            "started_after": opened_at_seconds,
             "before_order_ids": before_order_ids,
+            "upstream_order_id": upstream_order_id,
         }
         if not callable(verify) and not callable(confirm):
             raise RuntimeError("当前服务不支持官方采购订单回读")
-        verify_key = (store.id, order_id, product_id, link_id)
         with self._procurement_verify_lock:
             if verify_key in self._procurement_verify_in_progress:
                 return {
@@ -5908,6 +6479,31 @@ class NextUiController:
         read_attempts = int(result.get("read_attempts") or 0)
         if status != "confirmed":
             message = reason or "采购结果待核实"
+            automated = bool(payload.get("_auto_verify"))
+            auto_attempt = int(
+                payload.get("_auto_attempt") or 0
+            )
+            auto_max_attempts = int(
+                payload.get("_auto_max_attempts") or 0
+            )
+            auto_retryable = status in {
+                "not_found",
+                "in_progress",
+            }
+            auto_intermediate = (
+                automated
+                and auto_retryable
+                and auto_max_attempts > 0
+                and auto_attempt < auto_max_attempts
+            )
+            attempt_error = (
+                (
+                    "自动核对中，稍后自动重试"
+                    f"（{auto_attempt}/{auto_max_attempts}）"
+                )
+                if auto_intermediate
+                else message
+            )
             self.db.upsert_procurement_purchase_attempt(
                 store.id,
                 order_id,
@@ -5921,34 +6517,40 @@ class NextUiController:
                     "opened_at": str(
                         (attempt or {}).get("opened_at") or ""
                     ),
-                    "last_error": message,
+                    "last_error": attempt_error,
                 },
             )
-            for task in self.db.list_order_dispatch_tasks(
-                store.id,
-                order_id,
-            ):
-                if str(task.get("product_id") or "") != product_id:
-                    continue
-                self.db.update_order_dispatch_task(
-                    int(task.get("id") or 0),
-                    status="verification_pending",
-                    result_unknown=1,
-                    error=message,
-                    last_checked_at=datetime.now().isoformat(
-                        timespec="seconds"
-                    ),
+            if not auto_intermediate:
+                for task in self.db.list_order_dispatch_tasks(
+                    store.id,
+                    order_id,
+                ):
+                    if str(task.get("product_id") or "") != product_id:
+                        continue
+                    self.db.update_order_dispatch_task(
+                        int(task.get("id") or 0),
+                        status="verification_pending",
+                        result_unknown=1,
+                        error=message,
+                        last_checked_at=datetime.now().isoformat(
+                            timespec="seconds"
+                        ),
+                    )
+                self.db.update_order_workbench(
+                    store.id,
+                    order_id,
+                    last_error=f"采购结果待核实：{message}",
                 )
-            self.db.update_order_workbench(
-                store.id,
-                order_id,
-                last_error=f"采购结果待核实：{message}",
-            )
             return {
                 "status": status,
                 "page_closed": page_closed,
                 "read_attempts": read_attempts,
-                "reason": message,
+                "reason": attempt_error,
+                "auto_verification": (
+                    "checking"
+                    if auto_intermediate
+                    else ("pending" if automated else "")
+                ),
                 "detail": self._order_workbench_detail(
                     {"store_id": store.id, "order_id": order_id}
                 ),
@@ -5962,8 +6564,16 @@ class NextUiController:
             or matched.get("trade_no")
             or ""
         ).strip()
+        expected_upstream_order_id = str(
+            payload.get("upstream_order_id") or ""
+        ).strip()
         if not upstream_order_id:
             raise RuntimeError("官方采购订单缺少订单号")
+        if (
+            expected_upstream_order_id
+            and upstream_order_id != expected_upstream_order_id
+        ):
+            raise RuntimeError("官方回读订单号与成功页订单号不一致")
         quantity = int(matched.get("goods_count") or expected_quantity or 0)
         paid_amount = int(matched.get("pay_amount") or 0)
         freight_amount = int(matched.get("freight_amount") or 0)
@@ -6093,7 +6703,7 @@ class NextUiController:
             "close_procurement_window",
             None,
         )
-        if callable(close_window):
+        if callable(close_window) and not payload.get("_auto_verify"):
             close_window(account_id)
             page_closed = True
         self.db.upsert_procurement_purchase_attempt(
@@ -8405,6 +9015,14 @@ class NextUiController:
         records = payload.get("records")
         if not isinstance(records, list):
             raise ValueError("records 格式无效")
+        if (
+            any(
+                isinstance(record, dict) and "purchase_order_no" in record
+                for record in records
+            )
+            and not self._procurement_association_enabled()
+        ):
+            raise PermissionError("此功能正在加急开发优化中")
         selected_store = payload.get("store_id")
         imported = 0
         missing = []
@@ -10058,6 +10676,10 @@ class NextUiController:
             return []
         if not isinstance(rows, list):
             return []
+        rows = filter_active_violation_records(
+            rows,
+            self.db.list_stores(),
+        )
         result = []
         for row in rows:
             if not isinstance(row, dict):
@@ -10089,40 +10711,7 @@ class NextUiController:
         return result
 
     def _upload_violation_title_rows(self) -> list[dict[str, Any]]:
-        try:
-            rows = json.loads(
-                self.db.get_setting("upload_violation_titles", "[]")
-            )
-        except (TypeError, ValueError, json.JSONDecodeError):
-            rows = []
-        if not isinstance(rows, list) or not rows:
-            try:
-                records = json.loads(
-                    self.db.get_setting("violation_library", "[]")
-                )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                records = []
-            rows = build_upload_violation_titles(
-                records if isinstance(records, list) else []
-            )
-            if rows:
-                self.db.set_setting(
-                    "upload_violation_titles",
-                    json.dumps(rows, ensure_ascii=False),
-                )
-        try:
-            cloud_rows = json.loads(
-                self.db.get_setting(
-                    "cloud_counterfeit_violation_titles",
-                    "[]",
-                )
-            )
-        except (TypeError, ValueError, json.JSONDecodeError):
-            cloud_rows = []
-        return merge_cloud_counterfeit_titles(
-            [dict(row) for row in rows if isinstance(row, dict)],
-            cloud_rows if isinstance(cloud_rows, list) else [],
-        )
+        return load_upload_violation_title_records(self.db)
 
     def _cloud_violation_token(self) -> str:
         auth_context = self.auth_context
@@ -10132,6 +10721,7 @@ class NextUiController:
     def _push_counterfeit_violation_index(
         self,
         access_token: str,
+        store_ids: set[int] | None = None,
     ) -> dict[str, Any]:
         client = self.auth_client
         push = getattr(
@@ -10147,16 +10737,39 @@ class NextUiController:
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             records = []
+        active_stores = self.db.list_stores()
+        records = filter_active_violation_records(
+            records if isinstance(records, list) else [],
+            active_stores,
+        )
+        if store_ids is not None:
+            records = [
+                record
+                for record in records
+                if int(record.get("store_id") or 0) in store_ids
+            ]
+        app_id_by_store_id = {
+            store.id: store.app_id
+            for store in active_stores
+            if store.id and store.app_id
+        }
         rows: list[dict[str, Any]] = []
-        for record in records if isinstance(records, list) else []:
+        for record in records:
             if not isinstance(record, dict):
                 continue
+            try:
+                record_store_id = int(record.get("store_id") or 0)
+            except (TypeError, ValueError):
+                record_store_id = 0
+            store_app_id = str(
+                record.get("store_app_id")
+                or app_id_by_store_id.get(record_store_id)
+                or ""
+            ).strip()
             rows.extend(
                 build_cloud_counterfeit_rows(
                     [record],
-                    store_app_id=str(
-                        record.get("store_app_id") or ""
-                    ),
+                    store_app_id=store_app_id,
                 )
             )
         deduped = {
@@ -10164,8 +10777,37 @@ class NextUiController:
             for row in rows
             if row.get("store_app_id")
         }
-        result = push(access_token, list(deduped.values()))
-        return result if isinstance(result, dict) else {}
+        pending_rows = list(deduped.values())
+        result = push(access_token, pending_rows)
+        if not isinstance(result, dict):
+            return {
+                "saved": 0,
+                "error": "云端售假库返回不完整，未确认写入",
+            }
+        try:
+            saved = int(result.get("saved"))
+        except (TypeError, ValueError):
+            return {
+                **result,
+                "saved": 0,
+                "error": "云端售假库返回不完整，未确认写入",
+            }
+        if saved < 0 or saved > len(pending_rows):
+            return {
+                **result,
+                "saved": max(0, saved),
+                "error": "云端售假库返回的确认数量无效",
+            }
+        if saved != len(pending_rows):
+            return {
+                **result,
+                "saved": saved,
+                "error": (
+                    "云端售假库未确认全部写入："
+                    f"已确认 {saved}/{len(pending_rows)} 条"
+                ),
+            }
+        return {**result, "saved": saved}
 
     def _pull_counterfeit_violation_index(
         self,
@@ -10219,13 +10861,37 @@ class NextUiController:
     def _refresh_violations(self, payload: dict[str, Any]) -> dict[str, Any]:
         service = self._require_product_service()
         store_id = payload.get("store_id")
-        stores = (
-            [self._require_store(int(store_id))]
-            if store_id not in (None, "")
-            else self.db.list_stores()
-        )
+        if store_id not in (None, ""):
+            requested_store = self._require_store(int(store_id))
+            stores = (
+                [requested_store]
+                if is_real_logged_in_store(requested_store)
+                else []
+            )
+            if not stores:
+                return {
+                    "refreshed": 0,
+                    "succeeded": 0,
+                    "errors": [
+                        f"{requested_store.name} 不是已登录真实店铺，"
+                        "已拒绝同步违规记录"
+                    ],
+                    "violations": [],
+                    "cloud_counterfeit": {},
+                }
+        else:
+            stores = real_logged_in_stores(self.db.list_stores())
+        if not stores:
+            return {
+                "refreshed": 0,
+                "succeeded": 0,
+                "errors": ["没有可同步的已登录真实店铺"],
+                "violations": [],
+                "cloud_counterfeit": {},
+            }
         errors: list[str] = []
         succeeded = 0
+        succeeded_store_ids: set[int] = set()
         with ThreadPoolExecutor(
             max_workers=max(1, min(4, len(stores))),
             thread_name_prefix="webui-violation-sync",
@@ -10242,12 +10908,14 @@ class NextUiController:
                     errors.append(f"{store.name}: {exc}")
                 else:
                     succeeded += 1
+                    succeeded_store_ids.add(store.id)
         cloud_result: dict[str, Any] = {}
         access_token = self._cloud_violation_token()
-        if access_token:
+        if access_token and succeeded_store_ids:
             try:
                 cloud_result = self._push_counterfeit_violation_index(
-                    access_token
+                    access_token,
+                    succeeded_store_ids,
                 )
                 self._pull_counterfeit_violation_index(access_token)
             except Exception as exc:
@@ -10259,6 +10927,18 @@ class NextUiController:
                     "violations.cloud_counterfeit.sync_failed",
                     error=str(exc)[:1000],
                 )
+        elif access_token:
+            cloud_result = {
+                "saved": 0,
+                "skipped": "no_successful_store_sync",
+                "error": "没有成功同步的店铺，未推送云端售假库",
+            }
+        else:
+            cloud_result = {
+                "saved": 0,
+                "skipped": "missing_access_token",
+                "error": "当前登录缺少云端访问令牌",
+            }
         return {
             "refreshed": len(stores),
             "succeeded": succeeded,
@@ -10329,123 +11009,60 @@ class NextUiController:
         self,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        if payload.get("confirmed") is not True:
+            raise ValueError(
+                "执行全店中转属于真实平台写操作，"
+                "请先完成一次执行确认"
+            )
         store, manager = self._store_for_transit(payload)
         rules = normalize_rules(
             payload.get("rules")
             if isinstance(payload.get("rules"), dict)
             else self._transit_shipping_rules()
         )
-        requested_ids = {
+        requested_ids = [
             str(value)
             for value in payload.get("template_ids") or []
             if str(value).strip()
-        }
-        open_service = bool(payload.get("open_service", True))
-        set_products = bool(
-            payload.get(
-                "set_all_products_transit",
-                rules["set_all_products_transit"],
-            )
-        )
-        open_result: dict[str, Any] = {}
-        template_results: list[dict[str, Any]] = []
-        product_results: list[dict[str, Any]] = []
-        errors: list[str] = []
+        ]
         with self._allow_platform_write(
             store,
             "remote_transit_shipping_batch",
         ):
-            if open_service:
-                try:
-                    open_result = manager.open_service(store)
-                except Exception as exc:
-                    errors.append(f"开通中转服务：{exc}")
-            else:
-                open_result = manager.service_status(store)
-            templates = manager.templates(store)
-            for template in templates:
-                template_id = str(template.get("templateId") or "")
-                linked = int(template.get("relatedProductsNum") or 0)
-                if requested_ids:
-                    selected = template_id in requested_ids
-                else:
-                    selected = linked > 0
-                if not selected:
-                    continue
-                try:
-                    backup = copy.deepcopy(template)
-                    self.db.set_setting(
-                        (
-                            f"transit_template_backup_"
-                            f"{store.id}_{template_id}"
-                        ),
-                        json.dumps(backup, ensure_ascii=False),
-                    )
-                    updated = manager.update_template(
-                        store,
-                        template,
-                        rules,
-                    )
-                    template_results.append(
-                        {
-                            "template_id": template_id,
-                            "name": str(updated.get("name") or ""),
-                            "linked_products": linked,
-                            "status": "updated",
-                        }
-                    )
-                except Exception as exc:
-                    message = (
-                        f"模板 {template_id}：{exc}"
-                    )
-                    errors.append(message)
-                    template_results.append(
-                        {
-                            "template_id": template_id,
-                            "name": str(template.get("name") or ""),
-                            "linked_products": linked,
-                            "status": "failed",
-                            "error": str(exc)[:500],
-                        }
-                    )
-            if set_products:
-                try:
-                    products = manager.products(store)
-                    product_results = manager.set_products_transit(
-                        store,
-                        products,
-                    )
-                except Exception as exc:
-                    errors.append(f"批量设置中转商品：{exc}")
-            if template_results:
-                self.db.set_setting(
-                    TRANSIT_SHIPPING_RULES_SETTING,
-                    json.dumps(rules, ensure_ascii=False),
-                )
+            result = manager.run_continuous_flow(
+                store,
+                template_ids=requested_ids,
+                rules=rules,
+            )
+        if result.get("success"):
+            self.db.set_setting(
+                TRANSIT_SHIPPING_RULES_SETTING,
+                json.dumps(rules, ensure_ascii=False),
+            )
         self._write_operation_log(
             "transit",
-            "偏远中转批量设置",
+            "全店中转连续流程",
             (
-                f"{store.name}：模板 {len(template_results)}，"
-                f"商品结果 {len(product_results)}"
+                f"{store.name}："
+                f"{result.get('message') or result.get('failed_stage')}"
             ),
             store_id=store.id,
-            status="failed" if errors else "success",
+            status="success" if result.get("success") else "failed",
             detail={
-                "template_ids": [
-                    row["template_id"] for row in template_results
-                ],
-                "set_products": set_products,
-                "errors": errors[:20],
+                "template_ids": requested_ids,
+                "failed_stage": result.get("failed_stage", ""),
+                "product_failures": result.get(
+                    "product_failures",
+                    [],
+                )[:20],
+                "template_failures": result.get(
+                    "template_failures",
+                    [],
+                )[:20],
+                "errors": result.get("errors", [])[:20],
             },
         )
-        return {
-            "service": open_result,
-            "templates": template_results,
-            "products": product_results,
-            "errors": errors,
-            "rules": rules,
-        }
+        return {**result, "rules": rules}
 
     def _list_procurement(self, payload: dict[str, Any]) -> dict[str, Any]:
         platform = str(payload.get("platform") or "").strip() or None
@@ -11514,10 +12131,7 @@ class NextUiController:
                     store for store in self.db.list_stores()
                     if store.app_id
                 ]
-                logged_in_stores = [
-                    store for store in all_stores
-                    if "已登录" in f"{store.web_status} {store.status}"
-                ]
+                logged_in_stores = real_logged_in_stores(all_stores)
                 self._write_startup_refresh_status(
                     run_id=run_id,
                     status="running",
@@ -11567,6 +12181,7 @@ class NextUiController:
                                     else f"startup:{run_id}:{name}"
                                 ),
                             )
+                        violation_stage_status = ""
                         if isinstance(value, dict):
                             if name == "orders":
                                 status_changes = value.get("status_changes") or []
@@ -11588,6 +12203,9 @@ class NextUiController:
                                     status_changes
                                 )
                             elif name == "violations":
+                                violation_stage_status = str(
+                                    value.get("stage_status") or ""
+                                )
                                 value = {
                                     key: value.get(key)
                                     for key in (
@@ -11597,15 +12215,34 @@ class NextUiController:
                                         "cloud_counterfeit",
                                     )
                                 }
-                        stages[name] = {
-                            "status": (
+                        if (
+                            name == "violations"
+                            and isinstance(value, dict)
+                        ):
+                            stage_status = str(
+                                violation_stage_status
+                                or "completed"
+                            )
+                            stage_errors = [
+                                str(error)
+                                for error in value.get("errors") or []
+                                if str(error).strip()
+                            ]
+                            errors.extend(
+                                f"{name}: {error}"
+                                for error in stage_errors
+                            )
+                        else:
+                            stage_status = (
                                 "completed"
                                 if not (
                                     isinstance(value, dict)
                                     and value.get("errors")
                                 )
                                 else "partial"
-                            ),
+                            )
+                        stages[name] = {
+                            "status": stage_status,
                             "result": value,
                         }
                     stages[name]["duration_ms"] = int(
@@ -11614,20 +12251,59 @@ class NextUiController:
 
                 if enabled["violations"]:
                     def sync_violations() -> dict[str, Any]:
-                        succeeded = 0
-                        failures: list[str] = []
-                        for store in logged_in_stores:
-                            try:
-                                self._refresh_violations(
-                                    {"store_id": store.id}
-                                )
-                            except Exception as exc:
-                                failures.append(f"{store.name}: {exc}")
-                            else:
-                                succeeded += 1
+                        if not logged_in_stores:
+                            return {
+                                "stage_status": "failed",
+                                "refreshed": 0,
+                                "succeeded": 0,
+                                "errors": [
+                                    "没有可同步的已登录真实店铺"
+                                ],
+                                "cloud_counterfeit": {},
+                            }
+                        result = self._refresh_violations({})
+                        errors_value = [
+                            str(error)
+                            for error in result.get("errors") or []
+                            if str(error).strip()
+                        ]
+                        cloud = result.get("cloud_counterfeit")
+                        cloud_failed = (
+                            not isinstance(cloud, dict)
+                            or bool(cloud.get("error"))
+                            or bool(cloud.get("skipped"))
+                        )
+                        if cloud_failed:
+                            cloud_error = (
+                                str(cloud.get("error") or "").strip()
+                                if isinstance(cloud, dict)
+                                else ""
+                            )
+                            errors_value.append(
+                                "云端售假库同步失败"
+                                + (f"：{cloud_error}" if cloud_error else "")
+                            )
+                        succeeded = int(
+                            result.get("succeeded") or 0
+                        )
+                        if cloud_failed:
+                            stage_status = "failed"
+                        elif not errors_value:
+                            stage_status = "completed"
+                        elif succeeded > 0:
+                            stage_status = "partial"
+                        else:
+                            stage_status = "failed"
                         return {
+                            "stage_status": stage_status,
+                            "refreshed": int(
+                                result.get("refreshed") or 0
+                            ),
                             "succeeded": succeeded,
-                            "errors": failures,
+                            "errors": errors_value,
+                            "cloud_counterfeit": (
+                                cloud if isinstance(cloud, dict) else {}
+                            ),
                         }
 
                     run_stage("violations", sync_violations)
@@ -11708,7 +12384,23 @@ class NextUiController:
 
                     run_stage("products", refresh_products)
 
-                status = "completed" if not errors else "partial"
+                enabled_stage_statuses = [
+                    str(stage.get("status") or "")
+                    for name, stage in stages.items()
+                    if enabled.get(name)
+                ]
+                if not errors:
+                    status = "completed"
+                elif (
+                    enabled_stage_statuses
+                    and all(
+                        value in {"failed", "timeout"}
+                        for value in enabled_stage_statuses
+                    )
+                ):
+                    status = "failed"
+                else:
+                    status = "partial"
                 self._write_startup_refresh_status(
                     run_id=run_id,
                     status=status,
@@ -11806,10 +12498,43 @@ class NextUiController:
                             "reason": reason,
                         }
                         try:
-                            self._refresh_violations(
+                            violation_result = self._refresh_violations(
                                 {"store_id": store_id}
                             )
-                            result["violations"] = "completed"
+                            cloud = (
+                                violation_result.get("cloud_counterfeit")
+                                if isinstance(violation_result, dict)
+                                else None
+                            )
+                            failures = (
+                                list(violation_result.get("errors") or [])
+                                if isinstance(violation_result, dict)
+                                else []
+                            )
+                            if (
+                                failures
+                                or not isinstance(cloud, dict)
+                                or cloud.get("error")
+                                or cloud.get("skipped")
+                            ):
+                                cloud_error = (
+                                    str(cloud.get("error") or "").strip()
+                                    if isinstance(cloud, dict)
+                                    else "缺少云端售假库状态"
+                                )
+                                result["violations"] = (
+                                    "failed: "
+                                    + "；".join(
+                                        [
+                                            str(value)
+                                            for value in failures
+                                            if str(value).strip()
+                                        ]
+                                        + [cloud_error]
+                                    )
+                                )[:500]
+                            else:
+                                result["violations"] = "completed"
                         except Exception as exc:
                             result["violations"] = f"failed: {exc}"[:500]
                         for domain, start, jobs, lock in (
@@ -11872,11 +12597,26 @@ class NextUiController:
                                 "error": str(exc)[:500],
                             }
                         results.append(result)
+                    followup_failed = any(
+                        str(result.get("violations") or "") != "completed"
+                        or any(
+                            not isinstance(result.get(domain), dict)
+                            or str(
+                                result[domain].get("status") or ""
+                            ) != "completed"
+                            for domain in ("stores", "orders", "products")
+                        )
+                        for result in results
+                    )
                     self.db.set_setting(
                         "new_store_followup_status",
                         json.dumps(
                             {
-                                "status": "completed",
+                                "status": (
+                                    "partial"
+                                    if followup_failed
+                                    else "completed"
+                                ),
                                 "reason": reason,
                                 "stores": results,
                                 "updated_at": datetime.now().isoformat(
@@ -12790,9 +13530,11 @@ class NextUiController:
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         service = self._require_product_service()
-        stores = self._selected_stores(payload)
+        stores = real_logged_in_stores(
+            self._selected_stores(payload)
+        )
         if not stores:
-            raise ValueError("当前账户没有可同步的店铺")
+            raise ValueError("当前账户没有已登录的真实店铺")
         errors: list[str] = []
         succeeded = 0
         counts = 0
@@ -14641,6 +15383,13 @@ class NextUiController:
             self.db.get_setting("upload_templates", "[]")
         )
         default_id = self._upload_default_template_id()
+        migrated = False
+        for row in rows:
+            if "cloud_violation" not in row:
+                row["cloud_violation"] = True
+                migrated = True
+        if migrated:
+            self._save_upload_templates(rows)
         for row in rows:
             row["is_default"] = bool(
                 default_id and str(row.get("id") or "") == default_id
@@ -14655,16 +15404,31 @@ class NextUiController:
 
     def _upload_cloud_violation_types(self) -> list[str]:
         types: set[str] = set()
+        active_stores = self.db.list_stores()
         for setting_key in (
             "violation_library",
             "upload_violation_titles",
         ):
-            for row in self._read_json_list(
+            rows = self._read_json_list(
                 self.db.get_setting(setting_key, "[]")
-            ):
+            )
+            rows = filter_active_violation_records(
+                rows,
+                active_stores,
+            )
+            for row in rows:
                 reason = str(row.get("reason") or "").strip()
                 if reason:
                     types.add(reason)
+        for row in self._read_json_list(
+            self.db.get_setting(
+                "cloud_counterfeit_violation_titles",
+                "[]",
+            )
+        ):
+            reason = str(row.get("reason") or "").strip()
+            if reason:
+                types.add(reason)
         return sorted(types)
 
     def _normalize_upload_template(
@@ -14712,6 +15476,22 @@ class NextUiController:
                 0,
                 int(template.get("trim_detail") or 0),
             )
+            template["trim_detail_tail"] = max(
+                0,
+                int(template.get("trim_detail_tail") or 0),
+            )
+            template["detail_keep_first"] = max(
+                0,
+                int(template.get("detail_keep_first") or 0),
+            )
+            template["remove_head_index"] = max(
+                0,
+                int(template.get("remove_head_index") or 0),
+            )
+            template["remove_detail_index"] = max(
+                0,
+                int(template.get("remove_detail_index") or 0),
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("模板价格、库存、保证金或裁剪参数无效") from exc
         if template.get("listing_mode") not in {
@@ -14754,6 +15534,49 @@ class NextUiController:
             "删除最低价",
         }:
             raise ValueError("低价规格处理方式无效")
+        raw_category_ids = template.get("specified_category_ids")
+        if isinstance(raw_category_ids, str):
+            try:
+                raw_category_ids = json.loads(raw_category_ids or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_category_ids = []
+        template["specified_category_ids"] = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in raw_category_ids or []
+                if str(value).strip().isdigit()
+            )
+        ) if isinstance(raw_category_ids, list) else []
+        template["specified_category_id"] = str(
+            template.get("specified_category_id") or ""
+        ).strip()
+        template["specified_category_path"] = str(
+            template.get("specified_category_path") or ""
+        ).strip()
+        template["specified_category_version"] = str(
+            template.get("specified_category_version") or ""
+        ).strip()
+        template["specified_category_store_id"] = str(
+            template.get("specified_category_store_id") or ""
+        ).strip()
+        if template["specified_category_id"]:
+            if (
+                not template["specified_category_ids"]
+                or template["specified_category_id"]
+                != template["specified_category_ids"][-1]
+                or not template["specified_category_path"]
+                or not template["specified_category_store_id"].isdigit()
+            ):
+                raise ValueError(
+                    "指定商品类目快照不完整，请重新选择叶子类目"
+                )
+            template["category_mode"] = "specified"
+        else:
+            template["specified_category_ids"] = []
+            template["specified_category_path"] = ""
+            template["specified_category_version"] = ""
+            template["specified_category_store_id"] = ""
+            template["category_mode"] = "auto"
         ladder_rules = str(template.get("ladder_rules") or "")
         for raw_line in ladder_rules.splitlines():
             line = raw_line.strip()
@@ -14807,7 +15630,9 @@ class NextUiController:
         )
         template["save_as_draft"] = template.get("listing_mode") == "draft"
         template["category_mode"] = (
-            "auto"
+            "specified"
+            if template.get("specified_category_id")
+            else "auto"
         )
         template["auto_open_category"] = True
         template["cloud_violation_types"] = str(
@@ -15435,6 +16260,11 @@ class NextUiController:
             ),
             {},
         )
+        if template:
+            template = self._normalize_upload_template(
+                template,
+                template,
+            )
         template_stock = max(0, int(template.get("stock") or 0))
         ready = 0
         results: list[dict[str, Any]] = []
@@ -15579,17 +16409,14 @@ class NextUiController:
                             or []
                         ),
                     }
-            if template.get("cloud_violation") and title:
-                candidate_title = apply_template_title_rules(title, template)
-                violation_title = find_upload_violation_title(
-                    candidate_title,
+            if title:
+                violation_issue = mandatory_upload_violation_issue(
+                    title,
+                    template,
                     self._upload_violation_title_rows(),
                 )
-                if violation_title is not None:
-                    issues.append(
-                        "云违规标题过滤命中："
-                        f"{violation_title.get('reason') or '出售假冒商品'}"
-                    )
+                if violation_issue:
+                    issues.append(violation_issue)
             if not issues:
                 ready += 1
             results.append(
@@ -15940,35 +16767,56 @@ class NextUiController:
                     "label": "无品牌",
                 }
             )
-            for product in self.db.list_products(
-                store.id,
-                status=5,
-            )[:100]:
-                try:
-                    raw = json.loads(product.get("raw_json") or "{}")
-                except (TypeError, ValueError):
-                    raw = {}
-                if not isinstance(raw, dict):
-                    continue
-                brand_id = str(
-                    raw.get("brand_id")
-                    or raw.get("brandId")
-                    or ""
-                ).strip()
-                if not brand_id or any(
-                    item["id"] == brand_id for item in brands
-                ):
-                    continue
-                brands.append(
-                    {
-                        "id": brand_id,
-                        "label": str(
-                            raw.get("brandName")
-                            or raw.get("brand_name")
-                            or "未读取到品牌名称"
-                        ),
-                    }
+            if client is not None:
+                valid_brands: list[dict[str, Any]] = []
+                fetch_brands = getattr(
+                    service,
+                    "valid_store_brands",
+                    None,
                 )
+                if callable(fetch_brands):
+                    try:
+                        valid_brands = fetch_brands(store, client)
+                    except Exception as exc:
+                        valid_brands = []
+                        errors.append(f"读取店铺生效品牌失败：{exc}")
+                else:
+                    fallback_fetch = getattr(
+                        client,
+                        "fetch_valid_brands",
+                        None,
+                    )
+                    if callable(fallback_fetch):
+                        try:
+                            valid_brands = fallback_fetch()
+                        except Exception as exc:
+                            errors.append(
+                                f"读取店铺生效品牌失败：{exc}"
+                            )
+                for brand in valid_brands or []:
+                    if not isinstance(brand, dict):
+                        continue
+                    brand_id = str(
+                        brand.get("brand_id") or ""
+                    ).strip()
+                    if not brand_id or any(
+                        existing["id"] == brand_id
+                        for existing in brands
+                    ):
+                        continue
+                    label = str(
+                        brand.get("ch_name")
+                        or brand.get("en_name")
+                        or "未读取到品牌名称"
+                    ).strip()
+                    if brand.get("expiring"):
+                        label = f"{label}（即将过期）"
+                    brands.append(
+                        {
+                            "id": brand_id,
+                            "label": label,
+                        }
+                    )
             if not brands:
                 brands.append(
                     {
@@ -15983,14 +16831,80 @@ class NextUiController:
                 "freight_templates": freight_templates,
                 "after_sale_addresses": after_sale_addresses,
                 "brands": brands,
+                "brand_mode": "none",
+                "has_store_brands": len(brands) > 1,
+                "brand_source": "微信小店生效品牌资质",
                 "default_freight_template_id": (
                     default_freight_template_id
                 ),
                 "default_after_sale_address_id": (
                     default_after_sale_address_id
                 ),
-                "default_brand_id": brands[0]["id"],
+                "default_brand_id": "2100000000",
                 "error": "；".join(errors)[:1000],
+            }
+        return {"stores": result}
+
+    def _upload_categories(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Read each selected store's official, permission-filtered category tree."""
+        requested = [
+            int(value)
+            for value in payload.get("store_ids", [])
+            if str(value).isdigit()
+        ]
+        if not requested:
+            return {"stores": {}}
+        service = self._require_product_service()
+        fetch_categories = getattr(
+            service,
+            "upload_category_options",
+            None,
+        )
+        if not callable(fetch_categories):
+            raise RuntimeError("当前商品服务不支持官方类目读取")
+        refresh = bool(payload.get("refresh"))
+        stores = {
+            store.id: store
+            for store in self.db.list_stores()
+            if store.id in set(requested)
+        }
+        result: dict[str, Any] = {}
+        for store_id in dict.fromkeys(requested):
+            store = stores.get(store_id)
+            if store is None:
+                result[str(store_id)] = {
+                    "store_id": store_id,
+                    "roots": [],
+                    "version": "",
+                    "cache_key": "",
+                    "leaf_count": 0,
+                    "error": "店铺不存在",
+                }
+                continue
+            try:
+                options = fetch_categories(store, refresh=refresh)
+            except Exception as exc:
+                result[str(store_id)] = {
+                    "store_id": store.id,
+                    "store_name": store.name,
+                    "roots": [],
+                    "version": "",
+                    "cache_key": "",
+                    "leaf_count": 0,
+                    "error": str(exc)[:1000],
+                }
+                continue
+            result[str(store.id)] = {
+                "store_id": store.id,
+                "store_name": store.name,
+                **(
+                    dict(options)
+                    if isinstance(options, dict)
+                    else {}
+                ),
             }
         return {"stores": result}
 
@@ -16011,6 +16925,29 @@ class NextUiController:
             {},
         )
         template = self._normalize_upload_template(incoming, existing)
+        if template.get("specified_category_id"):
+            store = self.db.get_store(
+                int(template["specified_category_store_id"])
+            )
+            if store is None:
+                raise ValueError(
+                    "指定类目的上下文店铺不存在，请重新选择类目"
+                )
+            service = self._require_product_service()
+            validator = getattr(
+                service,
+                "validate_category_selection",
+                None,
+            )
+            if not callable(validator):
+                raise RuntimeError("当前商品服务不支持指定类目校验")
+            validated = validator(
+                store,
+                template["specified_category_ids"],
+                template["specified_category_id"],
+            )
+            template["specified_category_path"] = validated["path"]
+            template["specified_category_version"] = validated["version"]
         template["id"] = template_id
         template.setdefault(
             "created_at",
@@ -16144,6 +17081,11 @@ class NextUiController:
         return {"path": (result.stdout or "").strip()}
 
     def _create_upload_tasks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from ..ui.upload_page import (
+            _apply_upload_image_rules,
+            _normalize_source_payload,
+        )
+
         batch_ids = {
             str(value)
             for value in payload.get("batch_ids", [])
@@ -16202,6 +17144,19 @@ class NextUiController:
             template,
             template,
         )
+        violation_titles = self._upload_violation_title_rows()
+        for row in rows:
+            violation_issue = mandatory_upload_violation_issue(
+                str(row.get("title") or ""),
+                template,
+                violation_titles,
+            )
+            if violation_issue:
+                raise ValueError(
+                    f"商品标题已命中售假违规库，禁止创建上传任务："
+                    f"{str(row.get('title') or row.get('source_product_id') or '')[:120]}"
+                    f"；{violation_issue}"
+                )
         store_options = payload.get("store_options")
         if not isinstance(store_options, dict):
             store_options = {}
@@ -16221,13 +17176,13 @@ class NextUiController:
             }
         tasks = self._upload_tasks()
         created_ids: list[str] = []
+        blocked_stores: list[dict[str, Any]] = []
         now = datetime.now().isoformat(timespec="seconds")
         for store_id, store_rows in rows_by_store.items():
             store = stores.get(store_id)
             if store is None or not store_rows:
                 continue
             task_id = f"up_{uuid.uuid4().hex[:12]}"
-            created_ids.append(task_id)
             task_template = json.loads(json.dumps(template))
             options = store_options.get(str(store.id))
             if isinstance(options, dict):
@@ -16235,10 +17190,129 @@ class NextUiController:
                     "freight_template_id",
                     "brand_id",
                     "after_sale_address_id",
+                    "brand_mode",
+                    "specified_category_id",
+                    "specified_category_path",
+                    "specified_category_version",
+                    "specified_category_store_id",
                 ):
                     value = str(options.get(key) or "").strip()
                     if value:
                         task_template[key] = value
+                legacy_category_ids = []
+                raw_category_ids = options.get("specified_category_ids")
+                if isinstance(raw_category_ids, list):
+                    legacy_category_ids = list(
+                        dict.fromkeys(
+                            str(value).strip()
+                            for value in raw_category_ids
+                            if str(value).strip().isdigit()
+                        )
+                    )
+                if legacy_category_ids:
+                    task_template["category_mode"] = "specified"
+                    task_template["specified_category_ids"] = legacy_category_ids
+                    task_template["specified_category_id"] = str(
+                        task_template.get("specified_category_id")
+                        or legacy_category_ids[-1]
+                    )
+
+                configured_brand_mode = (
+                    str(options.get("brand_mode") or "").strip()
+                    if isinstance(options, dict)
+                    else ""
+                )
+                brand_mode = configured_brand_mode
+                if not brand_mode:
+                    # Preserve legacy task-creation callers that provided only
+                    # brand_id before the explicit 无品牌/店铺品牌 switch existed.
+                    brand_mode = "legacy"
+                task_template["brand_mode"] = brand_mode
+                if brand_mode not in {"none", "store"}:
+                    if brand_mode != "legacy":
+                        raise ValueError(
+                            f"{store.name} 品牌设置无效，请选择无品牌或店铺品牌"
+                        )
+                if brand_mode == "none":
+                    task_template["brand_id"] = "2100000000"
+                elif brand_mode == "store":
+                    service = self._require_product_service()
+                    brand_id = str(
+                        task_template.get("brand_id") or ""
+                    ).strip()
+                    try:
+                        client = service.client_for(store)
+                        brand_reader = getattr(
+                            service,
+                            "valid_store_brands",
+                            None,
+                        )
+                        valid_brands = (
+                            brand_reader(store, client)
+                            if callable(brand_reader)
+                            else client.fetch_valid_brands()
+                        )
+                    except Exception as exc:
+                        raise ValueError(
+                            f"{store.name} 无法校验店铺品牌：{exc}"
+                        ) from exc
+                    valid_ids = {
+                        str(item.get("brand_id") or "").strip()
+                        for item in valid_brands or []
+                        if isinstance(item, dict)
+                    }
+                    if not brand_id or brand_id not in valid_ids:
+                        raise ValueError(
+                            f"{store.name} 选择的店铺品牌不存在、未生效或已过期"
+                        )
+            if task_template.get("specified_category_id"):
+                service = self._require_product_service()
+                validator = getattr(
+                    service,
+                    "validate_category_selection",
+                    None,
+                )
+                if not callable(validator):
+                    blocked_stores.append(
+                        {
+                            "store_id": store.id,
+                            "store_name": store.name,
+                            "error": (
+                                f"{store.name} 当前商品服务不支持指定类目校验，"
+                                "请修改模板"
+                            ),
+                        }
+                    )
+                    continue
+                try:
+                    validated_category = validator(
+                        store,
+                        list(task_template.get("specified_category_ids") or []),
+                        str(task_template.get("specified_category_id") or ""),
+                    )
+                except Exception as exc:
+                    blocked_stores.append(
+                        {
+                            "store_id": store.id,
+                            "store_name": store.name,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                task_template["specified_category_ids"] = list(
+                    validated_category["category_ids"]
+                )
+                task_template["specified_category_id"] = validated_category[
+                    "category_id"
+                ]
+                task_template["specified_category_path"] = validated_category["path"]
+                task_template["specified_category_version"] = validated_category[
+                    "version"
+                ]
+                task_template["specified_category_validated_store_id"] = store.id
+            else:
+                task_template["category_mode"] = "auto"
+            created_ids.append(task_id)
             items = []
             for row in store_rows:
                 item = dict(row)
@@ -16246,6 +17320,36 @@ class NextUiController:
                 item["status"] = "pending"
                 item["message"] = "等待上传"
                 item["product_id"] = ""
+                source_payload = row.get("payload")
+                if not isinstance(source_payload, dict):
+                    source_payload = row.get("raw")
+                if isinstance(source_payload, dict):
+                    normalized = _normalize_source_payload(
+                        source_payload
+                    )
+                    if (
+                        normalized.get("head_imgs")
+                        or (normalized.get("desc_info") or {}).get("imgs")
+                    ):
+                        resolved = _apply_upload_image_rules(
+                            normalized,
+                            task_template,
+                        )
+                        item["image_snapshot"] = {
+                            "head_imgs": list(
+                                resolved.get("head_imgs") or []
+                            ),
+                            "detail_imgs": list(
+                                (resolved.get("desc_info") or {}).get(
+                                    "imgs"
+                                )
+                                or []
+                            ),
+                            "source_counts": dict(
+                                resolved.get("_source_image_counts")
+                                or {}
+                            ),
+                        }
                 items.append(item)
             tasks.insert(
                 0,
@@ -16266,6 +17370,7 @@ class NextUiController:
             "created": len(created_ids),
             "task_ids": created_ids,
             "tasks": tasks,
+            "blocked_stores": blocked_stores,
         }
 
     def _retry_upload_tasks(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -16539,19 +17644,47 @@ class NextUiController:
         if requeued:
             self._save_upload_tasks(tasks)
         blocked_statuses = {"success", "skipped", "verification_pending"}
-        runnable_items = [
-            item
-            for task in selected
-            for item in task.get("items") or []
-            if str(item.get("status") or "") not in blocked_statuses
-            and (
-                not item_ids
-                or str(item.get("item_id") or "") in item_ids
+        violation_titles = self._upload_violation_title_rows()
+        runnable_items: list[dict[str, Any]] = []
+        blocked_title_count = 0
+        for task in selected:
+            task_template = (
+                task.get("template")
+                if isinstance(task.get("template"), dict)
+                else {}
             )
-        ]
+            for item in task.get("items") or []:
+                if (
+                    str(item.get("status") or "") in blocked_statuses
+                    or (
+                        item_ids
+                        and str(item.get("item_id") or "") not in item_ids
+                    )
+                ):
+                    continue
+                violation_issue = mandatory_upload_violation_issue(
+                    str(item.get("title") or ""),
+                    task_template,
+                    violation_titles,
+                )
+                if violation_issue:
+                    item["status"] = "failed"
+                    item["message"] = violation_issue
+                    item["finished_at"] = datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                    blocked_title_count += 1
+                    continue
+                runnable_items.append(item)
+        if blocked_title_count:
+            self._save_upload_tasks(tasks)
         if not runnable_items:
             raise ValueError(
-                "没有可执行商品；待核实商品必须先人工确认，不能自动重复提交"
+                (
+                    f"{blocked_title_count} 个商品命中售假违规库，已禁止提交"
+                    if blocked_title_count
+                    else "没有可执行商品；待核实商品必须先人工确认，不能自动重复提交"
+                )
             )
         job_id = uuid.uuid4().hex
         generation = self._current_generation()

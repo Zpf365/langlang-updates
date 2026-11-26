@@ -370,6 +370,61 @@ class ActivityAutoRenewalManager:
             )
             if str(row.get("observed_date") or "") == observed_date
         ]
+        outcomes: list[dict[str, Any]] = []
+        timestamp = self._timestamp(current)
+        for row in today_runs:
+            if str(row.get("status") or "") not in {
+                "running",
+                "verification_pending",
+            }:
+                continue
+            confirmed = self._match_official_activity(
+                activities,
+                product_id=str(row.get("product_id") or ""),
+                expected_activity_id=str(
+                    row.get("activity_id") or ""
+                ),
+                expected_start=int(row.get("start_time") or 0),
+                expected_end=int(row.get("end_time") or 0),
+            )
+            if confirmed is None:
+                continue
+            activity_id, confirmed_start, confirmed_end = confirmed
+            reconciled = self.db.save_activity_auto_create_run(
+                int(store.id),
+                str(row["product_id"]),
+                observed_date,
+                str(row["rule_version"]),
+                status="success",
+                attempts=int(row.get("attempts") or 0),
+                activity_id=activity_id,
+                start_time=confirmed_start,
+                end_time=confirmed_end,
+                last_checked_at=timestamp,
+            )
+            row.update(reconciled)
+            outcomes.append(reconciled)
+            today_count += 1
+            self.db.record_activity_operation(
+                "自动新商品限时活动",
+                "success",
+                store.id,
+                store.name,
+                _integer(activity_id, 0) or None,
+                1,
+                (
+                    f"商品 {row['product_id']} 已在官方活动列表确认"
+                    f"活动 {activity_id}，{confirmed_start}–{confirmed_end}"
+                ),
+                {
+                    "product_id": str(row["product_id"]),
+                    "rule_version": str(row["rule_version"]),
+                    "activity_id": activity_id,
+                    "start_time": confirmed_start,
+                    "end_time": confirmed_end,
+                    "reconciled": True,
+                },
+            )
         handled_products = {
             str(row.get("product_id") or "")
             for row in today_runs
@@ -378,9 +433,6 @@ class ActivityAutoRenewalManager:
                 str(row.get("status") or "")
                 in {
                     "success",
-                    "running",
-                    "verification_pending",
-                    "skipped",
                     "manual_stopped",
                 }
                 or (
@@ -392,9 +444,17 @@ class ActivityAutoRenewalManager:
                         > self._timestamp(current)
                     )
                 )
+                or (
+                    str(row.get("status") or "") == "verification_pending"
+                    and (
+                        int(row.get("next_retry_at") or 0)
+                        > timestamp
+                        or int(row.get("attempts") or 0)
+                        >= AUTO_CREATE_RETRY_LIMIT
+                    )
+                )
             )
         }
-        outcomes: list[dict[str, Any]] = []
         for candidate in candidates:
             if budget["remaining"] <= 0:
                 break
@@ -495,15 +555,42 @@ class ActivityAutoRenewalManager:
         attempts = int((existing or {}).get("attempts") or 0)
         if existing and existing.get("status") in {
             "success",
-            "running",
-            "verification_pending",
             "manual_stopped",
         }:
             return existing
         if (
             existing
+            and existing.get("status") == "running"
+        ):
+            retry_at = timestamp + 30 * 60
+            return self.db.save_activity_auto_create_run(
+                int(store.id),
+                product_id,
+                observed_date,
+                rule_version,
+                status="verification_pending",
+                attempts=attempts,
+                next_retry_at=retry_at,
+                activity_id=str(existing.get("activity_id") or ""),
+                start_time=int(existing.get("start_time") or 0),
+                end_time=int(existing.get("end_time") or 0),
+                error=(
+                    "上次自动活动在提交后中断，"
+                    "等待官方状态稳定后再次核对或重试"
+                ),
+                last_checked_at=timestamp,
+            )
+        if (
+            existing
             and existing.get("status") == "failed"
             and attempts >= AUTO_CREATE_RETRY_LIMIT
+        ):
+            return existing
+        if (
+            existing
+            and existing.get("status") == "verification_pending"
+            and attempts >= AUTO_CREATE_RETRY_LIMIT
+            and int(existing.get("next_retry_at") or 0) <= timestamp
         ):
             return existing
         if (
@@ -523,6 +610,8 @@ class ActivityAutoRenewalManager:
         )
         start_time = timestamp + int(rules["start_delay_minutes"]) * 60
         end_time = start_time + int(rules["duration_seconds"])
+        attempted_activity_id = ""
+        write_accepted = False
         try:
             scope = (
                 self._write_scope(store)
@@ -545,6 +634,7 @@ class ActivityAutoRenewalManager:
                     stock_limit_per_sku=0,
                     create_all=True,
                 )
+            write_accepted = True
             if int((result or {}).get("already_active_count") or 0):
                 return self.db.save_activity_auto_create_run(
                     int(store.id),
@@ -570,6 +660,7 @@ class ActivityAutoRenewalManager:
                     ),
                     "",
                 )
+            attempted_activity_id = expected_id
             expected_start = int(
                 (result or {}).get("start_time") or start_time
             )
@@ -621,7 +712,10 @@ class ActivityAutoRenewalManager:
             )
             return row
         except Exception as exc:
-            verification = "未确认新活动生效" in str(exc)
+            verification = (
+                write_accepted
+                or "未确认新活动生效" in str(exc)
+            )
             status = (
                 "verification_pending"
                 if verification
@@ -643,6 +737,7 @@ class ActivityAutoRenewalManager:
                 status=status,
                 attempts=attempts,
                 next_retry_at=retry_at,
+                activity_id=attempted_activity_id,
                 start_time=start_time,
                 end_time=end_time,
                 error=str(exc)[:4000],
@@ -674,6 +769,23 @@ class ActivityAutoRenewalManager:
         expected_end: int,
     ) -> tuple[str, int, int] | None:
         activities = self.service.snapup_activities(store)
+        return self._match_official_activity(
+            activities,
+            product_id=product_id,
+            expected_activity_id=expected_activity_id,
+            expected_start=expected_start,
+            expected_end=expected_end,
+        )
+
+    def _match_official_activity(
+        self,
+        activities: Any,
+        *,
+        product_id: str,
+        expected_activity_id: str,
+        expected_start: int,
+        expected_end: int,
+    ) -> tuple[str, int, int] | None:
         matches = []
         for row in activities or []:
             if not isinstance(row, dict):
@@ -694,11 +806,15 @@ class ActivityAutoRenewalManager:
             start = _activity_start(row)
             end = _activity_end(row)
             if (
-                abs(start - int(expected_start))
+                int(expected_start) > 0
+                and int(expected_end) > 0
+                and abs(start - int(expected_start))
                 <= RENEWAL_MATCH_TOLERANCE_SECONDS
                 and abs(end - int(expected_end))
                 <= RENEWAL_MATCH_TOLERANCE_SECONDS
             ):
+                matches.append((end, activity_id, start, end))
+            elif int(expected_start) <= 0 or int(expected_end) <= 0:
                 matches.append((end, activity_id, start, end))
         if not matches:
             return None

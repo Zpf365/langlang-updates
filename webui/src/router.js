@@ -38,7 +38,11 @@ const routes = [
     meta: { entitlement: "module.storefront" },
   },
   { path: "/violations", component: () => import("./pages/ViolationsParityPage.vue") },
-  { path: "/procurement-accounts", component: () => import("./pages/ProcurementPage.vue") },
+  {
+    path: "/procurement-accounts",
+    component: () => import("./pages/ProcurementPage.vue"),
+    meta: { entitlement: "feature.procurement_association" },
+  },
   { path: "/customer-service", component: () => import("./pages/CustomerServicePage.vue") },
   {
     path: "/operations/:section?",

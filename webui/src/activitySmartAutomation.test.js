@@ -16,6 +16,12 @@ describe("smart snapup automation UI", () => {
     expect(page).toContain('call("activity.renewal.save"');
   });
 
+  it("persists store-level switches as soon as they are toggled", () => {
+    expect(page).toMatch(
+      /<input\s+v-model="renewalStoreConfigs\[store\.store_id\]\.enabled"[^>]*@change="saveRenewalConfig"[^>]*\/>/,
+    );
+  });
+
   it("saves immutable rule snapshots and shows automatic run records", () => {
     expect(page).toContain('call("activity.smart-auto.rules.save"');
     expect(page).toContain("保存为智能活动规则");

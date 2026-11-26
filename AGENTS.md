@@ -103,3 +103,12 @@ These rules are mandatory for every future code change.
       the local counter reaches the end of its usable range, do not publish a
       `.100`; promote the three-part public version instead. After a public
       release, local verification starts at `<new-public-version>.1`.
+21. Every module conversation owns its complete vertical slice: UI, frontend
+    network calls, controller, service, necessary database migrations,
+    official-document research, fixtures, tests, and first-pass verification.
+    The lead/orchestration conversation only dispatches, audits completion,
+    integrates module outputs, resolves conflicts, runs cross-module gates,
+    packages, and releases. The lead must not take over and implement a
+    module's missing business functionality. If a module cannot complete its
+    chain, it must report the concrete blocker instead of returning partial
+    work for the lead to build.

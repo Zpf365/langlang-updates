@@ -632,7 +632,8 @@ def test_1688_purchase_no_longer_opens_dead_member_address_page() -> None:
     assert window_source.count("_read_order_list_in_context") == 1
     assert 'self.commands.put(("verify"' in window_source
     assert "for candidate in active_pages" in window_source
-    assert "smart_make_order" in window_source
+    assert "CHECKOUT_URL_MARKERS" in source
+    assert "_is_checkout_url(current_url)" in window_source
 
 
 def test_service_reuses_the_same_product_window_without_address_work(

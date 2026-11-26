@@ -5,11 +5,6 @@ import {
   sourceProductId,
 } from "./procurementLink";
 
-export const PURCHASE_READBACK_STATUSES = new Set([
-  "page_open_pending_payment",
-  "verification_pending",
-]);
-
 function text(value) {
   return String(value ?? "").trim();
 }
@@ -56,23 +51,6 @@ export function purchaseGate({
     accountId: selected?.id || "",
     reasons,
     reason: reasons.join("；"),
-  };
-}
-
-export function canRequestPurchaseReadback(link = {}) {
-  if (link.purchase_confirmed) return false;
-  return PURCHASE_READBACK_STATUSES.has(
-    text(link.purchase_attempt_status),
-  );
-}
-
-export function purchaseReadbackPayload(order = {}, link = {}, accountId = "") {
-  return {
-    store_id: order.store_id,
-    order_id: order.order_id,
-    product_id: text(link.product_id),
-    link_id: Number(link.id || 0),
-    account_id: Number(accountId || link.account_id || 0),
   };
 }
 

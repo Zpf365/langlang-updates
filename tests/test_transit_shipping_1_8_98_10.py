@@ -55,6 +55,12 @@ def _template() -> dict:
                 {"provinceName": "台湾省"},
             ]
         },
+        "notDeliver": {
+            "addressInfo": [
+                {"provinceName": XINJIANG},
+                {"provinceName": "台湾省"},
+            ]
+        },
         "consolidateFlag": 0,
         "relatedProductsNum": 10,
     }
@@ -92,6 +98,10 @@ def test_target_rules_remove_xinjiang_and_build_transit_schema() -> None:
     assert {
         item["provinceName"]
         for item in result["notSendArea"]["addressInfo"]
+    } == {"台湾省"}
+    assert {
+        item["provinceName"]
+        for item in result["notDeliver"]["addressInfo"]
     } == {"台湾省"}
     assert result["consolidateFlag"] == 1
     transit = result["consolidateConfig"]["allFreightCalcMethod"][

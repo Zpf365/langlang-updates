@@ -501,6 +501,7 @@ def test_platform_violation_sync_updates_upload_title_rule_library(
     tmp_path: Path,
 ) -> None:
     controller, database, service, store_id = _controller(tmp_path)
+    database.update_web_status(store_id, "已登录", "")
 
     result = controller.dispatch(
         "violations.sync-platform-blacklist",
@@ -516,6 +517,21 @@ def test_platform_violation_sync_updates_upload_title_rule_library(
         row.get("title") == "禁止重复上传的商品标题"
         for row in titles
     )
+
+
+def test_platform_violation_sync_rejects_logged_out_store(
+    tmp_path: Path,
+) -> None:
+    controller, database, service, store_id = _controller(tmp_path)
+    database.update_web_status(store_id, "未登录", "登录失效")
+
+    with pytest.raises(ValueError, match="已登录的真实店铺"):
+        controller.dispatch(
+            "violations.sync-platform-blacklist",
+            {"store_ids": [store_id]},
+        )
+
+    assert service.platform_violation_syncs == []
 
 
 def test_customer_console_rpc_does_not_block_workbench(

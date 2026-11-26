@@ -11,7 +11,7 @@ def test_store_table_uses_reference_row_density_and_internal_scroll() -> None:
     assert ".store-page {\n  height: 100%;\n  min-height: 0;" in source
     assert "overflow: hidden;\n  background: #fff;" in source
     assert ".store-table-card > .table-scroll {\n  flex: 1 1 auto;\n  min-height: 0;\n  overflow: auto;" in source
-    assert ".store-table td {\n  height: 44px;" in source
+    assert ".store-table td {\n  height: 46px;" in source
     assert '<td class="app-id-cell">' in source
     assert "maskAppId(store.app_id)" in source
     assert ':title="store.app_id"' not in source
@@ -102,7 +102,7 @@ def test_order_quick_refresh_calls_network_job_and_shows_feedback() -> None:
 
     assert 'call("orders.quick-refresh.start"' in source
     assert 'call("orders.quick-refresh.status"' in source
-    assert 'quickRefreshing ? "刷新中..." : "快速刷新"' in source
+    assert 'quickRefreshing ? "刷新中..." : "快速刷新全部店铺"' in source
     assert 'class="refresh-feedback"' in source
     assert "quickRefresh.current" in source
     assert "quickRefreshPercent" in source

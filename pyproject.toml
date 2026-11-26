@@ -1,6 +1,6 @@
 [project]
 name = "weimi-manager"
-version = "1.8.99.4"
+version = "1.9.00"
 description = "澜琅微信小店多店铺运营工作台（1.6.63 原界面重构版）"
 requires-python = ">=3.11,<3.14"
 dependencies = [

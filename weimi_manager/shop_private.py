@@ -1198,30 +1198,32 @@ class ShopPrivateClient:
                 {"pageNum": 1, "pageSize": 100},
             ),
         ):
-            try:
-                result = self._get(path, params)
-            except ShopPrivateError:
-                continue
+            result = self._get(path, params)
             data = self._data(result)
             if not isinstance(data, dict):
                 data = {}
             record = result.get("record")
             if not isinstance(record, dict):
                 record = data.get("record") if isinstance(data, dict) else {}
-            rows = (
-                data.get("list")
-                or data.get("rows")
-                or data.get("records")
-                or data.get("pageProducts")
-                or (
-                    record.get("items")
-                    if isinstance(record, dict)
-                    else None
-                )
-                or []
+            rows = next(
+                (
+                    data[key]
+                    for key in (
+                        "list",
+                        "rows",
+                        "records",
+                        "pageProducts",
+                    )
+                    if key in data
+                ),
+                record.get("items")
+                if isinstance(record, dict) and "items" in record
+                else None,
             )
             if not isinstance(rows, list):
-                continue
+                raise ShopPrivateError(
+                    "违规记录接口未返回有效列表"
+                )
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -1278,30 +1280,32 @@ class ShopPrivateClient:
                 {"page": 1, "pageSize": 100, "violationType": "finder"},
             ),
         ):
-            try:
-                result = self._get(path, params)
-            except ShopPrivateError:
-                continue
+            result = self._get(path, params)
             data = self._data(result)
             if not isinstance(data, dict):
                 data = {}
             record = result.get("record")
             if not isinstance(record, dict):
                 record = data.get("record") if isinstance(data, dict) else {}
-            rows = (
-                data.get("list")
-                or data.get("rows")
-                or data.get("records")
-                or data.get("pageProducts")
-                or (
-                    record.get("items")
-                    if isinstance(record, dict)
-                    else None
-                )
-                or []
+            rows = next(
+                (
+                    data[key]
+                    for key in (
+                        "list",
+                        "rows",
+                        "records",
+                        "pageProducts",
+                    )
+                    if key in data
+                ),
+                record.get("items")
+                if isinstance(record, dict) and "items" in record
+                else None,
             )
             if not isinstance(rows, list):
-                continue
+                raise ShopPrivateError(
+                    "违规记录接口未返回有效列表"
+                )
             for row in rows:
                 if not isinstance(row, dict):
                     continue

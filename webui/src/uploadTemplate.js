@@ -35,6 +35,79 @@ export function validateLicenseGroups(text) {
   return value;
 }
 
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value ?? {}));
+}
+
+function nonNegativeInteger(value) {
+  const number = Math.floor(Number(value || 0));
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function removeOneBasedIndex(images, index) {
+  const ordinal = nonNegativeInteger(index);
+  if (!ordinal || ordinal > images.length) return images;
+  return [...images.slice(0, ordinal - 1), ...images.slice(ordinal)];
+}
+
+export function applyImageRules(payload, template = {}) {
+  const prepared = cloneJson(payload);
+  const rules = {
+    remove_head_index: nonNegativeInteger(template.remove_head_index),
+    trim_head: nonNegativeInteger(template.trim_head),
+    remove_detail_index: nonNegativeInteger(template.remove_detail_index),
+    trim_detail: nonNegativeInteger(template.trim_detail),
+    trim_detail_tail: nonNegativeInteger(template.trim_detail_tail),
+    detail_keep_first: nonNegativeInteger(template.detail_keep_first),
+  };
+  const descInfo = prepared.desc_info && typeof prepared.desc_info === "object"
+    ? prepared.desc_info
+    : {};
+  const clean = (values) => (Array.isArray(values) ? values : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  let headImages = clean(prepared.head_imgs);
+  let detailImages = clean(descInfo.imgs);
+  const signature = JSON.stringify(rules);
+  if (prepared._template_image_processing === signature) return prepared;
+
+  headImages = removeOneBasedIndex(headImages, rules.remove_head_index);
+  if (rules.trim_head) headImages = headImages.slice(rules.trim_head);
+  headImages = [...new Set(headImages)];
+
+  detailImages = removeOneBasedIndex(detailImages, rules.remove_detail_index);
+  if (rules.trim_detail) detailImages = detailImages.slice(rules.trim_detail);
+  if (rules.trim_detail_tail) {
+    detailImages = detailImages.slice(
+      0,
+      Math.max(0, detailImages.length - rules.trim_detail_tail),
+    );
+  }
+  if (rules.detail_keep_first) {
+    detailImages = detailImages.slice(0, rules.detail_keep_first);
+  }
+  detailImages = [...new Set(detailImages)];
+  if (!headImages.length && Object.values(rules).some(Boolean)) {
+    throw new Error("图片处理后主图为空，请调整主图处理规则");
+  }
+  if (!detailImages.length && [
+    rules.remove_detail_index,
+    rules.trim_detail,
+    rules.trim_detail_tail,
+    rules.detail_keep_first,
+  ].some(Boolean)) {
+    throw new Error("图片处理后详情图为空，请调整详情图处理规则");
+  }
+  prepared.head_imgs = headImages;
+  prepared.desc_info = { ...descInfo, imgs: detailImages };
+  prepared._template_image_processing = signature;
+  prepared._source_image_counts = {
+    head: clean(payload?.head_imgs).length,
+    detail: clean(payload?.desc_info?.imgs).length,
+  };
+  return prepared;
+}
+
 export function buildUploadTemplatePayload({
   form,
   sourceTemplate = {},
@@ -73,8 +146,12 @@ export function buildUploadTemplatePayload({
     stock,
     deposit_limit: deposit,
     low_price_multiplier: Math.max(1, Number(form.low_price_multiplier || 2)),
-    trim_head: Math.max(0, Number(form.trim_head || 0)),
-    trim_detail: Math.max(0, Number(form.trim_detail || 0)),
+    remove_head_index: nonNegativeInteger(form.remove_head_index),
+    trim_head: nonNegativeInteger(form.trim_head),
+    remove_detail_index: nonNegativeInteger(form.remove_detail_index),
+    trim_detail: nonNegativeInteger(form.trim_detail),
+    trim_detail_tail: nonNegativeInteger(form.trim_detail_tail),
+    detail_keep_first: nonNegativeInteger(form.detail_keep_first),
     category_license_groups: licenseGroups,
     ladder_rules: String(form.ladder_rules || "").trim(),
     cloud_violation_types: String(form.cloud_violation_types || "").trim(),
