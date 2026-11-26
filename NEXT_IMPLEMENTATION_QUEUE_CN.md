@@ -49,9 +49,25 @@
 - 内部候选不得自行发布；必须由总控验收并收到用户明确的公开发布指令。
 - 统一使用“拍单”，不使用“派单”。
 
-### 当前总控集成批次：1.8.99.3
+### 当前热修复批次：1.8.99.4
 
-状态：`INTEGRATED_CANDIDATE_1_8_99_3`
+状态：`LOCAL_INSTALLED_1_8_99_4`
+
+- 用户本机从 `1.8.99.1` 更新到 `1.8.99.3` 后，旧数据库启动报
+  `sqlite3.OperationalError: no such column: link_id`。
+- 根因：`1.8.99.3` 先在旧表上创建依赖 `link_id` 的索引，之后才执行补字段迁移。
+- 修复：从初始 schema 移除该索引，先通过 `PRAGMA table_info` 补齐
+  `link_id`、`trade_no`、`mail_no`、`carrier`，再创建索引。
+- 回归：真实 `zpfly` 数据库副本升级后字段和索引存在，9 家店、1527 个订单
+  数量不变。
+- 本机 `D:\WG\LangLang` 已更新到 `1.8.99.4`，登录页正常；
+  `zpfly` 真实数据库已迁移，9 家店和 1527 个订单保留。
+- 程序备份：`D:\WG\LangLang.update-backup-20261126-143604`。
+- 数据库备份：`D:\WG\LangLang.data-backup-20261126-143604`。
+
+### 前一批次：1.8.99.3
+
+状态：`SUPERSEDED_BY_1_8_99_4`
 
 - 托管中心：全店官方在售商品、20/20/5 分批、已有联盟分页、保存并启用已完成；
   相关 Python `4 passed`，Vitest `3 passed`，production build 通过。

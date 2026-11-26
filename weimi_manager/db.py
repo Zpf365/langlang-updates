@@ -352,8 +352,6 @@ CREATE TABLE IF NOT EXISTS procurement_purchase_records (
 
 CREATE INDEX IF NOT EXISTS idx_procurement_purchase_order_product
     ON procurement_purchase_records(store_id, order_id, product_id);
-CREATE INDEX IF NOT EXISTS idx_procurement_purchase_link
-    ON procurement_purchase_records(store_id, order_id, product_id, link_id);
 
 CREATE TABLE IF NOT EXISTS procurement_purchase_attempts (
     store_id INTEGER NOT NULL,
