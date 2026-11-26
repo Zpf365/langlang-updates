@@ -22,9 +22,8 @@ function formatMoney(value) {
 
 export function isRefundVisible(amount, orderCount) {
   const amountValue = numeric(amount);
-  const countValue = numeric(orderCount);
-  if (amountValue === null || countValue === null) return true;
-  return amountValue !== 0 || countValue !== 0;
+  if (amountValue === null) return true;
+  return amountValue !== 0;
 }
 
 export function salesPresentation(store, key) {

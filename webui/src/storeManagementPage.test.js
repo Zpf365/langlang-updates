@@ -155,6 +155,23 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("store.web_status_detail || store.web_status");
   });
 
+  it("enlarges every store table text tier within the two table views", () => {
+    expect(source).toContain("--store-table-heading-font-size: 11px;");
+    expect(source).toContain("--store-table-data-font-size: 11px;");
+    expect(source).toContain("--store-table-secondary-font-size: 10px;");
+    expect(source).toContain("--store-table-sales-font-size: 12px;");
+    expect(source).toContain("--store-table-heading-font-size: 13px;");
+    expect(source).toContain("--store-table-data-font-size: 13px;");
+    expect(source).toContain("--store-table-secondary-font-size: 12px;");
+    expect(source).toContain("--store-table-sales-font-size: 13px;");
+    expect(source).toContain(
+      "font-size: var(--store-table-sales-font-size);",
+    );
+    expect(source).toContain(
+      "font-size: var(--store-table-secondary-font-size);",
+    );
+  });
+
   it("shows refund rows only for real refund data or unknown values", () => {
     const noRefund = salesPresentation(
       {
@@ -239,18 +256,52 @@ describe("store management score and deposit presentation", () => {
     expect(refundOnly.refundText).toBe("退 ¥12.00 · 1单");
     expect(amountOnly.showRefund).toBe(true);
     expect(amountOnly.refundText).toBe("退 ¥5.00 · —单");
-    expect(countOnly.showRefund).toBe(true);
+    expect(countOnly.showRefund).toBe(false);
     expect(countOnly.refundText).toBe("退 ¥0.00 · —单");
     expect(countOnly.refundOrderCount).toBeNull();
     expect(countOnly.title).toBeUndefined();
     expect(unknownAmount.showRefund).toBe(true);
     expect(unknownAmount.refundText).toBe("退 — · 0单");
-    expect(unknownCount.showRefund).toBe(true);
+    expect(unknownCount.showRefund).toBe(false);
     expect(unknownCount.refundText).toBe("退 ¥0.00 · —单");
     expect(isRefundVisible(0, 0)).toBe(false);
     expect(isRefundVisible(null, 0)).toBe(true);
-    expect(isRefundVisible(0, null)).toBe(true);
+    expect(isRefundVisible(0, null)).toBe(false);
     expect(isRefundVisible(undefined, undefined)).toBe(true);
+  });
+
+  it("hides an explicit zero refund even when a stale count says one", () => {
+    const zeroRefund = salesPresentation(
+      {
+        metrics: {
+          gmv_today: 0,
+          today_orders: 0,
+          refund_gmv_today: 0,
+        },
+        sales_meta: {
+          refund_order_counts: { today: 1 },
+        },
+      },
+      "today",
+    );
+    const realRefund = salesPresentation(
+      {
+        metrics: {
+          gmv_today: 0,
+          today_orders: 0,
+          refund_gmv_today: 100,
+        },
+        sales_meta: {
+          refund_order_counts: { today: 1 },
+        },
+      },
+      "today",
+    );
+
+    expect(zeroRefund.salesText).toBe("销 ¥0.00 · 0单");
+    expect(zeroRefund.showRefund).toBe(false);
+    expect(realRefund.showRefund).toBe(true);
+    expect(realRefund.refundText).toBe("退 ¥1.00 · 1单");
   });
 
   it("keeps refund visibility scoped to each store period after refresh", () => {

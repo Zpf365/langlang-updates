@@ -2251,6 +2251,10 @@ onBeforeUnmount(() => {
  }
 
  .store-overview-table {
+   --store-table-heading-font-size: 11px;
+   --store-table-data-font-size: 11px;
+   --store-table-secondary-font-size: 10px;
+   --store-table-sales-font-size: 12px;
    width: 100%;
    min-width: 0;
    table-layout: fixed;
@@ -2259,12 +2263,12 @@ onBeforeUnmount(() => {
  }
 
  .store-overview-table th {
-   height: 34px;
+   height: 36px;
    padding: 0 5px;
    border-bottom: 1px solid #dce4ea;
    color: #5e6f7e;
    background: #f7f9fa;
-   font-size: 10px;
+   font-size: var(--store-table-heading-font-size);
    font-weight: 600;
    text-align: center;
    white-space: nowrap;
@@ -2278,7 +2282,7 @@ onBeforeUnmount(() => {
 
  .store-overview-table thead tr:nth-child(2) th {
    position: sticky;
-   top: 34px;
+   top: 36px;
    z-index: 6;
  }
 
@@ -2301,12 +2305,12 @@ onBeforeUnmount(() => {
  }
 
  .store-overview-table td {
-   height: 56px;
+   height: 60px;
    padding: 5px;
    border-bottom: 1px solid #edf1f4;
    color: #4a5d6c;
    background: #fff;
-   font-size: 9px;
+   font-size: var(--store-table-data-font-size);
    text-align: center;
    vertical-align: middle;
  }
@@ -2330,13 +2334,13 @@ onBeforeUnmount(() => {
 
  .overview-store-cell strong {
    color: #243746;
-   font-size: 10px;
+   font-size: var(--store-table-data-font-size);
  }
 
  .overview-store-cell small {
    margin-top: 3px;
    color: #87949f;
-   font-size: 8px;
+   font-size: var(--store-table-secondary-font-size);
  }
 
  .overview-product-cell span + span {
@@ -2349,7 +2353,7 @@ onBeforeUnmount(() => {
  }
 
  .sales-lines {
-   min-height: 34px;
+   min-height: 38px;
    display: flex;
    flex-direction: column;
    align-items: center;
@@ -2368,7 +2372,7 @@ onBeforeUnmount(() => {
    overflow: hidden;
    text-overflow: ellipsis;
    white-space: nowrap;
-   font-size: 11px;
+   font-size: var(--store-table-sales-font-size);
    line-height: 1.35;
  }
 
@@ -2393,15 +2397,15 @@ onBeforeUnmount(() => {
    overflow-wrap: anywhere;
    color: #657682;
    font-family: "Cascadia Code", Consolas, monospace;
-   font-size: 8px;
+   font-size: var(--store-table-secondary-font-size);
    line-height: 1.25;
  }
 
  .overview-credential button {
    flex: 0 0 auto;
-   height: 21px;
+   height: 23px;
    padding: 0 5px;
-   font-size: 8px;
+   font-size: var(--store-table-secondary-font-size);
  }
 
  .overview-login-cell {
@@ -2433,26 +2437,35 @@ onBeforeUnmount(() => {
  .store-detail-grid h4 {
    margin: 0 0 8px;
    color: #405565;
-   font-size: 10px;
+   font-size: var(--store-table-data-font-size);
  }
 
  .detail-line {
-   min-height: 23px;
+   min-height: 25px;
    display: flex;
    align-items: center;
    justify-content: space-between;
    gap: 8px;
    border-bottom: 1px solid #f0f3f5;
    color: #758491;
-   font-size: 9px;
+   font-size: var(--store-table-secondary-font-size);
  }
 
  .detail-line:last-child { border-bottom: 0; }
  .detail-line strong { color: #384e5f; font-weight: 600; text-align: right; }
- .detail-line small.up { color: #d94350; font-size: 8px; }
- .detail-line small.down { color: #15905d; font-size: 8px; }
+ .detail-line small.up,
+ .detail-line small.down {
+   color: #d94350;
+   font-size: var(--store-table-secondary-font-size);
+ }
+ .detail-line small.down { color: #15905d; }
  .detail-actions { display: flex; flex-wrap: wrap; gap: 5px; }
- .detail-freshness { margin-top: 8px; display: block; color: #8a96a0; font-size: 8px; }
+ .detail-freshness {
+   margin-top: 8px;
+   display: block;
+   color: #8a96a0;
+   font-size: var(--store-table-secondary-font-size);
+ }
 
 .store-filter-row {
   min-height: 46px;
@@ -2649,6 +2662,10 @@ onBeforeUnmount(() => {
 }
 
 .store-table {
+   --store-table-heading-font-size: 13px;
+   --store-table-data-font-size: 13px;
+   --store-table-secondary-font-size: 12px;
+   --store-table-sales-font-size: 13px;
    width: 2538px;
    min-width: 2538px;
   table-layout: fixed;
@@ -2658,10 +2675,10 @@ onBeforeUnmount(() => {
   position: sticky;
   top: 0;
   z-index: 2;
-  height: 42px;
+  height: 44px;
   padding: 0 6px;
   box-sizing: border-box;
-  font-size: 12px;
+  font-size: var(--store-table-heading-font-size);
   background: #f7f9fa;
   text-align: center;
 }
@@ -2695,15 +2712,15 @@ onBeforeUnmount(() => {
 }
 
 .store-table thead tr:nth-child(2) th {
-  top: 42px;
+  top: 44px;
 }
 
 .store-table td {
-  height: 44px;
+  height: 46px;
   padding: 0 6px;
   box-sizing: border-box;
   overflow: hidden;
-  font-size: 12px;
+  font-size: var(--store-table-data-font-size);
   line-height: 1.3;
   text-align: center;
 }
@@ -2765,7 +2782,7 @@ onBeforeUnmount(() => {
 
 .score-cell small {
   margin-left: 4px;
-  font-size: 11px;
+  font-size: var(--store-table-secondary-font-size);
   font-weight: 600;
 }
 
@@ -2782,7 +2799,7 @@ onBeforeUnmount(() => {
   display: block;
   margin-top: 3px;
   color: #8a641e;
-  font-size: 10px;
+  font-size: var(--store-table-secondary-font-size);
   font-style: normal;
 }
 
@@ -2831,7 +2848,7 @@ onBeforeUnmount(() => {
   border-radius: 3px;
   color: white;
   background: #707b87;
-  font-size: 11px;
+  font-size: var(--store-table-secondary-font-size);
 }
 
 .group-manager {
@@ -3458,7 +3475,7 @@ onBeforeUnmount(() => {
      display: block;
      color: #929ea7;
      content: attr(data-label);
-     font-size: 8px;
+     font-size: var(--store-table-secondary-font-size);
      text-align: left;
    }
 
