@@ -51,7 +51,7 @@
 
 ### 当前总控集成批次：1.8.99.3
 
-状态：`INTEGRATION_VERIFY`
+状态：`INTEGRATED_CANDIDATE_1_8_99_3`
 
 - 托管中心：全店官方在售商品、20/20/5 分批、已有联盟分页、保存并启用已完成；
   相关 Python `4 passed`，Vitest `3 passed`，production build 通过。

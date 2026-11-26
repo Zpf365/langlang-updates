@@ -31,7 +31,7 @@
 - 独占文件：`webui/src/pages/HostedPage.vue`、`weimi_manager/webui/hosted_runner.py`
 - 受限共享文件：`weimi_manager/service.py` 仅允许增加托管联盟读取方法；完成前其他模块不得修改该文件
 - 测试：`tests/test_hosted_all_store_commission.py`、托管中心相关 Vitest/pytest
-- 状态：实施中
+- 状态：已整合并签收为 `1.8.99.3` 内部候选；模块停止改动
 - 要求：保存配置可启用；全店官方在售商品分批处理；不支持的功能不得伪装成功
 - 首个交付：已完成并等待总控复核；未提交、未发布
 
@@ -40,7 +40,7 @@
 - 责任会话：订单与采购整体流程走通模块
 - 独占文件：`webui/src/pages/OrdersParityPage.vue`、`webui/src/components/OrderProcurementDialog.vue`、相关订单前端子组件和新增前端测试
 - 禁止修改：`weimi_manager/webui/controller.py`、`weimi_manager/service.py`、`weimi_manager/procurement.py`
-- 状态：前端流程审计与实施
+- 状态：已整合并签收；模块停止改动
 - 要求：从订单商品进入采购、打开官方购买页、付款后回读确认、采购记录落库、供应商发货与官方发货状态可见；缺失的 Python 接口写成精确交接清单
 
 ### PROCUREMENT-ACCOUNT-001：采购账号与结算页
@@ -48,7 +48,7 @@
 - 责任会话：采购账号模块
 - 独占文件：`weimi_manager/procurement.py`、`tests/test_procurement_*.py`、采购账号专用前端组件
 - 禁止修改：`weimi_manager/webui/controller.py`、`weimi_manager/service.py`
-- 状态：代码与离线验证
+- 状态：已整合并签收；模块停止改动
 - 要求：淘宝/1688 独立 Profile、重启校验、失效提示、1688 结算页临时地址一次性填写的幂等和失败边界
 
 ## 等待队列
@@ -62,7 +62,7 @@
 - 责任会话：上传商品模块
 - 独占文件：上传商品相关 Vue 页面和组件、`weimi_manager/service.py` 中商品提交方法、`weimi_manager/wechat_api.py` 中商品提交/模板方法、上传专项测试
 - 受限共享文件：`weimi_manager/webui/controller.py` 仅允许修改上传商品直接相关的 RPC 接线
-- 状态：实施中
+- 状态：真实测试店闭环通过并已整合；模块停止改动
 - 要求：定位并修复 `6600120 / deliver_method`，从新页面创建最小合规测试商品，官方回读成功后只清理本次自建商品
 
 ## 真实测试店授权
@@ -83,3 +83,20 @@
 - `weimi_manager/wechat_api.py`
 - `LangLang.spec`、版本文件、manifest、发布脚本
 - 全量回归、PyInstaller、候选封装、本机更新和公开发布
+
+## 1.8.99.3 集成结果
+
+- 集成提交：`95b51f3`
+- 候选：`candidate/1.8.99.3/`
+- 全量 pytest：`985 passed, 7 skipped, 21 subtests passed`
+- WebUI Vitest：`168 passed`
+- production build、PyInstaller、隔离 EXE 登录页冒烟：通过
+- 候选未覆盖本机 `D:\WG\LangLang`，未推送 Git，未发布 GitHub
+
+模块后续规则：
+
+1. 新的模块任务从集成提交之后的唯一基线开始，不沿用本次会话里的旧文件状态。
+2. 每次派单只读取总控列出的必要文件，不要求预先通读整个项目。
+3. 模块不得提交、打最终包、发布或覆盖本机；只交改动、测试和交接说明。
+4. 发现共享文件冲突时立即停止，由统筹总工串行修改。
+5. 真实测试店仍只允许 `zpfly` 和 `再百宽栾商行`（ID 19），且只操作本次自建数据。
