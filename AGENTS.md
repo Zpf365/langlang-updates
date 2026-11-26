@@ -83,3 +83,17 @@ These rules are mandatory for every future code change.
     continue checking other areas. Publish a new stable version only when the
     night QA has no unresolved blocker, tests/build/package gates pass, and the
     user's standing nightly-release policy remains authorized.
+19. Human interaction is user-operated. Whenever a workflow requires scanning,
+    login, payment, verification, external confirmation, or any other real
+    interaction/logic check, launch or navigate the software to the correct
+    screen, explain the exact next steps, and let the user perform the action.
+    Do not automate the user's authentication, payment, or confirmation.
+20. Local candidate versioning uses the current public release as its base:
+    `1.8.99.1`, `1.8.99.2`, `1.8.99.3`, then `.4`, `.5`, and so on. These
+    internal builds are tested on the user's local `D:\WG\LangLang` first and
+    are never published as GitHub Latest automatically. On reaching the
+    internal suffix limit of 99, promote directly to the next formal version
+    instead of creating a `.100` local package (`1.8.99` -> `1.9.00`). Formal
+    releases then increase the last field one at a time (`1.9.00` -> `1.9.01`),
+    with a carry at 99 (`1.9.99` -> `1.10.00`). Each formal version starts its
+    own local candidate sequence (for example `1.9.00.1`).
