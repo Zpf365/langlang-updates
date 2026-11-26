@@ -88,12 +88,18 @@ These rules are mandatory for every future code change.
     interaction/logic check, launch or navigate the software to the correct
     screen, explain the exact next steps, and let the user perform the action.
     Do not automate the user's authentication, payment, or confirmation.
-20. Local candidate versioning uses the current public release as its base:
-    `1.8.99.1`, `1.8.99.2`, `1.8.99.3`, then `.4`, `.5`, and so on. These
-    internal builds are tested on the user's local `D:\WG\LangLang` first and
-    are never published as GitHub Latest automatically. On reaching the
-    internal suffix limit of 99, promote directly to the next formal version
-    instead of creating a `.100` local package (`1.8.99` -> `1.9.00`). Formal
-    releases then increase the last field one at a time (`1.9.00` -> `1.9.01`),
-    with a carry at 99 (`1.9.99` -> `1.10.00`). Each formal version starts its
-    own local candidate sequence (for example `1.9.00.1`).
+20. Versions have two strictly separate tracks:
+    - Internal/local verification builds always have four numeric fields:
+      `1.8.99.1`, `1.8.99.2`, `1.8.99.3`, then `.4`, `.5`, and so on.
+      The fourth field is a local build counter and is never included in a
+      public package, GitHub Release, or online update manifest.
+    - Public release packages always have exactly three numeric fields. A
+      public release increments the current final field as one three-part
+      number, with carry into the preceding field:
+      `1.8.99` -> `1.9.00` -> `1.9.01` -> ... -> `1.9.99` -> `1.10.00`.
+      A public four-field version such as `1.8.99.4` is forbidden.
+    - Local build count does not determine when a public release happens.
+      Publishing still requires the user's explicit release instruction. If
+      the local counter reaches the end of its usable range, do not publish a
+      `.100`; promote the three-part public version instead. After a public
+      release, local verification starts at `<new-public-version>.1`.
