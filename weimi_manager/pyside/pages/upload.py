@@ -29,6 +29,8 @@ from ...ui.upload_page import (
     CategoryApprovalPending,
     CategoryAutoOpenError,
     TemplateRuleSkip,
+    UploadCancelled,
+    UploadPaused,
     _category_checks_all,
     _category_checks_from_options,
     _category_deposit_snapshot,
@@ -185,6 +187,14 @@ class UploadRunner:
             "upload_category_options",
             None,
         )
+
+        def stop_requested() -> str | None:
+            if self.cancelled.is_set():
+                return "cancelled"
+            if self.paused.is_set():
+                return "paused"
+            return None
+
         refresh_categories = None
         if callable(catalog_refresh):
             def refresh_categories() -> dict[str, Any]:
@@ -286,6 +296,9 @@ class UploadRunner:
                     )
             except TemplateRuleSkip as exc:
                 self._set_item(task, item, "skipped", str(exc))
+                continue
+            except (UploadCancelled, UploadPaused) as exc:
+                self._set_upload_interrupted(task, item, exc)
                 continue
             except CategoryApprovalPending as exc:
                 now = datetime.now()
@@ -464,6 +477,7 @@ class UploadRunner:
                     category_ids=category_ids,
                     application=item,
                     refresh_categories=refresh_categories,
+                    stop_requested=stop_requested,
                 )
                 product_id = str(result.get("product_id") or payload.get("product_id") or "")
                 if not product_id:
@@ -502,6 +516,8 @@ class UploadRunner:
                     item["message"] = (
                         "远端已创建商品，但本地任务/历史保存失败，请先核实：" + str(exc)[:300]
                     )
+            except (UploadCancelled, UploadPaused) as exc:
+                self._set_upload_interrupted(task, item, exc)
             except CategoryApprovalPending as exc:
                 now = datetime.now()
                 self._copy_category_pending_to_snapshot(
@@ -644,6 +660,29 @@ class UploadRunner:
                         completed,
                         total,
                     )
+
+    @staticmethod
+    def _set_upload_interrupted(
+        task: dict[str, Any],
+        item: dict[str, Any],
+        interrupted: Any,
+    ) -> None:
+        item["status"] = str(
+            getattr(interrupted, "status", "") or "cancelled"
+        )
+        item["message"] = str(interrupted)
+        item["finished_at"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        category_ids = list(
+            getattr(interrupted, "category_ids", []) or []
+        )
+        if category_ids:
+            item["category_ids"] = category_ids
+        if bool(getattr(interrupted, "category_applied", False)):
+            item["category_apply_submitted"] = True
+            item["category_state"] = "waiting"
+        UploadRunner._refresh_task_status(task)
 
     @staticmethod
     def _copy_category_pending_to_snapshot(
@@ -812,6 +851,8 @@ class UploadRunner:
             task["status"] = "needs_verification"
         elif any(status == "waiting_category" for status in statuses):
             task["status"] = "needs_category"
+        elif any(status == "cancelled" for status in statuses):
+            task["status"] = "cancelled"
         elif any(status in {"pending", "paused"} for status in statuses):
             task["status"] = "paused"
         elif any(status == "failed" for status in statuses):
@@ -823,7 +864,10 @@ class UploadRunner:
         success = statuses.count("success")
         failed = statuses.count("failed")
         skipped = statuses.count("skipped")
-        pending = sum(status not in {"success", "failed", "skipped"} for status in statuses)
+        pending = sum(
+            status not in {"success", "failed", "skipped", "cancelled"}
+            for status in statuses
+        )
         task["message"] = f"成功 {success}，失败 {failed}，跳过 {skipped}，待处理 {pending}"
 
 

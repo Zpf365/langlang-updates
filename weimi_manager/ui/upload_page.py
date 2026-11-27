@@ -702,6 +702,7 @@ def _is_category_permission_error(exc: Exception) -> bool:
                 "冻结",
                 "失效",
                 "不存在",
+                "禁用",
             )
         )
     )
@@ -762,7 +763,18 @@ def _is_category_failure_item(item: dict[str, Any]) -> bool:
     ).casefold()
     return "6600145" in message or (
         "类目" in message
-        and any(word in message for word in ("权限", "开通", "未授权"))
+        and any(
+            word in message
+            for word in (
+                "权限",
+                "开通",
+                "未授权",
+                "冻结",
+                "失效",
+                "不存在",
+                "禁用",
+            )
+        )
     )
 
 
@@ -1146,6 +1158,7 @@ def _retry_upload_after_category_open(
     category_ids: list[str] | None = None,
     application: dict[str, Any] | None = None,
     refresh_categories: Callable[[], dict[str, Any]] | None = None,
+    stop_requested: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     application = application if application is not None else {}
     saved_ids = application.get("category_ids")
@@ -1169,6 +1182,25 @@ def _retry_upload_after_category_open(
         ]
     else:
         category_ids = category_ids or _required_category_ids(payload)
+
+    def ensure_not_stopped(*, category_applied: bool = False) -> None:
+        reason = (
+            str(stop_requested() or "")
+            if callable(stop_requested)
+            else ""
+        )
+        if reason == "cancelled":
+            raise UploadCancelled(
+                "上传任务已取消，停止后续类目操作和商品写入",
+                category_ids=category_ids,
+                category_applied=category_applied,
+            )
+        if reason == "paused":
+            raise UploadPaused(
+                "上传任务已暂停，未继续类目操作和商品写入",
+                category_ids=category_ids,
+                category_applied=category_applied,
+            )
 
     def resolve_client() -> Any:
         try:
@@ -1227,6 +1259,7 @@ def _retry_upload_after_category_open(
         return state == "not_applied" and bool(check.get("eligible"))
 
     def retry_after_effective(client: Any) -> dict[str, Any]:
+        ensure_not_stopped()
         if progress is not None:
             progress("类目已生效，正在自动重新上货")
         try:
@@ -1274,6 +1307,7 @@ def _retry_upload_after_category_open(
         client: Any,
         exc: Exception,
     ) -> dict[str, Any]:
+        ensure_not_stopped()
         exc_text = str(exc)
         if "保证金" in exc_text:
             checks = _category_checks(client, category_ids)
@@ -1323,10 +1357,12 @@ def _retry_upload_after_category_open(
         ) from exc
 
     if saved_application:
+        ensure_not_stopped()
         client = resolve_client()
         if progress is not None:
             progress("正在复查类目开通状态")
         checks = _category_checks(client, category_ids)
+        ensure_not_stopped()
         hard_error = _category_hard_failure(checks)
         if hard_error:
             raise CategoryAutoOpenError(
@@ -1380,14 +1416,18 @@ def _retry_upload_after_category_open(
             )
             and all(category_id in checks for category_id in category_ids)
         ):
+            ensure_not_stopped()
             if progress is not None:
                 progress("正在提交类目开通申请")
             try:
                 client.batch_add_categories(category_ids)
             except Exception as exc:
+                ensure_not_stopped()
                 return recover_apply_exception(client, exc)
+            ensure_not_stopped(category_applied=True)
             submitted = True
             checks = _category_checks(client, category_ids)
+            ensure_not_stopped(category_applied=True)
             hard_error = _category_hard_failure(checks)
             if hard_error:
                 raise CategoryAutoOpenError(
@@ -1432,6 +1472,7 @@ def _retry_upload_after_category_open(
         )
 
     try:
+        ensure_not_stopped()
         return upload()
     except Exception as exc:
         if _is_category_deposit_failure_error(exc):
@@ -1462,6 +1503,7 @@ def _retry_upload_after_category_open(
                 "未识别到商品目标叶子类目，无法自动申请；"
                 "请检查数据包类目字段或模板兜底类目"
             ) from exc
+        ensure_not_stopped()
         if progress is not None:
             progress("正在检查并申请目标类目")
         client = resolve_client()
@@ -1469,6 +1511,7 @@ def _retry_upload_after_category_open(
             try:
                 refreshed = refresh_categories()
             except Exception as refresh_exc:
+                ensure_not_stopped()
                 refresh_message = (
                     "平台类目错误后刷新类目失败，待核实："
                     + str(refresh_exc)[:500]
@@ -1493,6 +1536,7 @@ def _retry_upload_after_category_open(
                 ) from refresh_exc
             if not isinstance(refreshed, dict):
                 refreshed = {}
+            ensure_not_stopped()
             refresh_error = str(
                 refreshed.get("refresh_error")
                 or (
@@ -1575,11 +1619,15 @@ def _retry_upload_after_category_open(
             )
         if progress is not None:
             progress("正在提交类目开通申请")
+        ensure_not_stopped()
         try:
             client.batch_add_categories(category_ids)
         except Exception as apply_exc:
+            ensure_not_stopped()
             return recover_apply_exception(client, apply_exc)
+        ensure_not_stopped(category_applied=True)
         checks = _category_checks(client, category_ids)
+        ensure_not_stopped(category_applied=True)
         hard_error = _category_hard_failure(checks)
         if hard_error:
             raise CategoryAutoOpenError(
@@ -2816,6 +2864,31 @@ def _upload_source_relation(
 
 class TemplateRuleSkip(ValueError):
     """Raised when a template filter deliberately skips one product."""
+
+
+class UploadInterrupted(RuntimeError):
+    """The upload stopped at a safe boundary after a user control request."""
+
+    status = "cancelled"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category_ids: list[str] | None = None,
+        category_applied: bool = False,
+    ) -> None:
+        self.category_ids = list(category_ids or [])
+        self.category_applied = bool(category_applied)
+        super().__init__(message)
+
+
+class UploadCancelled(UploadInterrupted):
+    status = "cancelled"
+
+
+class UploadPaused(UploadInterrupted):
+    status = "paused"
 
 
 class CategoryApprovalPending(RuntimeError):

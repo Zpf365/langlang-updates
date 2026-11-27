@@ -27,7 +27,7 @@
 
 ### TASK-20261127-024 WebUI 类目错误按需刷新独立修复
 
-状态：`VERIFY`
+状态：`VERIFY`；第一次独立审查返工 `1/3`，等待复审。
 
 - 基线：`f96a6f0` / `v1.9.01`；独立分支
   `hotfix/upload-category-refresh-1.9.01.1`。
@@ -44,10 +44,16 @@
   失败时保留旧缓存并显示错误。
 - 失败回归直接驱动真实 `UploadRunner`，覆盖冻结/失效同店共享一次刷新及
   后续商品写入前阻断、刷新失败复用单一结果、可申请未申请类目申请后重试。
+- 第一次复审阻断修复：类目错误与历史失败识别均补充“禁用”；类目刷新返回、
+  类目申请前后和自动重试前检查取消/暂停，停止后不再申请或重写；远端写入
+  超时在取消/暂停下仍保持 `verification_pending`。
 - 定向证据：pytest `139 passed, 9 subtests passed`；Vitest
   `5 files / 27 tests passed`；production build 通过，`112 modules`；
   WebUI 上传/类目控制器定向 `8 passed`；Python 修改文件和定向测试
   `py_compile` 通过。
+- 返工 1/3 证据：pytest `145 passed, 2 skipped, 9 subtests passed`；Vitest
+  `5 files / 27 tests passed`；Python 修改文件和定向测试 `py_compile`
+  通过。按 CTO 边界本轮未 build。
 - 未验证边界：未用真实店铺触发平台类目冻结/失效错误，未执行真实类目申请、
   审核等待或恢复，也未验证真实资质/保证金不足响应；未部署或启动候选界面。
 

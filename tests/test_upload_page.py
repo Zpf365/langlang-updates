@@ -187,6 +187,41 @@ class UploadPageContractTests(unittest.TestCase):
         self.assertFalse(already_created["category_reprocess_available"])
         self.assertEqual(tasks[0]["status"], "needs_verification")
 
+    def test_disabled_legacy_category_failure_enters_safe_recovery(
+        self,
+    ) -> None:
+        tasks = [
+            {
+                "id": "legacy-disabled",
+                "items": [
+                    {
+                        "item_id": "legacy-disabled-item",
+                        "status": "failed",
+                        "message": "目标类目已禁用",
+                        "payload": {
+                            "head_imgs": [
+                                "https://example.invalid/1.jpg"
+                            ],
+                            "skus": [
+                                {"sale_price": 100, "stock_num": 1}
+                            ],
+                            "cats_v2": [
+                                {"cat_id": "1000"},
+                                {"cat_id": "2001"},
+                            ],
+                        },
+                    }
+                ],
+            }
+        ]
+
+        self.assertTrue(_recover_upload_tasks(tasks))
+        item = tasks[0]["items"][0]
+        self.assertEqual(item["status"], "waiting_category")
+        self.assertEqual(item["category_state"], "waiting")
+        self.assertTrue(item["category_auto_recovery"])
+        self.assertEqual(item["category_ids"], ["2001"])
+
     def test_1688_upload_keeps_source_code_and_creates_sku_mapping(
         self,
     ) -> None:

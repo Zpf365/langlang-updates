@@ -192,6 +192,11 @@ def test_old_template_false_still_auto_applies_category(
             "已失效",
             "刷新后的官方类目树未找到该叶子",
         ),
+        (
+            "目标类目已禁用，商品不可创建",
+            "已禁用",
+            "平台已禁用该叶子类目",
+        ),
     ],
 )
 def test_upload_runner_refreshes_unavailable_store_category_once_and_blocks_later_writes(
@@ -556,6 +561,234 @@ def test_upload_runner_applies_eligible_refreshed_category_and_retries_write(
     assert apply_calls == [("3001",)]
     assert task["items"][0]["status"] == "success"
     assert task["items"][0]["product_id"] == "WX-CATEGORY-REFRESHED"
+
+
+@pytest.mark.parametrize(
+    ("control_event", "expected_status"),
+    [
+        ("cancelled", "cancelled"),
+        ("paused", "paused"),
+    ],
+)
+@pytest.mark.parametrize(
+    "control_at",
+    [
+        "refresh",
+        "category_apply",
+    ],
+)
+def test_upload_runner_stops_category_actions_after_cancel_or_pause(
+    tmp_path: Path,
+    monkeypatch,
+    control_event: str,
+    expected_status: str,
+    control_at: str,
+) -> None:
+    db = Database(
+        tmp_path / f"upload-category-{control_event}-{control_at}.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Category stopped",
+        f"wx-category-{control_event}-{control_at}",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    refresh_calls = []
+    apply_calls = []
+    runner_holder = {}
+
+    def stop_runner() -> None:
+        getattr(runner_holder["runner"], control_event).set()
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            if len(product_calls) == 1:
+                raise WechatApiError("无该类目权限", code=6600145)
+            return {"product_id": "SHOULD-NOT-RETRY"}
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            refresh_calls.append((selected_store.id, refresh))
+            if control_at == "refresh":
+                stop_runner()
+            return {
+                "roots": [
+                    {
+                        "category_id": "1000",
+                        "children": [
+                            {
+                                "category_id": "3001",
+                                "application_state": "not_applied",
+                                "application_label": "未申请",
+                                "application_reason": "",
+                                "application_eligible": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class CategoryClient:
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": "effective",
+                    "label": "已生效",
+                    "reason": "",
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, category_ids):
+            apply_calls.append(tuple(category_ids))
+            if control_at == "category_apply":
+                stop_runner()
+            return {"success": True}
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+    task = {
+        "id": f"task-category-{control_event}-{control_at}",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "category stopped",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": f"item-category-{control_event}-{control_at}",
+                "source_product_id": "SOURCE-CATEGORY-STOPPED",
+                "title": "Category stopped product",
+                "price": 100,
+                "stock": 2,
+                "status": "pending",
+                "payload": {
+                    "title": "Category stopped product",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "3001"},
+                    ],
+                },
+            }
+        ],
+    }
+
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    )
+    runner_holder["runner"] = runner
+    runner.run([task])
+
+    assert product_calls == ["product"]
+    assert refresh_calls == [(store_id, True)]
+    if control_at == "refresh":
+        assert apply_calls == []
+    else:
+        assert apply_calls == [("3001",)]
+    assert task["items"][0]["status"] == expected_status
+
+
+@pytest.mark.parametrize(
+    "control_event",
+    [
+        "cancelled",
+        "paused",
+    ],
+)
+def test_upload_runner_preserves_unknown_write_after_cancel_or_pause(
+    tmp_path: Path,
+    control_event: str,
+) -> None:
+    db = Database(
+        tmp_path / f"upload-unknown-{control_event}.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Unknown write",
+        f"wx-unknown-{control_event}",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    runner_holder = {}
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            getattr(runner_holder["runner"], control_event).set()
+            raise TimeoutError("timed out")
+
+    task = {
+        "id": f"task-unknown-{control_event}",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "unknown write",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": f"item-unknown-{control_event}",
+                "source_product_id": "SOURCE-UNKNOWN-WRITE",
+                "title": "Unknown write product",
+                "price": 100,
+                "stock": 2,
+                "status": "pending",
+                "payload": {
+                    "title": "Unknown write product",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "3001"},
+                    ],
+                },
+            }
+        ],
+    }
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    )
+    runner_holder["runner"] = runner
+
+    runner.run([task])
+
+    assert product_calls == ["product"]
+    assert task["items"][0]["status"] == "verification_pending"
+    assert "结果未知" in task["items"][0]["message"]
 
 
 def test_upload_runner_waits_later_products_after_shared_category_application(
