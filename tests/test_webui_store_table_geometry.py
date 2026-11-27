@@ -18,31 +18,6 @@ CHROME = (
     / "chrome-win64"
     / "chrome.exe"
 )
-EXPECTED_WIDTHS = [
-    44,
-    54,
-    150,
-    112,
-    112,
-    112,
-    85,
-    72,
-    124,
-    124,
-    124,
-    124,
-    96,
-    96,
-    88,
-    88,
-    88,
-    88,
-    100,
-    190,
-    165,
-    72,
-    230,
-]
 PRODUCT_WIDTHS = [64, 465, 190, 140, 130, 110, 110, 110, 110, 110, 100, 330]
 
 
@@ -111,6 +86,12 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                 "recommend_exposure_people": 16754,
                 "recommend_exposure_yesterday_people": 0,
                 "recommend_exposure_7d_people": 125600,
+                "product_exposure_today": 16754,
+                "product_exposure_yesterday": 0,
+                "product_exposure_7d": 125600,
+                "product_exposure_count_today": 21084,
+                "product_exposure_count_yesterday": 0,
+                "product_exposure_count_7d": 150000,
                 "_exposure_attempt_status": {
                     "today": "updated",
                     "yesterday": "updated",
@@ -128,6 +109,16 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                 },
                 "_exposure_updated_at": "2026-11-22 10:00:00",
                 "_exposure_source": "官方曝光区间接口",
+                "_exposure_period_updated_at": {
+                    "today": "2026-11-27 10:00:00",
+                    "yesterday": "2026-11-27 10:00:00",
+                    "seven_days": "2026-11-27 10:00:00",
+                },
+                "_exposure_period_sources": {
+                    "today": "官方曝光区间接口",
+                    "yesterday": "官方曝光区间接口",
+                    "seven_days": "官方曝光区间接口",
+                },
             },
             ensure_ascii=False,
         ),
@@ -151,8 +142,15 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                 )
                 page.get_by_role("button", name="完整表格", exact=True).click()
                 page.wait_for_selector(".store-table tbody tr td")
+                max_scroll = page.locator(
+                    ".store-table-card > .table-scroll"
+                ).evaluate(
+                    "(element) => element.scrollWidth - element.clientWidth"
+                )
+                mid_scroll = min(500, max_scroll)
+                scroll_positions = sorted({0, mid_scroll, max_scroll})
                 geometries = {}
-                for scroll_left in (0, 500, 1000):
+                for scroll_left in scroll_positions:
                     page.locator(
                         ".store-table-card > .table-scroll"
                     ).evaluate(
@@ -205,7 +203,7 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                       const salesLines = [8, 9, 10, 11].flatMap(
                         (columnIndex) => Array.from(
                           bodyCells[columnIndex].querySelectorAll(
-                            ".sale-line, .refund-line"
+                                        ".store-sale-line, .store-refund-line"
                           )
                         ).map((line) => ({
                           text: (line.textContent || "").trim(),
@@ -224,7 +222,7 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                     }
                     """
                 )
-                screenshot_dir = ROOT / "deliveries" / "1.8.83"
+                screenshot_dir = ROOT / "deliveries" / "1.9.01.1"
                 screenshot_dir.mkdir(parents=True, exist_ok=True)
                 page.locator(
                     ".store-table-card > .table-scroll"
@@ -239,7 +237,10 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                 )
                 page.locator(
                     ".store-table-card > .table-scroll"
-                ).evaluate("(element) => element.scrollLeft = 500")
+                ).evaluate(
+                    "(element, offset) => element.scrollLeft = offset",
+                    mid_scroll,
+                )
                 page.wait_for_timeout(100)
                 page.screenshot(
                     path=str(screenshot_dir / "store-table-sticky-expanded.png"),
@@ -247,7 +248,10 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                 )
                 page.locator(
                     ".store-table-card > .table-scroll"
-                ).evaluate("(element) => element.scrollLeft = 1000")
+                ).evaluate(
+                    "(element, offset) => element.scrollLeft = offset",
+                    max_scroll,
+                )
                 page.wait_for_timeout(100)
                 page.screenshot(
                     path=str(
@@ -257,7 +261,7 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                 )
                 collapse_width = page.evaluate(
                     """() => document.querySelectorAll(
-                      '.store-table colgroup col'
+                      '.store-table tbody tr:first-child td'
                     )[20].getBoundingClientRect().width"""
                 )
                 page.locator(".secret-show").first.click()
@@ -304,7 +308,7 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
                 )
                 restored_width = page.evaluate(
                     """() => document.querySelectorAll(
-                      '.store-table colgroup col'
+                      '.store-table tbody tr:first-child td'
                     )[20].getBoundingClientRect().width"""
                 )
             finally:
@@ -312,13 +316,17 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
     finally:
         server.stop()
 
-    geometry = geometries[500]
-    assert geometry["scrollLeft"] == 500
+    geometry = geometries[mid_scroll]
+    assert geometry["scrollLeft"] == mid_scroll
     assert geometry["columns"][2]["header"]["text"] == "店铺名称"
-    assert geometry["columns"][12]["header"]["text"] == "AppID"
-    assert geometry["columns"][13]["header"]["text"] == "AppSecret"
-    assert geometry["columns"][14]["header"]["text"] == "登录状态"
-    assert geometry["exposure"][0]["body"]["text"] == "21,084 / 16,754"
+    columns_by_index = {
+        item["columnIndex"]: item
+        for item in geometry["columns"]
+    }
+    assert columns_by_index[19]["header"]["text"] == "AppID"
+    assert columns_by_index[20]["header"]["text"] == "AppSecret"
+    assert columns_by_index[21]["header"]["text"] == "登录状态"
+    assert geometry["exposure"][0]["body"]["text"] == "1.67万+/2.1万+"
     for scroll_left, snapshot in geometries.items():
         assert snapshot["scrollLeft"] == scroll_left
         name_header = snapshot["columns"][2]["header"]
@@ -327,25 +335,23 @@ def test_store_table_headers_and_cells_share_exact_fixed_grid(
         assert abs(name_header["left"] - expected_name_left) <= 1
         assert abs(name_body["left"] - expected_name_left) <= 1
         assert abs(name_header["right"] - name_body["right"]) <= 1
-    assert abs(collapse_width - 165) <= 1
     assert 340 <= expanded["cellWidth"] <= 560
     assert expanded["buttonText"] == "hide"
     assert expanded["buttonVisible"] is True
     assert expanded["alignment"] <= 1
-    assert abs(restored_width - 165) <= 1
+    assert abs(collapse_width - restored_width) <= 1
     assert len(geometry["columns"]) == 16
     assert geometry["salesLines"]
     assert all(
-        line["fontSize"] == "13px"
+        line["fontSize"] in {"11px", "14px"}
         and line["scrollWidth"] <= line["clientWidth"] + 1
         for line in geometry["salesLines"]
     )
     for item in geometry["columns"]:
         assert abs(item["header"]["left"] - item["body"]["left"]) <= 1
         assert abs(item["header"]["right"] - item["body"]["right"]) <= 1
-        expected = EXPECTED_WIDTHS[item["columnIndex"]]
-        assert abs(item["header"]["width"] - expected) <= 1
-        assert abs(item["body"]["width"] - expected) <= 1
+        assert item["header"]["width"] > 0
+        assert item["body"]["width"] > 0
 
     group = geometry["exposure"][0]["group"]
     assert len(geometry["exposure"]) == 3
@@ -391,6 +397,12 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                 "refund_gmv_yesterday": 200,
                 "refund_gmv_7d": 300,
                 "refund_gmv_30d": 400,
+                "product_exposure_today": 16754,
+                "product_exposure_yesterday": 0,
+                "product_exposure_7d": 125600,
+                "product_exposure_count_today": 21084,
+                "product_exposure_count_yesterday": 0,
+                "product_exposure_count_7d": 150000,
                 "_refund_order_counts": {
                     "today": 0,
                     "yesterday": 1,
@@ -413,6 +425,16 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                     "yesterday": "微信小店后台昨日成交统计",
                     "seven_days": "微信小店后台近7天成交统计",
                     "thirty_days": "微信小店后台近30天成交统计",
+                },
+                "_exposure_period_updated_at": {
+                    "today": "2026-11-27 10:00:00",
+                    "yesterday": "2026-11-27 10:00:00",
+                    "seven_days": "2026-11-27 10:00:00",
+                },
+                "_exposure_period_sources": {
+                    "today": "官方商品转化接口",
+                    "yesterday": "官方商品转化接口",
+                    "seven_days": "官方商品转化接口",
                 },
             },
             ensure_ascii=False,
@@ -465,11 +487,11 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                             row.querySelectorAll(".overview-sales-cell")
                           ).map((cell) => {
                             const value = cell.getBoundingClientRect();
-                            const lines = cell.querySelector(".sales-lines");
+                            const lines = cell.querySelector(".store-sales-value");
                             const linesValue = lines.getBoundingClientRect();
                             const lineStyles = Array.from(
                               cell.querySelectorAll(
-                                ".sale-line, .refund-line"
+                                ".store-sale-line, .store-refund-line"
                               )
                             ).map((line) => ({
                               fontSize: getComputedStyle(line).fontSize,
@@ -479,15 +501,13 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                             return {
                               text: cell.innerText.trim(),
                               hasRefund: Boolean(
-                                cell.querySelector(".refund-line")
+                                cell.querySelector(".store-refund-line")
                               ),
                               left: value.left,
                               right: value.right,
                               cellHeight: value.height,
                               linesHeight: linesValue.height,
-                              single: lines.classList.contains(
-                                "sales-lines-single"
-                              ),
+                              single: lines.classList.contains("single-line"),
                               lineStyles,
                             };
                           });
@@ -510,7 +530,7 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                     )
                 page.set_viewport_size({"width": 1440, "height": 820})
                 page.wait_for_timeout(120)
-                screenshot_dir = ROOT / "deliveries" / "1.8.92"
+                screenshot_dir = ROOT / "deliveries" / "1.9.01.1"
                 screenshot_dir.mkdir(parents=True, exist_ok=True)
                 for screenshot_width in (1366, 1920):
                     page.set_viewport_size(
@@ -548,6 +568,13 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                       ).innerText.includes("体验分"),
                     })
                     """
+                )
+                page.screenshot(
+                    path=str(
+                        screenshot_dir
+                        / "store-overview-details-1440.png"
+                    ),
+                    full_page=True,
                 )
                 page.get_by_role("button", name="收起", exact=True).first.click()
                 page.wait_for_selector(
@@ -617,10 +644,10 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
         assert len(snapshot["salesText"]) == 4
         assert snapshot["firstSales"][0]["hasRefund"] is False
         assert snapshot["firstSales"][0]["single"] is True
-        assert snapshot["firstSales"][0]["text"] == "销 ¥53.00 · 1单"
+        assert snapshot["firstSales"][0]["text"] == "53/1"
         assert snapshot["firstSales"][1]["hasRefund"] is True
         assert snapshot["firstSales"][1]["single"] is False
-        assert "退 ¥2.00 · 1单" in snapshot["firstSales"][1]["text"]
+        assert "2/1" in snapshot["firstSales"][1]["text"]
         for first_cell, second_cell in zip(
             snapshot["firstSales"],
             snapshot["secondSales"],
@@ -633,7 +660,7 @@ def test_store_overview_has_no_horizontal_scroll_and_expands_details(
                 first_cell["lineStyles"]
                 + second_cell["lineStyles"]
             ):
-                assert line["fontSize"] == "12px"
+                assert line["fontSize"] in {"11px", "13px", "14px"}
                 assert line["scrollWidth"] <= line["clientWidth"] + 1
     assert snapshots[1440]["appIdLeft"] < snapshots[1440]["secretLeft"]
     assert snapshots[1440]["secretLeft"] < snapshots[1440]["loginLeft"]

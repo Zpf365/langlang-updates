@@ -2417,11 +2417,11 @@ onBeforeUnmount(() => {
  }
 
  .store-overview-table .overview-sales-cell {
-   min-width: 124px;
+    min-width: 120px;
  }
 
  .store-overview-table .overview-credential-cell {
-   min-width: 118px;
+    min-width: 112px;
  }
 
  .store-overview-table tbody tr {

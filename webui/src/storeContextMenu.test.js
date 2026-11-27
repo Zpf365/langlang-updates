@@ -9,6 +9,10 @@ const desktop = readFileSync(
   new URL("../../weimi_manager/webui/desktop.py", import.meta.url),
   "utf8",
 );
+const salesValue = readFileSync(
+  new URL("./components/StoreSalesValue.vue", import.meta.url),
+  "utf8",
+);
 
 describe("store context menu contract", () => {
   it("uses a custom Chinese menu and suppresses browser context menus", () => {
@@ -47,7 +51,10 @@ describe("store context menu contract", () => {
   });
 
   it("shows metric provenance without exposing refund audit payloads", () => {
-    expect(page).toContain("salesPresentation(store, key).title");
+    expect(page).toContain(
+      '<StoreSalesValue :display="salesDisplayFor(store, key)" />',
+    );
+    expect(salesValue).toContain(':title="display.title"');
     expect(page).not.toContain("退款单量来源");
     expect(page).not.toContain("订单状态200覆盖证据");
   });
