@@ -71,6 +71,7 @@ AFTER_SALE_FULL_SYNC_DAYS = 30
 UPLOAD_CATEGORY_CACHE_SCHEMA = 1
 UPLOAD_CATEGORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 UPLOAD_CATEGORY_REFRESH_COOLDOWN_SECONDS = 60 * 60
+PRODUCT_BATCH_ACTION_SIZE = 20
 EXTERNAL_MARKETING_ATTRIBUTE_TOKENS = frozenset(
     {
         "是否外贸",
@@ -5264,6 +5265,496 @@ class SyncService:
         self._require_platform_write(store, "product_web_batch_action")
         private = ShopPrivateClient(self.db, store)
         return private.batch_product_action(product_ids, way)
+
+    def batch_delete_products(
+        self,
+        store: Store,
+        product_ids: list[str],
+        *,
+        batch_size: int = PRODUCT_BATCH_ACTION_SIZE,
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+        use_private_batch: bool = True,
+        hard_delete: bool = False,
+    ) -> dict[str, Any]:
+        """Recycle or permanently delete products through bounded batches.
+
+        When ``hard_delete`` is false, active products stop in the recycle bin.
+        When true, they are moved to the recycle bin and then permanently
+        deleted in the same task. Each platform write batch has one bounded
+        recycle-list read; the previous per-product full scan is intentionally
+        avoided.
+        """
+        self._require_platform_write(store, "product_web_batch_action")
+        ids = list(
+            dict.fromkeys(
+                str(product_id).strip()
+                for product_id in product_ids
+                if str(product_id or "").strip()
+            )
+        )
+        if not ids:
+            raise ValueError("至少选择一个商品")
+        chunk_size = max(1, min(int(batch_size or PRODUCT_BATCH_ACTION_SIZE), 100))
+        run_id = self.db.start_sync_run(store.id, "product_delete")
+        item_states: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        cancelled = False
+
+        def record(
+            product_id: str,
+            status: str,
+            message: str,
+            *,
+            action: str,
+            fallback_action: str = "",
+        ) -> None:
+            row = {
+                "store_id": store.id,
+                "product_id": product_id,
+                "status": status,
+                "message": message,
+                "action": action,
+            }
+            if fallback_action:
+                row["fallback_action"] = fallback_action
+            item_states[product_id] = row
+            if status in {"failed", "pending"}:
+                errors.append(f"{product_id}: {message}")
+            self.db.log_product_operation(
+                store.id,
+                product_id,
+                action,
+                status,
+                message,
+            )
+
+        if (
+            store.app_id == "demo-store"
+            or not use_private_batch
+        ):
+            active_ids = [
+                product_id
+                for product_id in ids
+                if int(
+                    (
+                        self.db.get_product(store.id, product_id)
+                        or {}
+                    ).get("status")
+                    or -1
+                )
+                != 6
+            ]
+            recycled_ids = [
+                product_id for product_id in ids if product_id not in active_ids
+            ]
+            if store.app_id == "demo-store":
+                for product_id in ids:
+                    self.db.remove_product_cache(store.id, product_id)
+                    record(
+                        product_id,
+                        "success",
+                        "演示店铺已从本地商品缓存移除",
+                        action="彻底删除" if product_id in recycled_ids else "移入回收站",
+                    )
+            else:
+                if active_ids and not (
+                    cancel_event is not None and cancel_event.is_set()
+                ):
+                    try:
+                        listing_result = self.set_products_listing(
+                            store,
+                            active_ids,
+                            False,
+                            progress=progress,
+                            cancel_event=cancel_event,
+                        )
+                        failed_prefixes = {
+                            str(value).split(":", 1)[0]
+                            for value in listing_result.errors
+                            if ":" in str(value)
+                        }
+                        fallback_success_remaining = int(
+                            listing_result.success or 0
+                        )
+                        for product_id in active_ids:
+                            if product_id in failed_prefixes:
+                                record(
+                                    product_id,
+                                    "failed",
+                                    next(
+                                        (
+                                            value
+                                            for value in listing_result.errors
+                                            if str(value).startswith(
+                                                f"{product_id}:"
+                                            )
+                                        ),
+                                        "安全降级下架失败",
+                                    ),
+                                    action="移入回收站",
+                                    fallback_action="商品下架",
+                                )
+                            elif listing_result.cancelled:
+                                if fallback_success_remaining > 0:
+                                    fallback_success_remaining -= 1
+                                    record(
+                                        product_id,
+                                        "failed",
+                                        "平台批量删除能力不可用；已安全降级为下架，"
+                                        "商品未删除",
+                                        action="移入回收站",
+                                        fallback_action="商品下架",
+                                    )
+                                else:
+                                    record(
+                                        product_id,
+                                        "cancelled",
+                                        "已取消，安全降级下架未确认",
+                                        action="移入回收站",
+                                        fallback_action="商品下架",
+                                    )
+                            else:
+                                record(
+                                    product_id,
+                                    "failed",
+                                    "平台批量删除能力不可用；已安全降级为下架，"
+                                    "商品未删除",
+                                    action="移入回收站",
+                                    fallback_action="商品下架",
+                                )
+                    except Exception as exc:
+                        for product_id in active_ids:
+                            record(
+                                product_id,
+                                "pending",
+                                "批量删除能力不可用，安全降级下架结果待核实：" + str(exc),
+                                action="移入回收站",
+                                fallback_action="商品下架",
+                            )
+                cancelled = bool(
+                    cancel_event is not None and cancel_event.is_set()
+                )
+                for product_id in active_ids:
+                    if cancelled and product_id not in item_states:
+                        record(
+                            product_id,
+                            "cancelled",
+                            "已取消，未执行平台写操作",
+                            action="移入回收站",
+                        )
+                for product_id in recycled_ids:
+                    if cancelled:
+                        record(
+                            product_id,
+                            "cancelled",
+                            "已取消，未执行彻底删除",
+                            action="彻底删除",
+                        )
+                    else:
+                        record(
+                            product_id,
+                            "failed",
+                            "当前店铺无网页批量删除能力，未执行彻底删除",
+                            action="彻底删除",
+                        )
+        else:
+            private = ShopPrivateClient(self.db, store)
+
+            def recycle_presence() -> set[str]:
+                products = private.scan_products(
+                    "recycle",
+                    max_pages=None,
+                    page_size=100,
+                )
+                return {
+                    str(product.product_id)
+                    for product in products
+                    if getattr(product, "product_id", "")
+                }
+
+            for offset in range(0, len(ids), chunk_size):
+                chunk = ids[offset : offset + chunk_size]
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    for product_id in ids[offset:]:
+                        record(
+                            product_id,
+                            "cancelled",
+                            "已取消，未执行平台写操作",
+                            action=(
+                                "彻底删除"
+                                if int(
+                                    (
+                                        self.db.get_product(
+                                            store.id,
+                                            product_id,
+                                        )
+                                        or {}
+                                    ).get("status")
+                                    or -1
+                                )
+                                == 6
+                                else "移入回收站"
+                            ),
+                        )
+                    break
+
+                to_recycle: list[str] = []
+                to_delete: list[str] = []
+                for product_id in chunk:
+                    product = self.db.get_product(store.id, product_id) or {}
+                    if int(product.get("status") or -1) == 6:
+                        to_delete.append(product_id)
+                    else:
+                        to_recycle.append(product_id)
+
+                recycled_confirmed: list[str] = []
+                if to_recycle:
+                    try:
+                        result = private.batch_product_action(
+                            to_recycle,
+                            "recycle",
+                        )
+                        if int(result.get("errcode") or 0) != 0:
+                            raise RuntimeError(
+                                str(
+                                    result.get("errmsg")
+                                    or "批量移入回收站接口返回失败"
+                                )
+                            )
+                    except Exception as exc:
+                        for product_id in to_recycle:
+                            record(
+                                product_id,
+                                "pending",
+                                "移入回收站请求结果未知，缓存已保留，待核实："
+                                + str(exc),
+                                action="移入回收站",
+                            )
+                    else:
+                        try:
+                            present = recycle_presence()
+                        except Exception as exc:
+                            for product_id in to_recycle:
+                                record(
+                                    product_id,
+                                    "pending",
+                                    "移入回收站请求已返回，但回收站回读失败，"
+                                    "缓存已保留，待核实：" + str(exc),
+                                    action=(
+                                        "彻底删除"
+                                        if hard_delete
+                                        else "移入回收站"
+                                    ),
+                                )
+                        else:
+                            recycled_confirmed = [
+                                product_id
+                                for product_id in to_recycle
+                                if product_id in present
+                            ]
+                            for product_id in to_recycle:
+                                if product_id not in present:
+                                    record(
+                                        product_id,
+                                        "failed",
+                                        "平台批量请求成功，但回收站未找到商品，"
+                                        "不标记删除成功",
+                                        action="移入回收站",
+                                    )
+                            if not hard_delete:
+                                for product_id in recycled_confirmed:
+                                    self.db.remove_product_cache(
+                                        store.id,
+                                        product_id,
+                                    )
+                                    record(
+                                        product_id,
+                                        "success",
+                                        "平台回收站已确认商品",
+                                        action="移入回收站",
+                                    )
+                                recycled_confirmed = []
+
+                real_candidates = [
+                    product_id
+                    for product_id in recycled_confirmed + to_delete
+                    if product_id not in item_states
+                ]
+                if (
+                    cancel_event is not None
+                    and cancel_event.is_set()
+                    and hard_delete
+                ):
+                    cancelled = True
+                    for product_id in recycled_confirmed:
+                        record(
+                            product_id,
+                            "pending",
+                            "已移入回收站、未彻底删除，缓存已保留，待核实",
+                            action="彻底删除",
+                        )
+                    for product_id in to_delete:
+                        if product_id not in item_states:
+                            record(
+                                product_id,
+                                "cancelled",
+                                "已取消，未执行彻底删除",
+                                action="彻底删除",
+                            )
+                elif hard_delete and real_candidates:
+                    try:
+                        result = private.batch_product_action(
+                            real_candidates,
+                            "real",
+                        )
+                        if int(result.get("errcode") or 0) != 0:
+                            raise RuntimeError(
+                                str(
+                                    result.get("errmsg")
+                                    or "批量彻底删除接口返回失败"
+                                )
+                            )
+                    except Exception as exc:
+                        for product_id in real_candidates:
+                            record(
+                                product_id,
+                                "pending",
+                                "彻底删除请求结果未知，缓存已保留，待核实："
+                                + str(exc),
+                                action="彻底删除",
+                            )
+                    else:
+                        try:
+                            remaining = recycle_presence()
+                        except Exception as exc:
+                            for product_id in real_candidates:
+                                record(
+                                    product_id,
+                                    "pending",
+                                    "彻底删除请求已返回，但回收站回读失败，"
+                                    "缓存已保留，待核实：" + str(exc),
+                                    action="彻底删除",
+                                )
+                        else:
+                            for product_id in real_candidates:
+                                if product_id not in remaining:
+                                    self.db.remove_product_cache(
+                                        store.id,
+                                        product_id,
+                                    )
+                                    record(
+                                        product_id,
+                                        "success",
+                                        "平台回收站已确认不存在该商品",
+                                        action="彻底删除",
+                                    )
+                                else:
+                                    record(
+                                        product_id,
+                                        "failed",
+                                        "平台回收站仍存在商品，彻底删除未生效",
+                                        action="彻底删除",
+                                    )
+
+                if progress:
+                    progress(
+                        f"正在批量删除 {min(offset + len(chunk), len(ids))}/{len(ids)}",
+                        min(offset + len(chunk), len(ids)),
+                        len(ids),
+                    )
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    for product_id in ids[offset + len(chunk):]:
+                        record(
+                            product_id,
+                            "cancelled",
+                            "已取消，未执行平台写操作",
+                            action=(
+                                "彻底删除"
+                                if int(
+                                    (
+                                        self.db.get_product(
+                                            store.id,
+                                            product_id,
+                                        )
+                                        or {}
+                                    ).get("status")
+                                    or -1
+                                )
+                                == 6
+                                else "移入回收站"
+                            ),
+                        )
+                    break
+
+        for product_id in ids:
+            if product_id not in item_states:
+                record(
+                    product_id,
+                    "pending",
+                    "没有获得明确的平台写入结论，缓存已保留，待核实",
+                    action=(
+                        "彻底删除"
+                        if int(
+                            (
+                                self.db.get_product(store.id, product_id)
+                                or {}
+                            ).get("status")
+                            or -1
+                        )
+                        == 6
+                        else "移入回收站"
+                    ),
+                )
+        items = [item_states[product_id] for product_id in ids]
+        counts = {
+            status: sum(
+                1 for row in items if row["status"] == status
+            )
+            for status in ("success", "failed", "cancelled", "pending")
+        }
+        cancelled = bool(
+            cancelled
+            and (
+                counts["cancelled"] > 0
+                or counts["pending"] > 0
+            )
+        )
+        if cancelled:
+            status = "cancelled"
+        elif counts["pending"]:
+            status = "verification_pending"
+        elif counts["failed"] and counts["success"]:
+            status = "partial"
+        elif counts["failed"]:
+            status = "failed"
+        else:
+            status = "completed"
+        message = (
+            f"批量删除已取消：成功 {counts['success']} 个，"
+            f"失败 {counts['failed']} 个，取消 {counts['cancelled']} 个，"
+            f"待核实 {counts['pending']} 个"
+            if cancelled
+            else (
+                f"批量删除：成功 {counts['success']} 个，"
+                f"失败 {counts['failed']} 个，待核实 {counts['pending']} 个"
+            )
+        )
+        self.db.finish_sync_run(
+            run_id,
+            status,
+            counts["success"],
+            message,
+        )
+        return {
+            "cancelled": cancelled,
+            "items": items,
+            "counts": counts,
+            "errors": errors[:100],
+            "message": message,
+        }
 
     def promote_products_to_league(
         self,

@@ -1,6 +1,6 @@
 # 澜琅下一阶段实施队列
 
-更新时间：2026-11-26（Asia/Shanghai）
+更新时间：2026-11-27（Asia/Shanghai）
 
 本文件是跨对话的持续任务清单。新实施对话开始工作前必须先读本文件，再读
 `AGENTS.md` 和当前候选验收报告。完成一项后更新状态、证据路径和版本，不删除
@@ -24,6 +24,24 @@
 - Release commit `26506b4` 与 `v1.9.01` 已推送，GitHub Release 已发布为 Latest。
 - 在线 manifest GET、ZIP 下载 URL GET Range 和 asset digest 均已回读一致。
 - 本机 `D:\WG\LangLang` 未覆盖、未重启。
+
+### 商品取消与批量删除热修复（TASK-20261127-008 / 012）
+
+状态：`VERIFY`
+
+- 分支：`hotfix/product-cancel-delete-1.9.01.1`；基线：`f96a6f0`。
+- 商品批量上架、下架、删除和撤回审核改为持久后台任务；
+  `products.batch.cancel` 在安全边界停止，未启动项记为已取消。
+- 商品刷新接入 `products.refresh.cancel`，当前页签请求结束后停止，
+  不进入后续页签或经营指标读取。
+- 删除按店铺拆分、按 20 件平台批量分块；销售中商品先移入回收站，
+  再分块彻底删除并逐阶段复核。结果逐项记录成功、失败、已取消或待核实；
+  无网页批量能力时安全降级下架。
+- 终态持久化到 `webui_product_task_jobs`，页面重进可恢复“已取消/待核实”。
+- 定向证据：商品相关 pytest `35 passed / 8 subtests`，WebUI controller
+  `10 passed`，network parity `3 passed`，Vitest `12 passed`，
+  `py_compile` 和 production build 通过。
+- 真实平台批量删除、彻底删除、撤回审核和刷新取消尚未验证；未发布、未部署。
 
 - 统筹总工负责任务拆分、文件锁、跨模块共享逻辑、回归、版本、候选包和发布签收。
 - 模块会话只在被明确派单后读取相关代码；不得提交 Git、打包、发布或覆盖本机。

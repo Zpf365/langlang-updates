@@ -13,11 +13,20 @@ import {
   nextProductSort,
   sortProducts,
 } from "../productSorting";
+import {
+  PRODUCT_BATCH_TERMINAL_STATUSES,
+  runProductBatchJob,
+} from "../productBatchOperations";
 
 const stores = ref([]);
 const products = ref([]);
 const loading = ref(false);
 const note = ref("");
+const refreshBusy = computed(() => (
+  loading.value
+  && Boolean(productProgress.jobId)
+  && ["starting", "running", "cancelling"].includes(productProgress.status)
+));
 const activeStatus = ref("all");
 const selectedIds = ref([]);
 const confirmAction = ref(null);
@@ -56,6 +65,14 @@ const actionProgress = reactive({
   total: 0,
   productId: "",
   status: "",
+  jobId: "",
+  cancelRequested: false,
+  counts: {
+    success: 0,
+    failed: 0,
+    cancelled: 0,
+    pending: 0,
+  },
 });
 const operationBusy = computed(() => actionProgress.busy);
 const filters = reactive({ store_id: "", search: "", min_price: "", max_price: "" });
@@ -68,6 +85,8 @@ const productProgress = reactive({
   current: 0,
   total: 0,
   message: "",
+  jobId: "",
+  cancelRequested: false,
 });
 const statusTabs = [
   ["all", "全部"],
@@ -124,20 +143,33 @@ const displayStart = computed(() => (
   displayedCount.value ? (currentPage.value - 1) * perPage.value + 1 : 0
 ));
 const displayEnd = computed(() => displayStart.value + Math.max(0, displayedCount.value - 1));
+function productSelectionKey(item) {
+  return `${Number(item.store_id || 0)}:${String(item.product_id || "")}`;
+}
+
 const selectedProducts = computed(() => products.value.filter((item) => (
-  selectedIds.value.includes(item.product_id)
+  selectedIds.value.includes(productSelectionKey(item))
 )));
 const allSelectedInRecycle = computed(() => (
   selectedProducts.value.length > 0
   && selectedProducts.value.every((item) => Number(item.status) === 6)
 ));
 const batchDeleteLabel = computed(() => (
-  allSelectedInRecycle.value
-    ? "批量彻底删除"
-    : selectedProducts.value.some((item) => Number(item.status) === 6)
-      ? "批量删除（混合）"
-      : "批量移入回收站"
+  selectedProducts.value.some((item) => Number(item.status) !== 6)
+    ? "批量彻底删除（含销售中）"
+    : "批量彻底删除"
 ));
+const confirmTitle = computed(() => {
+  if (confirmAction.value?.type === "delete") return "彻底删除商品";
+  if (confirmAction.value?.type === "recycle") return "移入回收站";
+  if (confirmAction.value?.type === "cancel_audit") return "批量撤回审核";
+  return confirmAction.value?.listed ? "批量上架" : "批量下架";
+});
+const confirmPrimaryLabel = computed(() => {
+  if (confirmAction.value?.type === "delete") return "确认彻底删除";
+  if (confirmAction.value?.type === "recycle") return "确认移入回收站";
+  return "确认执行";
+});
 const actionProgressPercent = computed(() => (
   actionProgress.total > 0
     ? Math.round(actionProgress.current / actionProgress.total * 100)
@@ -216,11 +248,17 @@ function recordLog(message) {
 
 function productOperationStatusLabel(status) {
   return {
+    completed: "已完成",
     success: "成功",
     failed: "失败",
     partial: "部分完成",
     pending: "待核实",
     running: "处理中",
+    starting: "准备中",
+    cancelling: "正在取消",
+    cancelled: "已取消",
+    paused: "已暂停",
+    verification_pending: "待核实",
   }[status] || status || "记录";
 }
 
@@ -253,6 +291,7 @@ async function changeStore() {
   currentPage.value = 1;
   await loadProducts();
   await loadOperationLogs();
+  await restoreProductTasks();
 }
 
 async function loadStores() {
@@ -313,7 +352,7 @@ async function locateQueriedProduct() {
     products.value = [product];
     filters.search = productId;
     activeStatus.value = "all";
-    selectedIds.value = [productId];
+    selectedIds.value = [productSelectionKey(product)];
     focusedProductId.value = productId;
     currentPage.value = 1;
     productFocusMessage.value = (
@@ -372,6 +411,8 @@ async function refreshProducts() {
   productProgress.current = 0;
   productProgress.total = 0;
   productProgress.message = "正在获取商品目录…";
+  productProgress.jobId = "";
+  productProgress.cancelRequested = false;
   recordLog(`开始获取商品，当前状态：${statusTabs.find(([key]) => key === activeStatus.value)?.[1] || "全部"}`);
   try {
     const statusToTab = {
@@ -392,29 +433,17 @@ async function refreshProducts() {
       search: filters.search,
       tab_keys: tabKeys,
     });
-    let job = null;
-    let lastLoggedPercent = -1;
-    while (true) {
-      job = await call("products.refresh.status", { job_id: started.job_id });
-      productProgress.status = job.status;
-      productProgress.current = Number(job.current || 0);
-      productProgress.total = Number(job.total || 0);
-      productProgress.message = job.message || "";
-      note.value = job.message || "正在读取商品…";
-      if (job.total > 0) {
-        const percent = Math.floor((Number(job.current || 0) / Number(job.total)) * 10) * 10;
-        if (percent > lastLoggedPercent) {
-          lastLoggedPercent = percent;
-          recordLog(`正在读取商品详情 ${job.current}/${job.total}`);
-        }
-      }
-      if (["completed", "partial"].includes(job.status)) break;
-      if (job.status === "failed") {
-        throw new Error(job.message || "商品刷新失败");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 350));
+    productProgress.jobId = started.job_id || "";
+    const job = await followProductRefreshJob(started.job_id);
+    if (job.status === "cancelled") {
+      note.value = job.message || "商品刷新已取消";
+      recordLog(note.value);
+      return;
     }
-    products.value = job.products || [];
+    if (job.status === "failed") {
+      throw new Error(job.message || "商品刷新失败");
+    }
+    products.value = job.products || products.value;
     const errors = job.errors || [];
     note.value = errors.length
       ? errors.join("；")
@@ -433,26 +462,70 @@ async function refreshProducts() {
   }
 }
 
-function isSelected(productId) {
-  return selectedIds.value.includes(productId);
+async function followProductRefreshJob(jobId) {
+  let job = null;
+  let lastLoggedPercent = -1;
+  while (true) {
+    job = await call("products.refresh.status", { job_id: jobId });
+    productProgress.status = job.status;
+    productProgress.current = Number(job.current || 0);
+    productProgress.total = Number(job.total || 0);
+    productProgress.message = job.message || "";
+    productProgress.cancelRequested = Boolean(job.cancel_requested);
+    note.value = job.message || "正在读取商品…";
+    if (job.total > 0) {
+      const percent = Math.floor((Number(job.current || 0) / Number(job.total)) * 10) * 10;
+      if (percent > lastLoggedPercent) {
+        lastLoggedPercent = percent;
+        recordLog(`正在读取商品详情 ${job.current}/${job.total}`);
+      }
+    }
+    if (
+      ["completed", "partial", "failed", "cancelled", "verification_pending"]
+        .includes(job.status)
+    ) {
+      return job;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
 }
 
-function toggleSelected(productId) {
-  selectedIds.value = isSelected(productId)
-    ? selectedIds.value.filter((id) => id !== productId)
-    : [...selectedIds.value, productId];
+async function cancelProductRefresh() {
+  if (!productProgress.jobId || productProgress.status === "cancelling") return;
+  try {
+    const job = await call("products.refresh.cancel", {
+      job_id: productProgress.jobId,
+    });
+    productProgress.status = job.status || "cancelling";
+    productProgress.message = job.message || "正在取消商品刷新";
+    productProgress.cancelRequested = true;
+    note.value = productProgress.message;
+  } catch (cause) {
+    note.value = cause instanceof Error ? cause.message : String(cause);
+  }
+}
+
+function isSelected(product) {
+  return selectedIds.value.includes(productSelectionKey(product));
+}
+
+function toggleSelected(product) {
+  const key = productSelectionKey(product);
+  selectedIds.value = isSelected(product)
+    ? selectedIds.value.filter((id) => id !== key)
+    : [...selectedIds.value, key];
 }
 
 function togglePage() {
-  const pageIds = pagedProducts.value.map((item) => item.product_id);
-  selectedIds.value = pageIds.every((id) => isSelected(id))
+  const pageIds = pagedProducts.value.map(productSelectionKey);
+  selectedIds.value = pageIds.every((id) => selectedIds.value.includes(id))
     ? selectedIds.value.filter((id) => !pageIds.includes(id))
     : [...new Set([...selectedIds.value, ...pageIds])];
 }
 
 function toggleAllPages() {
-  const pageIds = filtered.value.map((item) => item.product_id);
-  selectedIds.value = pageIds.every((id) => isSelected(id))
+  const pageIds = filtered.value.map(productSelectionKey);
+  selectedIds.value = pageIds.every((id) => selectedIds.value.includes(id))
     ? selectedIds.value.filter((id) => !pageIds.includes(id))
     : [...new Set(selectedIds.value.concat(pageIds))];
 }
@@ -466,17 +539,177 @@ async function setListing(listed) {
 }
 
 function setSingleListing(product, listed) {
-  selectedIds.value = [product.product_id];
+  selectedIds.value = [productSelectionKey(product)];
   confirmAction.value = { type: "listing", listed };
 }
 
 function setSingleDelete(product) {
-  selectedIds.value = [product.product_id];
+  selectedIds.value = [productSelectionKey(product)];
   confirmAction.value = { type: "delete" };
 }
 
 function singleDeleteLabel(product) {
   return Number(product.status) === 6 ? "彻底删除" : "删除";
+}
+
+function setSingleRecycle(product) {
+  selectedIds.value = [productSelectionKey(product)];
+  confirmAction.value = { type: "recycle" };
+}
+
+function applyBatchProgress(job, type, label) {
+  actionProgress.type = type;
+  actionProgress.label = label;
+  actionProgress.jobId = String(job.job_id || actionProgress.jobId || "");
+  actionProgress.status = job.status || "running";
+  actionProgress.current = Number(job.current || 0);
+  actionProgress.total = Number(job.total || actionProgress.total || 0);
+  actionProgress.productId = String(job.active_product_id || "");
+  actionProgress.cancelRequested = Boolean(job.cancel_requested);
+  actionProgress.counts = {
+    success: Number(job.counts?.success ?? job.success ?? 0),
+    failed: Number(job.counts?.failed ?? job.failed ?? 0),
+    cancelled: Number(job.counts?.cancelled ?? job.cancelled_count ?? 0),
+    pending: Number(job.counts?.pending ?? job.pending ?? 0),
+  };
+  if (job.message) note.value = job.message;
+}
+
+async function runSelectedBatch(action, rows, label, type) {
+  if (operationBusy.value) return;
+  if (!rows.length) {
+    note.value = "请先选择商品";
+    return;
+  }
+  actionProgress.busy = true;
+  actionProgress.type = type;
+  actionProgress.label = label;
+  actionProgress.current = 0;
+  actionProgress.total = rows.length;
+  actionProgress.productId = "";
+  actionProgress.status = "starting";
+  actionProgress.jobId = "";
+  actionProgress.cancelRequested = false;
+  actionProgress.counts = {
+    success: 0,
+    failed: 0,
+    cancelled: 0,
+    pending: 0,
+  };
+  try {
+    const job = await runProductBatchJob({
+      rows,
+      action,
+      request: call,
+      onUpdate: (currentJob) => applyBatchProgress(currentJob, type, label),
+    });
+    applyBatchProgress(job, type, label);
+    const finalMessage = job.message || `${label}${productOperationStatusLabel(job.status)}`;
+    recordLog(finalMessage);
+    await loadProducts();
+    await loadOperationLogs();
+    note.value = finalMessage;
+  } catch (cause) {
+    actionProgress.status = "failed";
+    note.value = cause instanceof Error ? cause.message : String(cause);
+    recordLog(`${label}失败：${note.value}`);
+  } finally {
+    actionProgress.busy = false;
+    actionProgress.productId = "";
+  }
+}
+
+async function cancelCurrentOperation() {
+  if (!actionProgress.jobId || actionProgress.status === "cancelling") return;
+  try {
+    const job = await call("products.batch.cancel", {
+      job_id: actionProgress.jobId,
+    });
+    applyBatchProgress(job, actionProgress.type, actionProgress.label);
+    note.value = job.message || "正在取消；当前请求结束后停止";
+  } catch (cause) {
+    note.value = cause instanceof Error ? cause.message : String(cause);
+  }
+}
+
+async function resumeProductBatchTask(task) {
+  const type = task.action || "delete";
+  const label = task.label || "商品批量操作";
+  actionProgress.busy = true;
+  applyBatchProgress(task, type, label);
+  try {
+    let job = task;
+    while (
+      !PRODUCT_BATCH_TERMINAL_STATUSES.has(job.status)
+      && job.status !== "paused"
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      job = await call("products.batch.status", { job_id: task.job_id });
+      applyBatchProgress(job, type, label);
+    }
+    const finalMessage = job.message || `${label}${productOperationStatusLabel(job.status)}`;
+    if (job.status !== "paused") {
+      await loadProducts();
+      await loadOperationLogs();
+    }
+    note.value = finalMessage;
+  } catch (cause) {
+    note.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    actionProgress.busy = false;
+  }
+}
+
+async function restoreProductTasks() {
+  try {
+    const payload = {};
+    if (filters.store_id && !isAllStores.value) {
+      payload.store_id = filters.store_id;
+    }
+    const tasks = (await call("products.tasks.list", payload)).tasks || [];
+    const task = tasks[0];
+    if (!task || (task.status === "failed" && !task.items?.length)) return;
+    if (task.kind === "refresh") {
+      productProgress.jobId = task.job_id;
+      productProgress.status = task.status;
+      productProgress.current = Number(task.current || 0);
+      productProgress.total = Number(task.total || 0);
+      productProgress.message = task.message || "";
+      productProgress.cancelRequested = Boolean(task.cancel_requested);
+      if (task.status === "paused") {
+        note.value = task.message || "商品刷新已随旧账户暂停";
+      } else if (!PRODUCT_BATCH_TERMINAL_STATUSES.has(task.status)) {
+        loading.value = true;
+        const job = await followProductRefreshJob(task.job_id);
+        if (job.status === "cancelled") {
+          note.value = job.message || "商品刷新已取消";
+        } else if (job.status === "failed") {
+          note.value = job.message || "商品刷新失败";
+        } else {
+          products.value = job.products || products.value;
+          note.value = job.message || note.value;
+        }
+        loading.value = false;
+      } else {
+        note.value = task.message || note.value;
+      }
+      return;
+    }
+    if (task.kind === "batch") {
+      const type = task.action || "delete";
+      const label = task.label || "商品批量操作";
+      applyBatchProgress(task, type, label);
+      if (task.status === "paused") {
+        note.value = task.message || "商品批量操作已随旧账户暂停";
+      } else if (!PRODUCT_BATCH_TERMINAL_STATUSES.has(task.status)) {
+        await resumeProductBatchTask(task);
+      } else {
+        note.value = task.message || note.value;
+      }
+    }
+  } catch (cause) {
+    note.value = cause instanceof Error ? cause.message : String(cause);
+  }
 }
 
 async function performListing() {
@@ -488,49 +721,12 @@ async function performListing() {
   }
   const listed = confirmAction.value.listed;
   confirmAction.value = null;
-  actionProgress.busy = true;
-  actionProgress.type = listed ? "listing" : "delisting";
-  actionProgress.label = listed ? "批量上架" : "批量下架";
-  actionProgress.current = 0;
-  actionProgress.total = rows.length;
-  actionProgress.productId = "";
-  actionProgress.status = "running";
-  const failures = [];
-  try {
-    for (const [index, row] of rows.entries()) {
-      actionProgress.productId = row.product_id;
-      try {
-        const result = await call("products.set-listing", {
-          store_id: row.store_id,
-          product_ids: [row.product_id],
-          listed,
-        });
-        if (Number(result.failed || 0) > 0 || result.cancelled) {
-          throw new Error(
-            result.errors?.[0]
-            || result.message
-            || `商品 ${row.product_id} 上架状态未确认成功`,
-          );
-        }
-      } catch (cause) {
-        failures.push(`${row.product_id}: ${cause instanceof Error ? cause.message : String(cause)}`);
-      }
-      actionProgress.current = index + 1;
-    }
-    await loadProducts();
-    await loadOperationLogs();
-    actionProgress.status = failures.length
-      ? (failures.length === rows.length ? "failed" : "partial")
-      : "success";
-    note.value = failures.length
-      ? `${listed ? "批量上架" : "批量下架"}完成：成功 ${rows.length - failures.length} 个，失败 ${failures.length} 个：${failures.slice(0, 2).join("；")}`
-      : `${listed ? "批量上架" : "批量下架"}完成：成功 ${rows.length} 个`;
-  } catch (cause) {
-    note.value = cause instanceof Error ? cause.message : String(cause);
-  } finally {
-    actionProgress.busy = false;
-    actionProgress.productId = "";
-  }
+  await runSelectedBatch(
+    listed ? "listing" : "delisting",
+    rows,
+    listed ? "批量上架" : "批量下架",
+    listed ? "listing" : "delisting",
+  );
 }
 
 async function performDelete() {
@@ -541,52 +737,46 @@ async function performDelete() {
     return;
   }
   confirmAction.value = null;
-  actionProgress.busy = true;
-  actionProgress.type = "delete";
   const recycleCount = rows.filter((row) => Number(row.status) === 6).length;
   const operationLabel = recycleCount === rows.length
     ? "批量彻底删除"
     : recycleCount > 0
       ? "批量删除（回收站彻底删除 / 其他移入回收站）"
       : "批量移入回收站";
-  actionProgress.label = operationLabel;
-  actionProgress.current = 0;
-  actionProgress.total = rows.length;
-  actionProgress.productId = "";
-  actionProgress.status = "running";
-  const failures = [];
-  try {
-    for (const [index, row] of rows.entries()) {
-      actionProgress.productId = row.product_id;
-      try {
-        await call("products.delete", {
-          store_id: row.store_id,
-          product_id: row.product_id,
-        });
-      } catch (cause) {
-        failures.push(`${row.product_id}: ${cause instanceof Error ? cause.message : String(cause)}`);
-      }
-      actionProgress.current = index + 1;
-    }
-    await loadProducts();
-    await loadOperationLogs();
-    actionProgress.status = failures.length
-      ? (failures.length === rows.length ? "failed" : "partial")
-      : "success";
-    note.value = failures.length
-      ? `${operationLabel}完成：成功 ${rows.length - failures.length} 个，失败或待核实 ${failures.length} 个：${failures.slice(0, 2).join("；")}`
-      : `${operationLabel}完成：成功 ${rows.length} 个`;
-  } catch (cause) {
-    note.value = cause instanceof Error ? cause.message : String(cause);
-  } finally {
-    actionProgress.busy = false;
-    actionProgress.productId = "";
+  await runSelectedBatch("delete", rows, operationLabel, "delete");
+}
+
+async function performRecycle() {
+  if (operationBusy.value) return;
+  const rows = selectedProducts.value.slice();
+  if (!rows.length) {
+    note.value = "请先选择商品";
+    return;
   }
+  if (rows.every((row) => Number(row.status) === 6)) {
+    note.value = "所选商品均已在回收站";
+    return;
+  }
+  confirmAction.value = null;
+  await runSelectedBatch(
+    "recycle",
+    rows,
+    "批量移入回收站",
+    "recycle",
+  );
+}
+
+async function confirmCurrentAction() {
+  const type = confirmAction.value?.type;
+  if (type === "delete") await performDelete();
+  else if (type === "recycle") await performRecycle();
+  else if (type === "cancel_audit") await performCancelAudit();
+  else await performListing();
 }
 
 function setCancelAudit(product = null) {
   if (product) {
-    selectedIds.value = [product.product_id];
+    selectedIds.value = [productSelectionKey(product)];
   }
   if (!selectedIds.value.length) {
     note.value = "请先选择商品";
@@ -597,52 +787,18 @@ function setCancelAudit(product = null) {
 
 async function performCancelAudit() {
   if (operationBusy.value) return;
-  const productIds = selectedIds.value.slice();
-  if (!productIds.length) {
+  const rows = selectedProducts.value.slice();
+  if (!rows.length) {
     note.value = "请先选择商品";
     return;
   }
   confirmAction.value = null;
-  actionProgress.busy = true;
-  actionProgress.type = "cancel_audit";
-  actionProgress.label = "批量撤回审核";
-  actionProgress.current = 0;
-  actionProgress.total = productIds.length;
-  actionProgress.productId = "";
-  actionProgress.status = "running";
-  const failures = [];
-  try {
-    const rows = selectedProducts.value.filter((row) => productIds.includes(row.product_id));
-    for (const [index, row] of rows.entries()) {
-      const productId = row.product_id;
-      actionProgress.productId = productId;
-      try {
-        await call("products.cancel-audit", {
-          store_id: row.store_id,
-          product_id: productId,
-        });
-      } catch (cause) {
-        failures.push(`${productId}: ${cause instanceof Error ? cause.message : String(cause)}`);
-      }
-      actionProgress.current = index + 1;
-    }
-    await loadProducts();
-    await loadOperationLogs();
-    actionProgress.status = failures.length
-      ? (failures.length === productIds.length ? "failed" : "partial")
-      : "success";
-    note.value = failures.length
-      ? `批量撤回审核完成：成功 ${productIds.length - failures.length} 个，失败 ${failures.length} 个：${failures.slice(0, 2).join("；")}`
-      : `已撤回 ${productIds.length} 个商品的审核`;
-    recordLog(note.value);
-  } catch (cause) {
-    actionProgress.status = "failed";
-    note.value = cause instanceof Error ? cause.message : String(cause);
-    recordLog(note.value);
-  } finally {
-    actionProgress.busy = false;
-    actionProgress.productId = "";
-  }
+  await runSelectedBatch(
+    "cancel_audit",
+    rows,
+    "批量撤回审核",
+    "cancel_audit",
+  );
 }
 
 async function openProductStock(product) {
@@ -703,6 +859,14 @@ async function copyTagLink(product) {
   actionProgress.total = 1;
   actionProgress.productId = product.product_id;
   actionProgress.status = "running";
+  actionProgress.jobId = "";
+  actionProgress.cancelRequested = false;
+  actionProgress.counts = {
+    success: 0,
+    failed: 0,
+    cancelled: 0,
+    pending: 0,
+  };
   try {
     const result = await call("products.taglink", {
       store_id: product.store_id,
@@ -735,6 +899,14 @@ async function openOfficialProduct(product) {
   actionProgress.total = 1;
   actionProgress.productId = product.product_id;
   actionProgress.status = "running";
+  actionProgress.jobId = "";
+  actionProgress.cancelRequested = false;
+  actionProgress.counts = {
+    success: 0,
+    failed: 0,
+    cancelled: 0,
+    pending: 0,
+  };
   note.value = "正在定位并打开商品官方后台…";
   try {
     const started = await call("products.open-official", {
@@ -801,6 +973,7 @@ onMounted(async () => {
     await loadProducts();
   }
   await loadOperationLogs();
+  await restoreProductTasks();
 });
 </script>
 
@@ -848,6 +1021,15 @@ onMounted(async () => {
     <div v-if="loading" class="product-loading-bar">
       <span class="loading-dot" />
       <span>{{ productProgress.message || "正在从微信小店实时读取商品…" }}</span>
+      <button
+        v-if="refreshBusy"
+        class="btn danger product-refresh-cancel"
+        type="button"
+        :disabled="productProgress.status === 'cancelling'"
+        @click="cancelProductRefresh"
+      >
+        {{ productProgress.status === "cancelling" ? "正在取消…" : "取消刷新" }}
+      </button>
     </div>
 
     <div v-if="productFocusMessage" class="product-focus-banner" role="status">
@@ -859,7 +1041,7 @@ onMounted(async () => {
       <label>
         <input
           type="checkbox"
-          :checked="pagedProducts.length > 0 && pagedProducts.every((item) => isSelected(item.product_id))"
+          :checked="pagedProducts.length > 0 && pagedProducts.every((item) => isSelected(item))"
           @change="togglePage"
         />
         全选当前页
@@ -871,6 +1053,7 @@ onMounted(async () => {
       <button class="btn primary" type="button" :disabled="!selectedIds.length || operationBusy" @click="setListing(true)">批量上架</button>
       <button class="btn muted" type="button" :disabled="!selectedIds.length || operationBusy" @click="setListing(false)">{{ actionProgress.type === "delisting" && operationBusy ? `下架中 ${actionProgress.current}/${actionProgress.total}` : "批量下架" }}</button>
        <button class="btn muted" type="button" :disabled="!selectedIds.length || operationBusy" @click="setCancelAudit()">{{ actionProgress.type === "cancel_audit" && operationBusy ? `撤回审核中 ${actionProgress.current}/${actionProgress.total}` : "批量撤回审核" }}</button>
+      <button class="btn muted" type="button" :disabled="!selectedIds.length || operationBusy || allSelectedInRecycle" @click="confirmAction = { type: 'recycle' }">{{ actionProgress.type === "recycle" && operationBusy ? `移入回收站中 ${actionProgress.current}/${actionProgress.total}` : "批量移入回收站" }}</button>
       <button class="btn danger" type="button" :disabled="!selectedIds.length || operationBusy" @click="confirmAction = { type: 'delete' }">{{ actionProgress.type === "delete" && operationBusy ? `${batchDeleteLabel}中 ${actionProgress.current}/${actionProgress.total}` : batchDeleteLabel }}</button>
       <button class="btn amber" type="button" disabled title="当前服务端未提供跨店复制接口">复制到其他店铺</button>
     </div>
@@ -879,7 +1062,20 @@ onMounted(async () => {
       <span v-if="actionProgress.busy" class="loading-dot" />
       <strong>{{ actionProgress.label }} · {{ productOperationStatusLabel(actionProgress.status) }}</strong>
       <span>{{ actionProgress.current }} / {{ actionProgress.total }}</span>
+      <button
+        v-if="actionProgress.busy && actionProgress.jobId"
+        class="btn danger"
+        type="button"
+        :disabled="!actionProgress.jobId || actionProgress.status === 'cancelling'"
+        @click="cancelCurrentOperation"
+      >
+        {{ actionProgress.status === "cancelling" ? "正在取消…" : "取消操作" }}
+      </button>
       <small v-if="actionProgress.productId">当前商品 {{ actionProgress.productId }}</small>
+      <small>
+        成功 {{ actionProgress.counts.success }} · 失败 {{ actionProgress.counts.failed }}
+        · 已取消 {{ actionProgress.counts.cancelled }} · 待核实 {{ actionProgress.counts.pending }}
+      </small>
       <div class="operation-progress-track"><i :style="{ width: `${actionProgressPercent}%` }" /></div>
     </div>
 
@@ -930,7 +1126,7 @@ onMounted(async () => {
                 :class="{ 'focused-product-row': focusedProductId === product.product_id }"
                 :data-product-id="product.product_id"
               >
-                <td><input type="checkbox" :checked="isSelected(product.product_id)" @change="toggleSelected(product.product_id)" /></td>
+                <td><input type="checkbox" :checked="isSelected(product)" @change="toggleSelected(product)" /></td>
                 <td class="product-title-cell">
                   <div class="product-title">
                     <span class="product-thumb">
@@ -955,6 +1151,7 @@ onMounted(async () => {
                   <button type="button" :disabled="operationBusy" @click="copyTagLink(product)">短链</button>
                   <button type="button" :disabled="operationBusy" @click="openOfficialProduct(product)">后台</button>
                   <button type="button" :disabled="operationBusy" @click="setCancelAudit(product)">撤回审核</button>
+                  <button type="button" :disabled="operationBusy || Number(product.status) === 6" title="移入回收站" @click="setSingleRecycle(product)">回收站</button>
                   <button class="red" type="button" :disabled="operationBusy" @click="setSingleDelete(product)">{{ singleDeleteLabel(product) }}</button>
                 </td>
               </tr>
@@ -1045,17 +1242,13 @@ onMounted(async () => {
 
     <ModalDialog
       :open="Boolean(confirmAction)"
-      :title="confirmAction?.type === 'delete'
-        ? (allSelectedInRecycle ? '彻底删除商品' : '删除商品')
-        : (confirmAction?.type === 'cancel_audit'
-          ? '批量撤回审核'
-          : (confirmAction?.listed ? '批量上架' : '批量下架'))"
+      :title="confirmTitle"
       :subtitle="`已选择 ${selectedIds.length} 个商品`"
       width="520px"
       @close="confirmAction = null"
     >
-      <p v-if="confirmAction?.type === 'delete' && allSelectedInRecycle">所选商品已在回收站。彻底删除操作不可恢复，将逐件调用官方真实删除并重新读取回收站确认；平台仍存在时不会显示成功。</p>
-      <p v-else-if="confirmAction?.type === 'delete'">不在回收站的商品会移入回收站；已在回收站的商品会执行不可恢复的彻底删除。系统将逐件远程复核并记录结果。</p>
+      <p v-if="confirmAction?.type === 'delete'">彻底删除不可恢复。所选销售中商品会先按店铺和平台批量上限分块移入回收站，再分块彻底删除并回读确认；平台回收站仍存在时不会显示成功，无法使用平台批量删除时会安全降级为下架。</p>
+      <p v-else-if="confirmAction?.type === 'recycle'">所选商品会按店铺和平台批量上限分块移入回收站，不会执行彻底删除。操作可取消，并逐项记录成功、失败、取消或待核实。</p>
       <p v-else-if="confirmAction?.type === 'cancel_audit'">将从微信小店撤回所选商品当前提交中的审核，并记录每个商品的执行结果。</p>
       <p v-else>该操作会调用所选店铺的实时商品接口，并记录执行结果。</p>
       <template #footer>
@@ -1065,12 +1258,8 @@ onMounted(async () => {
           :class="confirmAction?.type === 'delete' ? 'danger' : 'primary'"
           type="button"
           :disabled="operationBusy"
-          @click="confirmAction?.type === 'delete'
-            ? performDelete()
-            : (confirmAction?.type === 'cancel_audit' ? performCancelAudit() : performListing())"
-        >{{ confirmAction?.type === 'delete'
-          ? (allSelectedInRecycle ? '确认彻底删除' : '确认删除')
-          : '确认执行' }}</button>
+          @click="confirmCurrentAction"
+        >{{ confirmPrimaryLabel }}</button>
       </template>
     </ModalDialog>
 
@@ -1219,6 +1408,12 @@ onMounted(async () => {
   font-size: 12px;
 }
 
+.product-refresh-cancel {
+  margin-left: auto;
+  height: 28px;
+  padding: 0 12px;
+}
+
 .product-focus-banner {
   min-height: 38px;
   margin: -4px 0 10px;
@@ -1287,7 +1482,7 @@ onMounted(async () => {
   margin: -4px 72px 8px 0;
   padding: 9px 14px;
   display: grid;
-  grid-template-columns: auto auto auto minmax(120px, 1fr);
+  grid-template-columns: auto auto auto auto minmax(120px, 1fr);
   align-items: center;
   gap: 10px;
   border: 1px solid #b9d5f7;
@@ -1309,12 +1504,30 @@ onMounted(async () => {
   background: #fff5f6;
 }
 
+.product-operation-banner.cancelling {
+  border-color: #e5c48e;
+  color: #8a6118;
+  background: #fff9ec;
+}
+
+.product-operation-banner.cancelled {
+  border-color: #cfd5dc;
+  color: #5e6872;
+  background: #f5f7f9;
+}
+
 .product-operation-banner small {
   grid-column: 1 / -1;
   color: #70808e;
 }
 
+.product-operation-banner > .btn {
+  height: 30px;
+  padding: 0 11px;
+}
+
 .operation-progress-track {
+  grid-column: 1 / -1;
   height: 5px;
   overflow: hidden;
   border-radius: 99px;
