@@ -11,7 +11,7 @@
 
 ### 公开发布：澜琅 1.9.01
 
-状态：`RELEASE_PENDING`
+状态：`DONE_PUBLISHED`
 
 - 用户已明确授权“安全合规版本尽快上架”。
 - 从已验收内部候选 `12b80ae` / `1.9.00.1` 创建独立公开分支。
@@ -21,6 +21,9 @@
 - 本轮不覆盖、不重启 `D:\WG\LangLang`。
 - 本地最终包与 manifest 已核验；ZIP SHA256 为
   `44a8ed2d0cab682d22a4f8f360ab7671f7f4bb95c1be138c77263b8eb0022059`。
+- Release commit `26506b4` 与 `v1.9.01` 已推送，GitHub Release 已发布为 Latest。
+- 在线 manifest GET、ZIP 下载 URL GET Range 和 asset digest 均已回读一致。
+- 本机 `D:\WG\LangLang` 未覆盖、未重启。
 
 - 统筹总工负责任务拆分、文件锁、跨模块共享逻辑、回归、版本、候选包和发布签收。
 - 模块会话只在被明确派单后读取相关代码；不得提交 Git、打包、发布或覆盖本机。
