@@ -1649,7 +1649,10 @@ class ShopPrivateClient:
         if result.get("success") is not True and not (
             "ret" in result and _as_int(result["ret"], -1) == 0
         ):
-            raise ShopPrivateError("商品操作没有返回明确成功确认，请重新查询并核对微信后台")
+            raise ShopPrivateWriteUncertainError(
+                "商品操作没有返回明确成功确认，写入结果待核实，"
+                "请重新查询并核对微信后台"
+            )
         return result
 
     def realtime_overview(self) -> dict[str, Any]:

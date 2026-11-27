@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -52,6 +52,10 @@ from ..runtime_logging import (
     get_runtime_log_manager,
     log_event,
 )
+from ..store_refresh_pool import (
+    resolve_store_refresh_workers,
+    run_store_refresh_queue,
+)
 from ..transit_shipping import (
     TransitShippingError,
     TransitShippingManager,
@@ -79,6 +83,10 @@ from .logistics_monitor import logistics_monitor_payload
 from .clipboard import write_clipboard_text
 from .store_import import parse_store_import_source
 from ..team_service import TeamService
+from ..task_control import (
+    GlobalTaskPauseGate,
+    TaskPauseStateError,
+)
 from ..upload_violations import (
     build_cloud_counterfeit_rows,
     build_upload_violation_titles,
@@ -88,6 +96,42 @@ from ..upload_violations import (
     mandatory_upload_violation_issue,
     real_logged_in_stores,
 )
+
+
+GLOBAL_PAUSE_CONTROLLED_ACTIONS = frozenset(
+    {
+        "startup.refresh.start",
+        "stores.refresh",
+        "stores.refresh.start",
+        "products.refresh",
+        "products.refresh.start",
+        "products.delete",
+        "products.cancel-audit",
+        "products.set-listing",
+        "products.update-stock",
+        "products.upload-images",
+        "orders.sync",
+        "orders.refresh-one",
+        "orders.quick-refresh.start",
+        "orders.after-sales.sync",
+        "orders.after-sales.action",
+        "activity.apply",
+        "activity.submit-items",
+        "activity.renewal.scan.start",
+        "upload.run.start",
+        "automation.tasks.run-start",
+        "hosted.execute",
+        "violations.refresh",
+        "violations.sync-platform-blacklist",
+        "procurement.sync",
+        "transit.shipping.apply",
+        "storefront.action",
+    }
+)
+
+
+class _BackgroundTaskStopped(RuntimeError):
+    """The owning account or task was cancelled while waiting for control."""
 
 
 PRIMARY_NAV = (
@@ -118,6 +162,8 @@ MORE_NAV = (
     ("team", "团队管理", "users", "/more/team"),
     ("delivery_ledger", "未完成", "clipboard", "/more/delivery-ledger"),
 )
+
+STARTUP_PRODUCT_REFRESH_CONCURRENCY = 4
 
 PROCUREMENT_AUTO_VERIFY_MAX_ATTEMPTS = 4
 PROCUREMENT_AUTO_VERIFY_RETRY_SECONDS = 2.0
@@ -393,9 +439,24 @@ class _ScopedUploadProductService:
     def __init__(self, controller: "NextUiController", service: Any) -> None:
         self._controller = controller
         self._service = service
+        self._runner: Any | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._service, name)
+
+    def bind_runner(self, runner: Any) -> None:
+        self._runner = runner
+
+    def _runner_can_write(self) -> bool:
+        runner = self._runner
+        if runner is None:
+            return True
+        cancelled = getattr(runner, "cancelled", None)
+        paused = getattr(runner, "paused", None)
+        return not (
+            (cancelled is not None and cancelled.is_set())
+            or (paused is not None and paused.is_set())
+        )
 
     def product_write(
         self,
@@ -422,10 +483,15 @@ class _ScopedUploadProductService:
             ),
             "cancel_audit": ("product_audit_cancel",),
         }.get(str(action), ())
+        if not self._runner_can_write():
+            raise PermissionError(
+                "上传任务已取消或暂停，拒绝当前商品平台写"
+            )
         with self._controller._allow_platform_write(
             store,
             "product_write",
             *client_actions,
+            still_valid=self._runner_can_write,
         ):
             return self._service.product_write(
                 store,
@@ -453,8 +519,13 @@ class NextUiController:
         team_service: TeamService | None = None,
         project_dir: Path | None = None,
         now_provider: Callable[[], datetime] | None = None,
+        global_task_state_path: Path | None = None,
     ) -> None:
         self.db = db
+        self._global_task_pause_gate = GlobalTaskPauseGate(
+            global_task_state_path
+            or db.path.with_name("global_task_control.json")
+        )
         prune_store_cache = getattr(
             db,
             "prune_orphaned_store_cache_settings",
@@ -520,7 +591,8 @@ class NextUiController:
         self._store_jobs_lock = threading.Lock()
         self._store_score_state_lock = threading.RLock()
         self._store_refresh_workers: dict[str, threading.Thread] = {}
-        self._store_login_lock = threading.Lock()
+        self._store_profile_operations_lock = threading.Lock()
+        self._store_profile_operations: dict[int, str] = {}
         self._order_jobs: dict[str, dict[str, Any]] = {}
         self._order_jobs_lock = threading.Lock()
         self._order_backend_jobs: dict[str, dict[str, Any]] = {}
@@ -574,6 +646,7 @@ class NextUiController:
                     store,
                     "activity_create",
                 ),
+                before_step=self._activity_renewal_step_ready,
             )
             if product_service is not None and web_session is not None
             else None
@@ -599,6 +672,16 @@ class NextUiController:
         ] = ContextVar(
             f"webui_platform_write_scope_{id(self)}",
             default=frozenset(),
+        )
+        self._platform_write_generation: ContextVar[int | None] = ContextVar(
+            f"webui_platform_write_generation_{id(self)}",
+            default=None,
+        )
+        self._platform_write_guard: ContextVar[
+            Callable[[], bool] | None
+        ] = ContextVar(
+            f"webui_platform_write_guard_{id(self)}",
+            default=None,
         )
         if product_service is not None:
             setattr(
@@ -712,6 +795,51 @@ class NextUiController:
             for store_id in store_ids:
                 if self._product_store_leases.get(int(store_id)) == owner:
                     self._product_store_leases.pop(int(store_id), None)
+
+    def _claim_store_profile_operations(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> list[int]:
+        normalized = sorted(
+            {
+                int(store_id)
+                for store_id in store_ids
+                if int(store_id) > 0
+            }
+        )
+        with self._store_profile_operations_lock:
+            conflicts = [
+                store_id
+                for store_id in normalized
+                if store_id in self._store_profile_operations
+            ]
+            if conflicts:
+                return conflicts
+            for store_id in normalized:
+                self._store_profile_operations[store_id] = owner
+        return []
+
+    def _release_store_profile_operations(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> None:
+        with self._store_profile_operations_lock:
+            for store_id in store_ids:
+                normalized_id = int(store_id)
+                if self._store_profile_operations.get(normalized_id) == owner:
+                    self._store_profile_operations.pop(normalized_id, None)
+
+    @staticmethod
+    def _store_profile_busy_result(store_ids: list[int]) -> dict[str, Any]:
+        return {
+            "success": False,
+            "busy": True,
+            "login_confirmed": False,
+            "busy_store_ids": list(store_ids),
+            "message": "该店浏览器操作正在进行，请等待当前浏览器窗口关闭",
+        }
 
     @contextmanager
     def _product_store_lease(
@@ -842,6 +970,25 @@ class NextUiController:
         return job
 
     def _authorize_platform_write(self, app_id: str, action: str) -> None:
+        generation = self._platform_write_generation.get()
+        if generation is None:
+            raise PermissionError(
+                "真实平台写操作缺少当前会话安全门，已拒绝执行"
+            )
+        guard = self._platform_write_guard.get()
+        if guard is not None and not guard():
+            raise PermissionError(
+                "上传任务已取消或暂停，旧平台写操作已冻结"
+            )
+        if not self._global_task_pause_gate.wait_until_ready(
+            is_still_valid=lambda: (
+                (guard is None or guard())
+                and self._job_update_allowed(generation)
+            )
+        ):
+            raise PermissionError(
+                "账户会话已经切换，旧平台写操作已冻结"
+            )
         with self._account_session_lock:
             if self._account_session_closing:
                 raise PermissionError(
@@ -861,18 +1008,39 @@ class NextUiController:
         store: Any,
         action: str,
         *additional_actions: str,
+        still_valid: Callable[[], bool] | None = None,
     ) -> Iterator[None]:
-        token = self._platform_write_scope.set(
-            frozenset(
-                (str(getattr(store, "app_id", "") or ""), str(item))
-                for item in (action, *additional_actions)
-                if str(item or "").strip()
-            )
-        )
+        generation = self._current_generation()
+        guard_token = self._platform_write_guard.set(still_valid)
         try:
-            yield
+            if not self._global_task_pause_gate.wait_until_ready(
+                is_still_valid=lambda: (
+                    (still_valid is None or still_valid())
+                    and self._job_update_allowed(generation)
+                )
+            ):
+                if still_valid is not None and not still_valid():
+                    raise PermissionError(
+                        "上传任务已取消或暂停，拒绝当前商品平台写"
+                    )
+                raise PermissionError(
+                    "账户会话已经切换，旧平台写操作已冻结"
+                )
+            token = self._platform_write_scope.set(
+                frozenset(
+                    (str(getattr(store, "app_id", "") or ""), str(item))
+                    for item in (action, *additional_actions)
+                    if str(item or "").strip()
+                )
+            )
+            generation_token = self._platform_write_generation.set(generation)
+            try:
+                yield
+            finally:
+                self._platform_write_generation.reset(generation_token)
+                self._platform_write_scope.reset(token)
         finally:
-            self._platform_write_scope.reset(token)
+            self._platform_write_guard.reset(guard_token)
 
     def dispatch(
         self,
@@ -892,6 +1060,9 @@ class NextUiController:
             "analytics.diagnostics": self._analytics_diagnostics,
             "account.task-status": self._account_task_status,
             "account.action": self._account_action,
+            "tasks.pause-all": self._pause_all_tasks,
+            "tasks.resume-all": self._resume_all_tasks,
+            "tasks.status": lambda _payload: self._task_control_status(),
             "update.check": self._check_update,
             "update.install.start": self._start_update_install,
             "update.install.status": self._update_install_status,
@@ -946,6 +1117,7 @@ class NextUiController:
             "stores.refresh": self._refresh_stores,
             "stores.refresh.start": self._start_store_refresh,
             "stores.refresh.status": self._store_refresh_status,
+            "stores.refresh.cancel": self._cancel_store_refresh,
             "storefront.load": self._load_storefront,
             "storefront.action": self._storefront_action,
             "finance.summary": self._finance_summary,
@@ -1127,6 +1299,9 @@ class NextUiController:
         if account_closing and action not in {
             "account.action",
             "account.task-status",
+            "tasks.pause-all",
+            "tasks.resume-all",
+            "tasks.status",
         }:
             raise RuntimeError(
                 "当前账户会话正在安全关闭，旧账户操作已冻结"
@@ -1150,6 +1325,8 @@ class NextUiController:
                 self._require_procurement_association()
             else:
                 self._require_entitlement(entitlement)
+        if action in GLOBAL_PAUSE_CONTROLLED_ACTIONS:
+            self._require_global_task_start(action)
         started = time.perf_counter()
         manager = get_runtime_log_manager()
         summary = (
@@ -2561,6 +2738,254 @@ class NextUiController:
             account=self._account_public(self._member_role),
         )
 
+    def _iter_controlled_task_groups(
+        self,
+    ) -> tuple[
+        tuple[str, dict[str, dict[str, Any]], threading.Lock],
+        ...,
+    ]:
+        return (
+            ("店铺刷新", self._store_jobs, self._store_jobs_lock),
+            ("商品刷新", self._product_jobs, self._product_jobs_lock),
+            ("订单刷新", self._order_jobs, self._order_jobs_lock),
+            ("上传任务", self._upload_jobs, self._upload_jobs_lock),
+            ("自动化", self._automation_jobs, self._automation_jobs_lock),
+            (
+                "活动续期",
+                self._activity_renewal_jobs,
+                self._activity_renewal_jobs_lock,
+            ),
+        )
+
+    def _task_control_inventory(self) -> list[dict[str, Any]]:
+        with self._account_session_lock:
+            account_id = self._account_id()
+            generation = int(self._account_generation)
+        inventory: list[dict[str, Any]] = []
+        for label, jobs, lock in self._iter_controlled_task_groups():
+            with lock:
+                values = [dict(job) for job in jobs.values()]
+            for job in values:
+                job_account = str(job.get("account_id") or account_id)
+                try:
+                    job_generation = int(
+                        job.get("generation")
+                        if job.get("generation") is not None
+                        else generation
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    job_account != account_id
+                    or job_generation != generation
+                    or str(job.get("status") or "")
+                    in ACCOUNT_TASK_TERMINAL_STATUSES
+                ):
+                    continue
+                inventory.append(
+                    {
+                        "kind": label,
+                        "job_id": str(job.get("job_id") or ""),
+                        "status": str(job.get("status") or ""),
+                        "message": str(job.get("message") or ""),
+                        "paused_by_global_task": bool(
+                            job.get("paused_by_global_task")
+                        ),
+                    }
+                )
+        return inventory
+
+    def _require_global_task_start(self, operation: str) -> None:
+        try:
+            self._global_task_pause_gate.ensure_ready(operation)
+        except TaskPauseStateError as exc:
+            raise TaskPauseStateError(
+                f"暂停状态不可用，已阻止{operation}：{exc}"
+            ) from exc
+
+    def _wait_for_global_task_start(
+        self,
+        generation: int,
+        *,
+        also_current: Callable[[], bool] | None = None,
+    ) -> bool:
+        try:
+            return self._global_task_pause_gate.wait_until_ready(
+                is_still_valid=lambda: (
+                    (also_current is None or also_current())
+                    and self._job_update_allowed(generation)
+                )
+            )
+        except TaskPauseStateError:
+            return False
+
+    def _job_can_resume_global_pause(
+        self,
+        label: str,
+        job: dict[str, Any],
+    ) -> bool:
+        status = str(job.get("status") or "")
+        if status in ACCOUNT_TASK_TERMINAL_STATUSES:
+            return False
+        if job.get("_upload_worker_returned"):
+            return False
+        if label == "上传任务":
+            worker = job.get("_upload_worker")
+            if worker is not None and not worker.is_alive():
+                return False
+            runner = job.get("runner")
+            if runner is None:
+                return worker is not None
+            run_task_ids = {
+                str(value)
+                for value in job.get("_run_task_ids") or ()
+            }
+            tasks = getattr(runner, "tasks", None)
+            if not isinstance(tasks, list):
+                return False
+            return any(
+                str(item.get("status") or "") in {"pending", "queued"}
+                for task in tasks
+                if not run_task_ids
+                or str(task.get("id") or "") in run_task_ids
+                for item in task.get("items") or []
+            )
+        if label == "店铺刷新":
+            worker = self._store_refresh_workers.get(
+                str(job.get("job_id") or "")
+            )
+            if worker is not None:
+                return worker.is_alive()
+            for child_job_id in job.get("monitored_job_ids") or ():
+                child = self._store_refresh_workers.get(
+                    str(child_job_id) or ""
+                )
+                if child is not None and child.is_alive():
+                    return True
+            return False
+        return True
+
+    def _task_control_status(self) -> dict[str, Any]:
+        result = self._global_task_pause_gate.snapshot()
+        inventory = self._task_control_inventory()
+        active_statuses = {"starting", "running", "pausing", "cancelling"}
+        result.update(
+            {
+                "running": sum(
+                    item["status"] in active_statuses
+                    for item in inventory
+                ),
+                "paused_count": sum(
+                    item["paused_by_global_task"]
+                    for item in inventory
+                ),
+                "count": len(inventory),
+            }
+        )
+        return result
+
+    def _pause_all_tasks(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        with self._account_session_lock:
+            account_id = self._account_id()
+            generation = int(self._account_generation)
+        state = self._global_task_pause_gate.pause(
+            account_id=account_id,
+            generation=generation,
+            reason="用户在主界面暂停全部受控操作",
+        )
+        if state["paused"] is True:
+            paused_at = str(state.get("changed_at") or "")
+            for label, jobs, lock in self._iter_controlled_task_groups():
+                with lock:
+                    for job in jobs.values():
+                        job_account = str(
+                            job.get("account_id") or account_id
+                        )
+                        try:
+                            job_generation = int(
+                                job.get("generation")
+                                if job.get("generation") is not None
+                                else generation
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        status = str(job.get("status") or "")
+                        if (
+                            job_account != account_id
+                            or job_generation != generation
+                            or status in ACCOUNT_TASK_TERMINAL_STATUSES
+                            or status == "paused"
+                            or (
+                                label == "上传任务"
+                                and job.get("_upload_worker_returned")
+                            )
+                        ):
+                            continue
+                        job.setdefault("previous_status", status)
+                        job["status"] = "paused"
+                        job["paused_by_global_task"] = True
+                        job["global_pause_revision"] = int(
+                            state["revision"]
+                        )
+                        job["paused_at"] = paused_at
+                        job["message"] = (
+                            "全局操作已暂停；当前在途请求完成后停止推进"
+                        )
+        self._global_task_pause_gate.notify_waiters()
+        result = self._task_control_status()
+        result["changed"] = bool(state["changed"])
+        return result
+
+    def _resume_all_tasks(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        with self._account_session_lock:
+            account_id = self._account_id()
+            generation = int(self._account_generation)
+        state = self._global_task_pause_gate.resume(
+            account_id=account_id,
+            generation=generation,
+            reason="用户在主界面恢复全部受控操作",
+        )
+        if state["paused"] is False:
+            for label, jobs, lock in self._iter_controlled_task_groups():
+                with lock:
+                    for job in jobs.values():
+                        job_account = str(
+                            job.get("account_id") or account_id
+                        )
+                        try:
+                            job_generation = int(
+                                job.get("generation")
+                                if job.get("generation") is not None
+                                else generation
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        if (
+                            job_account != account_id
+                            or job_generation != generation
+                            or not job.get("paused_by_global_task")
+                            or job.get("paused_for_account_action")
+                            or not self._job_can_resume_global_pause(
+                                label,
+                                job,
+                            )
+                        ):
+                            continue
+                        job["status"] = str(
+                            job.get("previous_status") or "running"
+                        )
+                        job.pop("paused_by_global_task", None)
+                        job.pop("previous_status", None)
+                        job.pop("global_pause_revision", None)
+                        job.pop("paused_at", None)
+                        job["message"] = (
+                            "全局操作已恢复，继续原任务中尚未完成的项目"
+                        )
+        self._global_task_pause_gate.notify_waiters()
+        result = self._task_control_status()
+        result["changed"] = bool(state["changed"])
+        return result
+
     @staticmethod
     def _job_is_active(job: dict[str, Any]) -> bool:
         return (
@@ -2629,6 +3054,7 @@ class NextUiController:
         with self._account_session_lock:
             self._account_session_closing = True
             self._account_generation += 1
+        self._global_task_pause_gate.notify_waiters()
         interrupted = self._active_account_tasks()
         groups = (
             ("店铺刷新", self._store_jobs, self._store_jobs_lock),
@@ -7938,6 +8364,14 @@ class NextUiController:
         *,
         force: bool = False,
     ) -> dict[str, Any]:
+        pause_state = self._global_task_pause_gate.snapshot()
+        if pause_state.get("error"):
+            return {
+                "skipped": True,
+                "reason": "global_pause_state_error",
+            }
+        if pause_state.get("paused") is True:
+            return {"skipped": True, "reason": "global_pause"}
         now_monotonic = time.monotonic()
         if (
             not force
@@ -7946,6 +8380,7 @@ class NextUiController:
             return {"skipped": True, "reason": "interval"}
         if not self._procurement_monitor_lock.acquire(blocking=False):
             return {"skipped": True, "reason": "running"}
+        generation = self._current_generation()
         self._procurement_monitor_last_at = now_monotonic
         try:
             service = self._require_product_service()
@@ -7955,6 +8390,13 @@ class NextUiController:
                 if account.get("status") == "已登录"
             ]
             for account in accounts:
+                if not self._wait_for_global_task_start(generation):
+                    return {
+                        "completed": 0,
+                        "errors": 0,
+                        "skipped": True,
+                        "reason": "account_changed",
+                    }
                 try:
                     service.sync_procurement_account(
                         int(account["id"])
@@ -8189,6 +8631,13 @@ class NextUiController:
                     for item in order.items
                 ]
                 try:
+                    if not self._wait_for_global_task_start(generation):
+                        return {
+                            "completed": completed,
+                            "errors": errors,
+                            "skipped": True,
+                            "reason": "account_changed",
+                        }
                     with self._allow_platform_write(
                         store,
                         "order_delivery_update",
@@ -10669,6 +11118,7 @@ class NextUiController:
         }
 
     def _start_product_refresh(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_global_task_start("商品刷新")
         service = self._require_product_service()
         store = self._require_store(self._store_id(payload))
         allowed_tabs = {
@@ -11742,6 +12192,14 @@ class NextUiController:
         return self._get_hosted_schedule({})
 
     def _execute_hosted(self, payload: dict[str, Any]) -> dict[str, Any]:
+        generation = self._current_generation()
+
+        def checkpoint() -> None:
+            if not self._wait_for_global_task_start(generation):
+                raise _BackgroundTaskStopped(
+                    "托管执行已取消或账户代次已变化"
+                )
+
         service = self._require_product_service()
         selected_ids = {
             int(value)
@@ -11764,7 +12222,14 @@ class NextUiController:
         errors: list[str] = []
         succeeded = 0
         for store, config in targets:
-            error = run_hosted_store(self.db, service, store, config)
+            checkpoint()
+            error = run_hosted_store(
+                self.db,
+                service,
+                store,
+                config,
+                before_write=checkpoint,
+            )
             if error:
                 errors.append(error)
             else:
@@ -11781,6 +12246,17 @@ class NextUiController:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         current = now or datetime.now()
+        pause_state = self._global_task_pause_gate.snapshot()
+        if pause_state.get("error"):
+            return {
+                "started": False,
+                "reason": "全局暂停状态不可用，未启动托管定时执行",
+            }
+        if pause_state.get("paused") is True:
+            return {
+                "started": False,
+                "reason": "全局操作已暂停，未启动托管定时执行",
+            }
         schedule = self._get_hosted_schedule({})
         if not schedule["enabled"]:
             return {"started": False, "reason": "托管定时执行未启用"}
@@ -12628,27 +13104,29 @@ class NextUiController:
     def _login_store(self, payload: dict[str, Any]) -> dict[str, Any]:
         session = self._require_web_session()
         requested_ids = self._requested_store_ids(payload)
-        if not self._store_login_lock.acquire(blocking=False):
-            return {
-                "success": False,
-                "busy": True,
-                "login_confirmed": False,
-                "requested_store_ids": requested_ids,
-                "message": "网页登录任务正在进行，请等待当前交互浏览器关闭",
-            }
+        stores = []
+        missing_ids = []
+        for store_id in requested_ids:
+            store = self.db.get_store(store_id)
+            if store is None:
+                missing_ids.append(store_id)
+            else:
+                stores.append(store)
+        if not stores:
+            raise ValueError(
+                "所选店铺均不存在：" + ", ".join(map(str, missing_ids))
+            )
+        profile_store_ids = [store.id for store in stores]
+        conflicts = self._claim_store_profile_operations(
+            profile_store_ids,
+            "login",
+        )
+        if conflicts:
+            result = self._store_profile_busy_result(conflicts)
+            result["requested_store_ids"] = requested_ids
+            result["missing_store_ids"] = missing_ids
+            return result
         try:
-            stores = []
-            missing_ids = []
-            for store_id in requested_ids:
-                store = self.db.get_store(store_id)
-                if store is None:
-                    missing_ids.append(store_id)
-                else:
-                    stores.append(store)
-            if not stores:
-                raise ValueError(
-                    "所选店铺均不存在：" + ", ".join(map(str, missing_ids))
-                )
             primary = stores[0]
             result = dict(
                 session.interactive_login(
@@ -12657,7 +13135,10 @@ class NextUiController:
                 )
             )
         finally:
-            self._store_login_lock.release()
+            self._release_store_profile_operations(
+                profile_store_ids,
+                "login",
+            )
         matched_ids = {
             int(store_id)
             for store_id in result.get("matched_store_ids", [])
@@ -12741,7 +13222,21 @@ class NextUiController:
     def _open_store_backend(self, payload: dict[str, Any]) -> dict[str, Any]:
         session = self._require_web_session()
         store = self._require_store(self._store_id(payload))
-        session.open_official_backend(store)
+        conflicts = self._claim_store_profile_operations(
+            [store.id],
+            "open_backend",
+        )
+        if conflicts:
+            result = self._store_profile_busy_result(conflicts)
+            result["store_id"] = store.id
+            return result
+        try:
+            session.open_official_backend(store)
+        finally:
+            self._release_store_profile_operations(
+                [store.id],
+                "open_backend",
+            )
         return {"opened": store.id}
 
     def _clear_web_cache(self, _payload: dict[str, Any]) -> dict[str, Any]:
@@ -12957,7 +13452,7 @@ class NextUiController:
         return active_store, credential
 
     def _refresh_stores(self, payload: dict[str, Any]) -> dict[str, Any]:
-        service = self._require_product_service()
+        self._require_global_task_start("店铺刷新")
         requested_ids = {
             int(value)
             for value in payload.get("store_ids", [])
@@ -12970,37 +13465,31 @@ class NextUiController:
         ]
         if not stores:
             return {"refreshed": 0, "succeeded": 0, "errors": []}
-        self._record_store_score_baseline({store.id for store in stores})
-
-        def refresh_one(store):
-            return self._refresh_store_with_credential(store, service)
-
-        succeeded = 0
-        errors: list[str] = []
-        credential_actions: list[dict[str, Any]] = []
-        workers = max(1, min(6, len(stores)))
-        with ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="webui-store-refresh",
-        ) as executor:
-            futures = {
-                executor.submit(refresh_one, store): store
-                for store in stores
-            }
-            for future in as_completed(futures):
-                store = futures[future]
-                try:
-                    _active_store, credential = future.result()
-                    credential_actions.append(credential)
-                except Exception as exc:
-                    errors.append(f"{store.name}: {exc}")
-                else:
-                    succeeded += 1
+        started = self._start_store_refresh(
+            {"store_ids": [store.id for store in stores]}
+        )
+        self.wait_for_store_refresh(
+            str(started["job_id"]),
+            timeout=float(payload.get("timeout") or 300.0),
+        )
+        with self._store_jobs_lock:
+            job = dict(self._store_jobs.get(str(started["job_id"])) or {})
         return {
-            "refreshed": len(stores),
-            "succeeded": succeeded,
-            "errors": errors,
-            "credential_actions": credential_actions,
+            "job_id": str(started["job_id"]),
+            "refreshed": int(job.get("total") or len(stores)),
+            "succeeded": int(job.get("succeeded") or 0),
+            "failed": int(job.get("failed") or 0),
+            "cancelled": int(job.get("cancelled") or 0),
+            "errors": list(job.get("errors") or []),
+            "credential_actions": list(
+                job.get("credential_actions") or []
+            ),
+            "status": str(job.get("status") or ""),
+            "active": int(job.get("active") or 0),
+            "max": int(job.get("max") or 0),
+            "max_workers": int(job.get("max_workers") or 0),
+            "queued": int(job.get("queued") or 0),
+            "completed": int(job.get("completed") or 0),
         }
 
     def _start_store_refresh_monitor(
@@ -13018,6 +13507,13 @@ class NextUiController:
             "cancelled",
         }
         started_at = time.monotonic()
+        cancel_event = threading.Event()
+        with self._store_jobs_lock:
+            monitored_job = self._store_jobs.get(job_id)
+            if monitored_job is not None:
+                monitored_job["_cancel_event"] = cancel_event
+                if monitored_job.get("cancel_requested"):
+                    cancel_event.set()
 
         def update(**changes: Any) -> None:
             with self._store_jobs_lock:
@@ -13060,6 +13556,11 @@ class NextUiController:
                 cancelled_store_ids = sorted({
                     int(store_id)
                     for job in monitored
+                    for store_id in job.get("cancelled_store_ids") or ()
+                    if int(store_id) in requested_ids
+                } | {
+                    int(store_id)
+                    for job in monitored
                     if str(job.get("status") or "") == "cancelled"
                     for store_id in job.get("store_ids") or ()
                     if (
@@ -13068,6 +13569,22 @@ class NextUiController:
                         and int(store_id) not in failed_store_ids
                     )
                 })
+                active_total = sum(
+                    int(job.get("active") or 0)
+                    for job in monitored
+                )
+                queued_total = sum(
+                    int(job.get("queued") or 0)
+                    for job in monitored
+                )
+                completed_total = sum(
+                    int(job.get("completed") or 0)
+                    for job in monitored
+                )
+                max_workers_total = sum(
+                    int(job.get("max_workers") or 0)
+                    for job in monitored
+                )
                 current = len(
                     set(successful_store_ids)
                     | set(failed_store_ids)
@@ -13106,14 +13623,19 @@ class NextUiController:
                     total=len(store_ids),
                     succeeded=len(successful_store_ids),
                     failed=len(failed_store_ids),
+                    completed=completed_total,
                     cancelled=len(cancelled_store_ids),
+                    active=active_total,
+                    queued=queued_total,
+                    max=max_workers_total,
+                    max_workers=max_workers_total,
                     successful_store_ids=successful_store_ids,
                     failed_store_ids=failed_store_ids,
                     cancelled_store_ids=cancelled_store_ids,
                     credential_actions=credential_actions,
                     **credential_totals,
                     message=(
-                        f"联合刷新进行中（{current}/{len(store_ids)} 家）"
+                        "正在联合刷新店铺数据"
                         if not settled
                         else "正在汇总后台刷新结果…"
                     ),
@@ -13142,6 +13664,13 @@ class NextUiController:
                 status == "cancelled"
                 for status in statuses
             )
+            with self._store_jobs_lock:
+                aggregate_cancel_requested = bool(
+                    (
+                        self._store_jobs.get(job_id)
+                        or {}
+                    ).get("cancel_requested")
+                )
             if unaccounted_store_ids and not all_cancelled:
                 failed_store_ids = sorted({
                     *failed_store_ids,
@@ -13151,7 +13680,9 @@ class NextUiController:
                     f"店铺 {store_id} 未返回刷新结果"
                     for store_id in unaccounted_store_ids
                 )
-            if (
+            if aggregate_cancel_requested:
+                status = "cancelled"
+            elif (
                 statuses
                 and all(status == "completed" for status in statuses)
                 and not failed_store_ids
@@ -13185,21 +13716,34 @@ class NextUiController:
                 total=len(store_ids),
                 succeeded=len(successful_store_ids),
                 failed=len(failed_store_ids),
+                completed=completed_total,
                 cancelled=len(cancelled_store_ids),
+                active=0,
+                queued=0,
+                max=max_workers_total,
+                max_workers=max_workers_total,
                 successful_store_ids=successful_store_ids,
                 failed_store_ids=failed_store_ids,
                 cancelled_store_ids=cancelled_store_ids,
                 errors=errors,
                 message=(
-                    f"联合刷新结束：成功 {len(successful_store_ids)} 家，"
-                    f"失败 {len(failed_store_ids)} 家；"
-                    f"后台任务 {len(monitored_job_ids)} 个"
+                    (
+                        f"联合刷新已取消：完成 {completed_total} 家，"
+                        f"取消 {len(cancelled_store_ids)} 家"
+                    )
+                    if status == "cancelled"
+                    else (
+                        f"联合刷新结束：成功 {len(successful_store_ids)} 家，"
+                        f"失败 {len(failed_store_ids)} 家；"
+                        f"后台任务 {len(monitored_job_ids)} 个"
+                    )
                 ),
                 elapsed_seconds=round(
                     time.monotonic() - started_at,
                     3,
                 ),
             )
+            self._cleanup_finished_store_refresh_transients()
 
         monitor_thread = threading.Thread(
             target=worker,
@@ -13212,6 +13756,8 @@ class NextUiController:
         return monitor_thread
 
     def _start_store_refresh(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._cleanup_finished_store_refresh_transients()
+        self._require_global_task_start("店铺刷新")
         service = self._require_product_service()
         requested_ids = {
             int(value)
@@ -13274,13 +13820,21 @@ class NextUiController:
                     **owner,
                     "store_ids": store_ids,
                     "worker_count": len(monitored_job_ids),
+                    "max": 0,
+                    "max_workers": 0,
                     "status": "starting",
                     "current": 0,
                     "total": len(store_ids),
                     "succeeded": 0,
                     "failed": 0,
+                    "completed": 0,
+                    "cancelled": 0,
+                    "active": 0,
+                    "queued": len(store_ids),
                     "successful_store_ids": [],
                     "failed_store_ids": [],
+                    "cancelled_store_ids": [],
+                    "cancel_requested": False,
                     "message": "正在准备联合监控后台刷新任务…",
                     "errors": [],
                     "credential_succeeded": 0,
@@ -13299,13 +13853,21 @@ class NextUiController:
                         **owner,
                         "store_ids": store_ids,
                         "worker_count": len(monitored_job_ids) + 1,
+                        "max": 0,
+                        "max_workers": 0,
                         "status": "starting",
                         "current": 0,
                         "total": len(store_ids),
                         "succeeded": 0,
                         "failed": 0,
+                        "completed": 0,
+                        "cancelled": 0,
+                        "active": 0,
+                        "queued": len(store_ids),
                         "successful_store_ids": [],
                         "failed_store_ids": [],
+                        "cancelled_store_ids": [],
+                        "cancel_requested": False,
                         "message": "正在准备联合监控后台刷新任务…",
                         "errors": [],
                         "credential_succeeded": 0,
@@ -13320,19 +13882,27 @@ class NextUiController:
                 refresh_store_ids = tuple(
                     sorted(store.id for store in stores)
                 )
-                workers = max(1, min(8, len(stores)))
+                workers = resolve_store_refresh_workers(len(stores))
                 self._store_jobs[job_id] = {
                     "job_id": job_id,
                     **owner,
                     "store_ids": refresh_store_ids,
                     "worker_count": workers,
+                    "max": workers,
+                    "max_workers": workers,
                     "status": "starting",
                     "current": 0,
                     "total": len(stores),
                     "succeeded": 0,
                     "failed": 0,
+                    "completed": 0,
+                    "cancelled": 0,
+                    "active": 0,
+                    "queued": len(stores),
                     "successful_store_ids": [],
                     "failed_store_ids": [],
+                    "cancelled_store_ids": [],
+                    "cancel_requested": False,
                     "message": "正在准备刷新店铺…",
                     "errors": [],
                     "credential_succeeded": 0,
@@ -13361,6 +13931,15 @@ class NextUiController:
             }
         self._record_store_score_baseline({store.id for store in stores})
         started_at = time.monotonic()
+        cancel_event = threading.Event()
+        dispatch_lock = threading.Lock()
+        with self._store_jobs_lock:
+            job = self._store_jobs.get(job_id)
+            if job is not None:
+                job["_cancel_event"] = cancel_event
+                job["_dispatch_lock"] = dispatch_lock
+                if job.get("cancel_requested"):
+                    cancel_event.set()
 
         def update(**changes: Any) -> None:
             with self._store_jobs_lock:
@@ -13371,41 +13950,98 @@ class NextUiController:
                     job.update(changes)
 
         def worker() -> None:
-            update(status="running", message=f"正在刷新店铺数据（0/{len(stores)}）")
+            active = 0
+            queued = len(stores)
             completed = 0
             succeeded = 0
+            cancelled = 0
             errors: list[str] = []
             successful_store_ids: list[int] = []
             failed_store_ids: list[int] = []
+            cancelled_store_ids: list[int] = []
             credential_succeeded = 0
             credential_superseded = 0
             credential_failed = 0
             credential_deferred = 0
             credential_actions: list[dict[str, Any]] = []
-            with ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="webui-store-refresh-progress",
-            ) as executor:
-                futures = {
-                    executor.submit(
-                        self._refresh_store_with_credential,
-                        store,
-                        service,
-                    ): store
-                    for store in stores
-                }
-                for future in as_completed(futures):
-                    if not self._job_update_allowed(generation):
-                        break
-                    store = futures[future]
+            gate_aborted = False
+
+            def refresh_one(store: Store):
+                if not self._wait_for_global_task_start(
+                    generation,
+                    also_current=lambda: not cancel_event.is_set(),
+                ):
+                    return None
+                return self._refresh_store_with_credential(store, service)
+
+            update(
+                status="running",
+                active=0,
+                queued=queued,
+                completed=0,
+                cancelled=0,
+                current=0,
+                message=f"正在刷新店铺数据（0/{len(stores)}）",
+            )
+
+            def should_stop() -> bool:
+                return (
+                    cancel_event.is_set()
+                    or not self._job_update_allowed(generation)
+                )
+
+            def on_dispatch(_store: Any) -> None:
+                nonlocal active, queued
+                active += 1
+                queued = max(0, queued - 1)
+                update(
+                    active=active,
+                    queued=queued,
+                    message="正在刷新店铺数据",
+                )
+
+            def on_cancel(_store: Any) -> None:
+                nonlocal queued, cancelled
+                queued = max(0, queued - 1)
+                cancelled += 1
+                cancelled_store_ids.append(_store.id)
+                update(
+                    current=completed + cancelled,
+                    cancelled=cancelled,
+                    cancelled_store_ids=cancelled_store_ids,
+                    queued=queued,
+                    active=active,
+                    message="正在停止派发新店铺",
+                )
+
+            def on_finish(outcome: Any) -> None:
+                nonlocal active, completed, succeeded, cancelled
+                nonlocal credential_succeeded, credential_superseded
+                nonlocal credential_failed, credential_deferred
+                store = outcome.store
+                active = max(0, active - 1)
+                if outcome.error is not None:
                     completed += 1
-                    try:
-                        _active_store, credential = future.result()
-                        if credential.get("catalog_error"):
-                            raise ValueError(
-                                "商品目录扫描失败："
-                                + str(credential.get("catalog_error"))
-                            )
+                    errors.append(f"{store.name}: {outcome.error}")
+                    failed_store_ids.append(store.id)
+                elif outcome.result is None:
+                    if cancel_event.is_set():
+                        cancelled += 1
+                        cancelled_store_ids.append(store.id)
+                    else:
+                        gate_aborted = True
+                else:
+                    _active_store, credential = outcome.result
+                    completed += 1
+                    if credential.get("catalog_error"):
+                        errors.append(
+                            f"{store.name}: 商品目录扫描失败："
+                            f"{credential.get('catalog_error')}"
+                        )
+                        failed_store_ids.append(store.id)
+                    else:
+                        succeeded += 1
+                        successful_store_ids.append(store.id)
                         action = str(credential.get("action") or "none")
                         if action == "recovered":
                             credential_succeeded += 1
@@ -13423,67 +14059,81 @@ class NextUiController:
                                     **credential,
                                 }
                             )
-                    except Exception as exc:
-                        errors.append(f"{store.name}: {exc}")
-                        failed_store_ids.append(store.id)
-                        update(
-                            current=completed,
-                            succeeded=succeeded,
-                            failed=len(errors),
-                            successful_store_ids=successful_store_ids,
-                            failed_store_ids=failed_store_ids,
-                            credential_succeeded=credential_succeeded,
-                            credential_superseded=credential_superseded,
-                            credential_failed=credential_failed,
-                            credential_deferred=credential_deferred,
-                            credential_actions=credential_actions,
-                            message=(
-                                f"正在刷新  {store.name}  "
-                                f"({completed}/{len(stores)})"
-                            ),
-                        )
-                    else:
-                        succeeded += 1
-                        successful_store_ids.append(store.id)
-                        update(
-                            current=completed,
-                            succeeded=succeeded,
-                            failed=len(errors),
-                            successful_store_ids=successful_store_ids,
-                            failed_store_ids=failed_store_ids,
-                            credential_succeeded=credential_succeeded,
-                            credential_superseded=credential_superseded,
-                            credential_failed=credential_failed,
-                            credential_deferred=credential_deferred,
-                            credential_actions=credential_actions,
-                            message=(
-                                f"正在刷新  {store.name}  "
-                                f"({completed}/{len(stores)})"
-                            ),
-                        )
+                update(
+                    active=active,
+                    current=completed + cancelled,
+                    completed=completed,
+                    cancelled=cancelled,
+                    succeeded=succeeded,
+                    failed=len(failed_store_ids),
+                    successful_store_ids=successful_store_ids,
+                    failed_store_ids=failed_store_ids,
+                    cancelled_store_ids=cancelled_store_ids,
+                    credential_succeeded=credential_succeeded,
+                    credential_superseded=credential_superseded,
+                    credential_failed=credential_failed,
+                    credential_deferred=credential_deferred,
+                    credential_actions=credential_actions,
+                    message="正在刷新店铺数据",
+                )
+
+            run_store_refresh_queue(
+                stores,
+                max_workers=workers,
+                task=refresh_one,
+                should_stop=should_stop,
+                dispatch_lock=dispatch_lock,
+                on_dispatch=on_dispatch,
+                on_cancel=on_cancel,
+                on_finish=on_finish,
+                thread_name_prefix="webui-store-refresh-progress",
+            )
+            cancelled_run = cancel_event.is_set()
             update(
-                status="completed" if not errors else "partial",
-                current=len(stores),
+                status=(
+                    "paused"
+                    if gate_aborted
+                    else "cancelled"
+                    if cancelled_run
+                    else "completed" if not errors else "partial"
+                ),
+                current=completed + cancelled,
                 total=len(stores),
                 succeeded=succeeded,
-                failed=len(errors),
+                failed=len(failed_store_ids),
+                completed=completed,
+                cancelled=cancelled,
+                active=0,
+                queued=0,
                 successful_store_ids=successful_store_ids,
                 failed_store_ids=failed_store_ids,
+                cancelled_store_ids=cancelled_store_ids,
                 credential_succeeded=credential_succeeded,
                 credential_superseded=credential_superseded,
                 credential_failed=credential_failed,
                 credential_deferred=credential_deferred,
                 credential_actions=credential_actions,
                 message=(
-                    f"刷新完成：数据成功 {succeeded}，失败 {len(errors)}；"
-                    f"凭据恢复 {credential_succeeded}，恢复放弃 "
-                    f"{credential_superseded}，拒绝 {credential_failed}，"
-                    f"延后 {credential_deferred}"
-                    if errors
+                    "全局任务状态不可用或账户会话已切换，刷新已停在安全边界"
+                    if gate_aborted
                     else (
-                        f"刷新完成：成功刷新 {succeeded} 家店铺；"
+                        f"刷新已取消：完成 {completed}/{len(stores)} 家，"
+                        f"未开始 {cancelled} 家"
+                    )
+                    if cancelled_run
+                    else (
+                        f"刷新完成：数据成功 {succeeded}，"
+                        f"失败 {len(failed_store_ids)}；"
                         f"凭据恢复 {credential_succeeded}，恢复放弃 "
-                        f"{credential_superseded}，延后 {credential_deferred}"
+                        f"{credential_superseded}，拒绝 {credential_failed}，"
+                        f"延后 {credential_deferred}"
+                        if errors
+                        else (
+                            f"刷新完成：成功刷新 {succeeded} 家店铺；"
+                            f"凭据恢复 {credential_succeeded}，恢复放弃 "
+                            f"{credential_superseded}，延后 "
+                            f"{credential_deferred}"
+                        )
                     )
                 ),
                 errors=errors,
@@ -13535,7 +14185,10 @@ class NextUiController:
             thread = self._store_refresh_workers.get(str(job_id))
         if thread is not None:
             thread.join(max(0.0, float(timeout)))
-            return not thread.is_alive()
+            finished = not thread.is_alive()
+            if finished:
+                self._cleanup_finished_store_refresh_transients()
+            return finished
         return True
 
     def _store_refresh_status(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -13545,9 +14198,110 @@ class NextUiController:
             if job is None:
                 raise ValueError("店铺刷新任务不存在")
             self._require_job_owner(job, "店铺刷新任务")
-            return {
+            result = {
                 key: value
                 for key, value in job.items()
+                if not key.startswith("_")
+            }
+        if str(result.get("status") or "") in ACCOUNT_TASK_TERMINAL_STATUSES:
+            with self._store_jobs_lock:
+                thread = self._store_refresh_workers.get(job_id)
+            if (
+                thread is not None
+                and thread is not threading.current_thread()
+                and thread.is_alive()
+            ):
+                thread.join(0.1)
+            self._cleanup_finished_store_refresh_transients()
+        return result
+
+    def _cleanup_finished_store_refresh_transients(self) -> None:
+        transient_keys = {
+            "_cancel_event",
+            "_dispatch_lock",
+            "_worker_finished",
+        }
+        with self._store_jobs_lock:
+            for job_id, job in self._store_jobs.items():
+                if (
+                    str(job.get("status") or "")
+                    not in ACCOUNT_TASK_TERMINAL_STATUSES
+                ):
+                    continue
+                thread = self._store_refresh_workers.get(job_id)
+                if thread is not None and thread.is_alive():
+                    continue
+                self._store_refresh_workers.pop(job_id, None)
+                for key in transient_keys:
+                    job.pop(key, None)
+
+    def _cancel_store_refresh(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("店铺刷新任务编号不能为空")
+        reason = str(payload.get("reason") or "user").strip()[:80]
+        with self._store_jobs_lock:
+            job = self._store_jobs.get(job_id)
+            if job is None:
+                raise ValueError("店铺刷新任务不存在")
+            self._require_job_owner(job, "店铺刷新任务")
+            if str(job.get("status") or "") in {
+                "completed",
+                "partial",
+                "failed",
+                "cancelled",
+            }:
+                return {
+                    key: value
+                    for key, value in job.items()
+                    if not key.startswith("_")
+                }
+            target_ids = [
+                job_id,
+                *[
+                    str(child_job_id)
+                    for child_job_id in job.get("monitored_job_ids") or ()
+                ],
+            ]
+
+        cancelled_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        for target_id in dict.fromkeys(target_ids):
+            with self._store_jobs_lock:
+                target = self._store_jobs.get(target_id)
+                dispatch_lock = (
+                    target.get("_dispatch_lock")
+                    if target is not None
+                    else None
+                )
+            lock_context = (
+                dispatch_lock
+                if dispatch_lock is not None
+                else nullcontext()
+            )
+            with lock_context:
+                with self._store_jobs_lock:
+                    target = self._store_jobs.get(target_id)
+                    if not target or not self._job_is_active(target):
+                        continue
+                    target["cancel_requested"] = True
+                    target["cancel_reason"] = reason
+                    target["cancel_requested_at"] = cancelled_at
+                    target["message"] = (
+                        "正在停止派发新店铺，等待已开始的刷新结束"
+                    )
+                    cancel_event = target.get("_cancel_event")
+                    if isinstance(cancel_event, threading.Event):
+                        cancel_event.set()
+        with self._store_jobs_lock:
+            current = self._store_jobs.get(job_id) or {}
+            return {
+                key: value
+                for key, value in current.items()
                 if not key.startswith("_")
             }
 
@@ -13559,16 +14313,57 @@ class NextUiController:
         *,
         timeout: float = 300.0,
     ) -> dict[str, Any]:
+        def safety_stop(job: dict[str, Any], reason: str) -> dict[str, Any]:
+            stopped = dict(job)
+            stopped.setdefault(
+                "previous_status",
+                str(stopped.get("status") or "unknown"),
+            )
+            stopped.update(
+                status="paused",
+                safety_stopped=True,
+                message=reason,
+            )
+            with lock:
+                current = jobs.get(job_id)
+                if current is not None and self._job_is_active(current):
+                    current.update(
+                        previous_status=stopped["previous_status"],
+                        status="paused",
+                        safety_stopped=True,
+                        message=reason,
+                    )
+            return stopped
+
         deadline = time.monotonic() + max(1.0, timeout)
         while time.monotonic() < deadline:
             with lock:
                 job = dict(jobs.get(job_id) or {})
-            if job.get("status") in {
+            try:
+                self._require_job_owner(job, "后台刷新任务")
+            except PermissionError as exc:
+                return safety_stop(job, str(exc))
+            status = str(job.get("status") or "")
+            if status in {"paused", "cancelled"}:
+                job["safety_stopped"] = True
+                if status == "cancelled" and jobs is self._store_jobs:
+                    with self._store_jobs_lock:
+                        thread = self._store_refresh_workers.get(job_id)
+                    if thread is not None and thread.is_alive():
+                        thread.join(1.0)
+                    self._cleanup_finished_store_refresh_transients()
+                return job
+            if status in {
                 "completed",
                 "partial",
                 "failed",
-                "cancelled",
             }:
+                if jobs is self._store_jobs:
+                    with self._store_jobs_lock:
+                        thread = self._store_refresh_workers.get(job_id)
+                    if thread is not None and thread.is_alive():
+                        thread.join(1.0)
+                    self._cleanup_finished_store_refresh_transients()
                 return job
             time.sleep(0.1)
         with lock:
@@ -13615,6 +14410,7 @@ class NextUiController:
             def worker() -> None:
                 stages: dict[str, Any] = {}
                 errors: list[str] = []
+                generation = self._current_generation()
                 all_stores = [
                     store for store in self.db.list_stores()
                     if store.app_id
@@ -13653,22 +14449,35 @@ class NextUiController:
                         }
                         errors.append(f"{name}: {exc}")
                     else:
+                        refresh_safety_stopped = False
+                        refresh_stop_message = ""
                         if name in {"stores", "orders", "products"}:
+                            if isinstance(value, dict):
+                                refresh_safety_stopped = bool(
+                                    value.get("safety_stopped")
+                                ) or str(value.get("status") or "") in {
+                                    "paused",
+                                    "cancelled",
+                                }
+                                refresh_stop_message = str(
+                                    value.get("message") or ""
+                                )
                             job_ref = (
                                 str(value.get("job_id") or "")
                                 if isinstance(value, dict)
                                 else ""
                             )
-                            self._publish_refresh_analytics(
-                                name,
-                                {},
-                                value if isinstance(value, dict) else {},
-                                publish_key=(
-                                    f"{name}:{job_ref}"
-                                    if job_ref
-                                    else f"startup:{run_id}:{name}"
-                                ),
-                            )
+                            if not refresh_safety_stopped:
+                                self._publish_refresh_analytics(
+                                    name,
+                                    {},
+                                    value if isinstance(value, dict) else {},
+                                    publish_key=(
+                                        f"{name}:{job_ref}"
+                                        if job_ref
+                                        else f"startup:{run_id}:{name}"
+                                    ),
+                                )
                         violation_stage_status = ""
                         if isinstance(value, dict):
                             if name == "orders":
@@ -13729,6 +14538,16 @@ class NextUiController:
                                 )
                                 else "partial"
                             )
+                        if refresh_safety_stopped:
+                            stage_status = "cancelled"
+                            stop_message = (
+                                refresh_stop_message
+                                or "后台刷新已安全停止"
+                            )
+                            errors.append(f"{name}: {stop_message}")
+                            if isinstance(value, dict):
+                                value["safety_stopped"] = True
+                                value["message"] = stop_message
                         stages[name] = {
                             "status": stage_status,
                             "result": value,
@@ -13824,30 +14643,62 @@ class NextUiController:
                 if enabled["products"] and store_ids:
                     def refresh_products() -> dict[str, Any]:
                         results: list[dict[str, Any]] = []
-                        job_ids: list[tuple[str, int]] = []
-                        for store in all_stores:
-                            try:
-                                job = self._start_product_refresh(
+                        pending = list(all_stores)
+                        in_flight: list[tuple[str, int]] = []
+                        while pending or in_flight:
+                            while (
+                                pending
+                                and len(in_flight)
+                                < STARTUP_PRODUCT_REFRESH_CONCURRENCY
+                            ):
+                                if not self._job_update_allowed(generation):
+                                    break
+                                store = pending.pop(0)
+                                try:
+                                    job = self._start_product_refresh(
+                                        {
+                                            "store_id": store.id,
+                                            "tab_keys": [
+                                                "sales",
+                                                "offline",
+                                                "recycle",
+                                            ],
+                                        }
+                                    )
+                                except Exception as exc:
+                                    results.append(
+                                        {
+                                            "store_id": store.id,
+                                            "status": "failed",
+                                            "error": str(exc),
+                                        }
+                                    )
+                                    continue
+                                in_flight.append(
+                                    (str(job["job_id"]), store.id)
+                                )
+                            if not self._job_update_allowed(generation):
+                                cancelled = [
                                     {
                                         "store_id": store.id,
-                                        "tab_keys": [
-                                            "sales",
-                                            "offline",
-                                            "recycle",
-                                        ],
+                                        "status": "cancelled",
+                                        "message": "账户已切换，未启动该店铺商品刷新",
                                     }
-                                )
-                            except Exception as exc:
-                                results.append(
+                                    for store in pending
+                                ]
+                                cancelled.extend(
                                     {
-                                        "store_id": store.id,
-                                        "status": "failed",
-                                        "error": str(exc),
+                                        "store_id": store_id,
+                                        "status": "cancelled",
+                                        "message": "账户已切换，停止等待该店铺商品刷新",
                                     }
+                                    for _job_id, store_id in in_flight
                                 )
+                                results.extend(cancelled)
+                                break
+                            if not in_flight:
                                 continue
-                            job_ids.append((str(job["job_id"]), store.id))
-                        for job_id, store_id in job_ids:
+                            job_id, store_id = in_flight.pop(0)
                             result = self._wait_refresh_job(
                                 self._product_jobs,
                                 self._product_jobs_lock,
@@ -13865,9 +14716,24 @@ class NextUiController:
                             row for row in results
                             if row.get("status") not in {"completed"}
                         ]
+                        safety_stopped = bool(results) and all(
+                            row.get("status") in {"paused", "cancelled"}
+                            for row in results
+                        )
                         return {
                             "stores": results,
                             "errors": failures,
+                            "status": (
+                                "cancelled"
+                                if safety_stopped
+                                else "partial" if failures else "completed"
+                            ),
+                            "safety_stopped": safety_stopped,
+                            "message": (
+                                "账户切换或暂停使商品刷新被安全停止"
+                                if safety_stopped
+                                else ""
+                            ),
                         }
 
                     run_stage("products", refresh_products)
@@ -13879,6 +14745,14 @@ class NextUiController:
                 ]
                 if not errors:
                     status = "completed"
+                elif (
+                    enabled_stage_statuses
+                    and all(
+                        value == "cancelled"
+                        for value in enabled_stage_statuses
+                    )
+                ):
+                    status = "cancelled"
                 elif (
                     enabled_stage_statuses
                     and all(
@@ -14597,6 +15471,7 @@ class NextUiController:
         self,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_global_task_start("自动化任务")
         raw_ids = payload.get("task_ids")
         if not isinstance(raw_ids, list):
             raw_ids = [raw_ids]
@@ -14616,6 +15491,7 @@ class NextUiController:
             raise ValueError("部分自动化任务不存在")
         generation = self._current_generation()
         owner = self._job_owner_fields()
+        cancel_event = threading.Event()
         with self._automation_jobs_lock:
             active = [
                 row
@@ -14637,11 +15513,12 @@ class NextUiController:
                 "errors": [],
                 "started_at": datetime.now().isoformat(timespec="seconds"),
                 "finished_at": "",
+                "_cancel_event": cancel_event,
             }
             self._automation_jobs[job_id] = job
         thread = threading.Thread(
             target=self._run_automation_job,
-            args=(job_id, tasks, generation),
+            args=(job_id, tasks, generation, cancel_event),
             daemon=True,
             name=f"webui-automation-{job_id[:8]}",
         )
@@ -14663,6 +15540,21 @@ class NextUiController:
         self,
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        pause_state = self._global_task_pause_gate.snapshot()
+        if pause_state.get("error"):
+            return {
+                "due": 0,
+                "started": False,
+                "job_id": "",
+                "message": "全局暂停状态不可用，未启动到期自动化任务",
+            }
+        if pause_state.get("paused") is True:
+            return {
+                "due": 0,
+                "started": False,
+                "job_id": "",
+                "message": "全局操作已暂停，未启动到期自动化任务",
+            }
         current = now or datetime.now()
         now_text = current.strftime("%Y-%m-%d %H:%M:%S")
         due = [
@@ -14712,6 +15604,14 @@ class NextUiController:
 
             def worker() -> None:
                 while not self._automation_scheduler_stop.wait(1.0):
+                    pause_state = self._global_task_pause_gate.snapshot()
+                    if (
+                        pause_state.get("paused") is True
+                        or pause_state.get("error")
+                    ):
+                        if self._automation_scheduler_stop.wait(1.0):
+                            break
+                        continue
                     try:
                         self.run_due_automation_tasks()
                     except Exception:
@@ -14770,14 +15670,43 @@ class NextUiController:
         job_id: str,
         tasks: list[dict[str, Any]],
         generation: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         generation = (
             self._current_generation()
             if generation is None
             else int(generation)
         )
+        if cancel_event is None:
+            with self._automation_jobs_lock:
+                candidate = self._automation_jobs.get(job_id) or {}
+                value = candidate.get("_cancel_event")
+                cancel_event = (
+                    value if isinstance(value, threading.Event) else threading.Event()
+                )
+
+        def wait_for_step() -> None:
+            if not self._wait_for_global_task_start(
+                generation,
+                also_current=lambda: not cancel_event.is_set(),
+            ):
+                raise _BackgroundTaskStopped(
+                    "自动化任务已取消或账户代次已变化"
+                )
+
         for index, task in enumerate(tasks, start=1):
-            if not self._job_update_allowed(generation):
+            try:
+                wait_for_step()
+            except _BackgroundTaskStopped as exc:
+                with self._automation_jobs_lock:
+                    if self._job_update_allowed(generation):
+                        job = self._automation_jobs.get(job_id)
+                        if job is not None:
+                            job["status"] = "cancelled"
+                            job["message"] = str(exc)
+                            job["finished_at"] = datetime.now().isoformat(
+                                timespec="seconds"
+                            )
                 return
             with self._automation_jobs_lock:
                 if not self._job_update_allowed(generation):
@@ -14786,7 +15715,22 @@ class NextUiController:
                 job["message"] = f"正在执行：{task.get('name') or task.get('id')}"
                 job["current"] = index - 1
             try:
-                message = self._execute_automation_task(task)
+                message = self._execute_automation_task(
+                    task,
+                    generation=generation,
+                    cancel_event=cancel_event,
+                )
+            except _BackgroundTaskStopped as exc:
+                with self._automation_jobs_lock:
+                    if self._job_update_allowed(generation):
+                        job = self._automation_jobs.get(job_id)
+                        if job is not None:
+                            job["status"] = "cancelled"
+                            job["message"] = str(exc)
+                            job["finished_at"] = datetime.now().isoformat(
+                                timespec="seconds"
+                            )
+                return
             except Exception as exc:
                 if not self._job_update_allowed(generation):
                     return
@@ -14870,7 +15814,32 @@ class NextUiController:
             )
             job["finished_at"] = datetime.now().isoformat(timespec="seconds")
 
-    def _execute_automation_task(self, task: dict[str, Any]) -> str:
+    def _execute_automation_task(
+        self,
+        task: dict[str, Any],
+        *,
+        generation: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        generation = (
+            self._current_generation()
+            if generation is None
+            else int(generation)
+        )
+
+        def checkpoint() -> None:
+            if not self._wait_for_global_task_start(
+                generation,
+                also_current=(
+                    (lambda: not cancel_event.is_set())
+                    if cancel_event is not None
+                    else None
+                ),
+            ):
+                raise _BackgroundTaskStopped(
+                    "自动化任务已取消或账户代次已变化"
+                )
+
         service = self._require_product_service()
         task_type = self._automation_task_type(task.get("task_type"))
         raw_store_id = task.get("store_id")
@@ -14889,6 +15858,7 @@ class NextUiController:
         if task_type == "procurement_sync":
             count = 0
             for account in self.db.list_procurement_accounts():
+                checkpoint()
                 result = service.sync_procurement_account(int(account["id"]))
                 count += int(getattr(result, "count", 0) or 0)
             return f"采购同步 {count} 条"
@@ -14907,6 +15877,7 @@ class NextUiController:
                     service,
                     store,
                     config,
+                    before_write=checkpoint,
                 )
                 if error:
                     errors.append(error)
@@ -14916,6 +15887,7 @@ class NextUiController:
                 raise RuntimeError("；".join(errors[:8]))
             return f"托管执行完成：{executed} 家店铺"
         for store in stores:
+            checkpoint()
             if task_type == "order_sync":
                 result = service.sync_orders(
                     store,
@@ -14932,6 +15904,7 @@ class NextUiController:
                 messages.append(str(getattr(result, "message", result)))
             elif task_type == "product_sync":
                 result = service.sync_products(store, max_items=300)
+                checkpoint()
                 service.sync_product_details(store, max_items=300)
                 messages.append(str(getattr(result, "message", result)))
             elif task_type == "product_status":
@@ -16742,7 +17715,11 @@ class NextUiController:
         self,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_global_task_start("活动续期扫描")
         manager = self._require_activity_renewal_manager()
+        generation = self._current_generation()
+        owner = self._job_owner_fields()
+        cancel_event = threading.Event()
         raw_store_ids = payload.get("store_ids")
         if raw_store_ids in (None, [], ""):
             store_ids = [
@@ -16774,16 +17751,20 @@ class NextUiController:
             job_id = uuid.uuid4().hex
             self._activity_renewal_jobs[job_id] = {
                 "job_id": job_id,
+                **owner,
                 "status": "starting",
                 "current": 0,
                 "total": len(store_ids),
                 "message": "正在准备自动续期检查…",
                 "errors": [],
                 "results": [],
+                "_cancel_event": cancel_event,
             }
 
         def update(**changes: Any) -> None:
             with self._activity_renewal_jobs_lock:
+                if not self._job_update_allowed(generation):
+                    return
                 job = self._activity_renewal_jobs.get(job_id)
                 if job is not None:
                     job.update(changes)
@@ -16843,6 +17824,13 @@ class NextUiController:
             "job_id": job_id,
             "already_running": False,
         }
+
+    def _activity_renewal_step_ready(self) -> bool:
+        with self._account_session_lock:
+            if self._account_session_closing:
+                return False
+            generation = int(self._account_generation)
+        return self._wait_for_global_task_start(generation)
 
     def _activity_renewal_scan_status(
         self,
@@ -19110,6 +20098,7 @@ class NextUiController:
         return {"logs": logs[:5000], "count": len(logs)}
 
     def _start_upload_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_global_task_start("上传任务")
         service = self._require_product_service()
         if self._active_upload_job("run"):
             raise ValueError("已有上传任务正在运行")
@@ -19204,6 +20193,11 @@ class NextUiController:
         job_id = uuid.uuid4().hex
         generation = self._current_generation()
         owner = self._job_owner_fields()
+        run_task_ids = tuple(
+            str(task.get("id") or "")
+            for task in selected
+            if str(task.get("id") or "").strip()
+        )
         with self._upload_jobs_lock:
             self._upload_jobs[job_id] = {
                 "job_id": job_id,
@@ -19215,6 +20209,9 @@ class NextUiController:
                 "total": len(runnable_items),
                 "errors": [],
                 "tasks": [],
+                "_run_task_ids": run_task_ids,
+                "_upload_worker": None,
+                "_upload_worker_returned": False,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             }
 
@@ -19234,29 +20231,75 @@ class NextUiController:
                             job[key] = value
 
         def worker() -> None:
+            update(_upload_worker=threading.current_thread())
             try:
                 from types import SimpleNamespace
                 from ..pyside.pages.upload import UploadRunner
 
                 def progress(message: str, completed: int, total: int) -> None:
+                    globally_paused = (
+                        self._global_task_pause_gate.current_snapshot().get(
+                            "paused"
+                        )
+                        is True
+                    )
                     update(
-                        status="running",
+                        status="paused" if globally_paused else "running",
                         message=message,
                         completed=completed,
                         total=total,
                     )
 
-                runner = UploadRunner(
-                    SimpleNamespace(
-                        db=self.db,
-                        service=_ScopedUploadProductService(self, service),
-                    ),
-                    tasks,
-                    progress=progress,
-                    external_stop_requested=lambda: (
+                def upload_start_guard() -> bool:
+                    return (
+                        self._wait_for_global_task_start(
+                            generation,
+                            also_current=lambda: (
+                                not runner.cancelled.is_set()
+                                and not runner.paused.is_set()
+                            ),
+                        )
+                    )
+
+                scoped_service = _ScopedUploadProductService(
+                    self,
+                    service,
+                )
+                workspace = SimpleNamespace(
+                    db=self.db,
+                    service=scoped_service,
+                )
+                runner_options = {
+                    "progress": progress,
+                    "external_stop_requested": lambda: (
                         not self._job_update_allowed(generation)
                     ),
-                )
+                    "start_guard": upload_start_guard,
+                }
+                try:
+                    runner = UploadRunner(
+                        workspace,
+                        tasks,
+                        **runner_options,
+                    )
+                except TypeError as exc:
+                    error_text = str(exc)
+                    if "external_stop_requested" in error_text:
+                        # Older injected runners expose only the global
+                        # pause guard.
+                        runner_options.pop("external_stop_requested")
+                    elif "start_guard" in error_text:
+                        # v1.9.02 injected runners expose only the account
+                        # lifecycle guard.
+                        runner_options.pop("start_guard")
+                    else:
+                        raise
+                    runner = UploadRunner(
+                        workspace,
+                        tasks,
+                        **runner_options,
+                    )
+                scoped_service.bind_runner(runner)
                 with self._upload_jobs_lock:
                     job = self._upload_jobs.get(job_id)
                     if job is not None:
@@ -19275,19 +20318,56 @@ class NextUiController:
                 )
                 if not self._job_update_allowed(generation):
                     return
+                with self._upload_jobs_lock:
+                    if not self._job_update_allowed(generation):
+                        return
+                    job = self._upload_jobs.get(job_id)
+                    if job is not None:
+                        job["_upload_worker_returned"] = True
                 refreshed = self._upload_tasks()
+                run_task_id_set = set(run_task_ids)
+                unfinished_items = any(
+                    str(item.get("status") or "")
+                    not in {
+                        "success",
+                        "skipped",
+                        "failed",
+                        "verification_pending",
+                        "waiting_category",
+                        "cancelled",
+                    }
+                    for task in refreshed
+                    if not run_task_id_set
+                    or str(task.get("id") or "") in run_task_id_set
+                    for item in task.get("items") or []
+                )
                 waiting_category = any(
                     item.get("status") == "waiting_category"
                     for task in refreshed
                     if str(task.get("id") or "") in selected_ids
                     for item in task.get("items") or []
                 )
+                global_state = (
+                    self._global_task_pause_gate.current_snapshot()
+                )
                 if runner.cancelled.is_set():
                     status = "cancelled"
                     message = "上传已取消，未提交商品保持未提交状态"
-                elif runner.paused.is_set():
+                elif global_state.get("error") and unfinished_items:
+                    status = "paused"
+                    message = "全局暂停状态不可用，上传已停在安全边界"
+                elif (
+                    global_state.get("paused") is True
+                    and unfinished_items
+                ):
+                    status = "paused"
+                    message = "全局操作已暂停，未处理商品等待恢复"
+                elif runner.paused.is_set() and unfinished_items:
                     status = "paused"
                     message = "已暂停，当前商品处理完成；未处理商品等待继续"
+                elif unfinished_items:
+                    status = "paused"
+                    message = "上传仍有未完成商品，等待人工恢复"
                 elif waiting_category:
                     status = "partial"
                     message = "部分商品等待类目生效，已安排后续自动恢复上传"
@@ -19303,6 +20383,12 @@ class NextUiController:
                     errors=errors,
                     tasks=refreshed,
                     runner=None,
+                    _upload_worker=None,
+                    _upload_worker_returned=True,
+                    paused_by_global_task=False,
+                    previous_status=None,
+                    global_pause_revision=None,
+                    paused_at="",
                 )
                 if waiting_category and self._job_update_allowed(generation):
                     self._schedule_upload_category_resume(refreshed)
@@ -19312,6 +20398,12 @@ class NextUiController:
                     message=f"{type(exc).__name__}: {exc}",
                     errors=[str(exc)],
                     runner=None,
+                    _upload_worker=None,
+                    _upload_worker_returned=True,
+                    paused_by_global_task=False,
+                    previous_status=None,
+                    global_pause_revision=None,
+                    paused_at="",
                 )
 
         threading.Thread(
@@ -19353,7 +20445,9 @@ class NextUiController:
                 runner.paused.set()
                 job["status"] = "pausing"
                 job["message"] = "正在暂停；当前商品处理结束后停止"
-            return self._public_upload_job(job)
+            result = self._public_upload_job(job)
+        self._global_task_pause_gate.notify_waiters()
+        return result
 
     def _pause_upload_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request_upload_job_control(payload, cancel=False)

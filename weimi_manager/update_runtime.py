@@ -9,6 +9,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 import requests
 
@@ -19,6 +20,7 @@ from .update_protocol import (
 )
 
 MAX_PATCH_BYTES = 200 * 1024 * 1024
+CHANNEL_ASSET_NAME = "hot_update_channel.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,13 +34,90 @@ class RuntimeCycle:
         return self.activated_patch_ids
 
 
-def fetch_signed_channel(source: str) -> Mapping[str, Any]:
-    response = requests.get(source, timeout=(8, 30))
+def _validate_public_https_url(value: str, label: str) -> str:
+    text = str(value or "").strip()
+    parsed = urlsplit(text)
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(f"{label}必须是无凭据的 HTTPS 地址")
+    return text
+
+
+def _response_json(response: Any, source: str) -> Mapping[str, Any]:
     response.raise_for_status()
+    _validate_public_https_url(
+        str(getattr(response, "url", source) or source),
+        "更新频道最终地址",
+    )
     payload = response.json()
     if not isinstance(payload, Mapping):
         raise ValueError("更新频道清单格式无效")
     return payload
+
+
+def _is_github_release_api(source: str) -> bool:
+    parsed = urlsplit(source)
+    return (
+        str(parsed.hostname or "").casefold() == "api.github.com"
+        and parsed.path.startswith("/repos/")
+        and "/releases/" in parsed.path
+    )
+
+
+def _discover_github_release_asset(source: str) -> str:
+    response = requests.get(
+        source,
+        timeout=(8, 30),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "LangLang-HotUpdate/1",
+        },
+    )
+    release = _response_json(response, source)
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise ValueError("GitHub Release 响应缺少 assets")
+    matches = [
+        item
+        for item in assets
+        if isinstance(item, Mapping)
+        and str(item.get("name") or "") == CHANNEL_ASSET_NAME
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"GitHub Release 必须包含且仅包含一个 {CHANNEL_ASSET_NAME}"
+        )
+    asset_url = _validate_public_https_url(
+        str(matches[0].get("browser_download_url") or ""),
+        "GitHub Release 频道资产地址",
+    )
+    api_parts = urlsplit(source).path.strip("/").split("/")
+    asset_parts = urlsplit(asset_url).path.strip("/").split("/")
+    if (
+        len(api_parts) < 3
+        or len(asset_parts) < 6
+        or str(urlsplit(asset_url).hostname or "").casefold() != "github.com"
+        or asset_parts[0] != api_parts[1]
+        or asset_parts[1] != api_parts[2]
+        or asset_parts[2] != "releases"
+        or asset_parts[3] != "download"
+    ):
+        raise ValueError("GitHub Release 频道资产地址越界")
+    return asset_url
+
+
+def fetch_signed_channel(source: str) -> Mapping[str, Any]:
+    trusted_source = _validate_public_https_url(source, "更新频道地址")
+    if _is_github_release_api(trusted_source):
+        asset_url = _discover_github_release_asset(trusted_source)
+        response = requests.get(asset_url, timeout=(8, 30))
+        return _response_json(response, asset_url)
+    response = requests.get(trusted_source, timeout=(8, 30))
+    return _response_json(response, trusted_source)
 
 
 def download_patch_archive(
@@ -62,6 +141,10 @@ def download_patch_archive(
                 timeout=(8, 60),
             ) as response:
                 response.raise_for_status()
+                _validate_public_https_url(
+                    str(response.url or patch.url),
+                    "补丁下载最终地址",
+                )
                 for chunk in response.iter_content(1024 * 1024):
                     if not chunk:
                         continue

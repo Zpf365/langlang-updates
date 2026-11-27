@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import tkinter as tk
@@ -18,6 +17,7 @@ from ..account_store_sync import (
 from ..db import Database
 from ..models import Store
 from ..store_scope import logged_in_stores
+from ..store_refresh_pool import resolve_store_refresh_workers
 from .dialogs import CookieImportDialog, StoreDialog
 from .theme import MUTED, PANEL, TEXT, button
 
@@ -1364,17 +1364,7 @@ class StorePage(ttk.Frame):
                     store_errors.append(f"{store.name}: {exc}")
                 return store.name, store_errors
 
-            try:
-                configured = int(
-                    os.environ.get(
-                        "WEIMI_STORE_REFRESH_WORKERS",
-                        "6",
-                    )
-                )
-            except ValueError:
-                configured = 6
-            workers = min(8, max(1, configured, 1))
-            workers = max(1, min(workers, len(eligible)))
+            workers = resolve_store_refresh_workers(len(eligible))
             completed = 0
             total = len(eligible)
             with ThreadPoolExecutor(

@@ -38,7 +38,10 @@ def test_startup_refresh_runs_background_domains_once(tmp_path: Path) -> None:
     def store_refresh(_payload):
         calls.append("stores")
         job_id = "store-job"
-        controller._store_jobs[job_id] = {"status": "completed"}
+        controller._store_jobs[job_id] = {
+            "status": "completed",
+            **controller._job_owner_fields(),
+        }
         return {"job_id": job_id}
 
     def order_refresh(_payload):
@@ -46,6 +49,7 @@ def test_startup_refresh_runs_background_domains_once(tmp_path: Path) -> None:
         job_id = "order-job"
         controller._order_jobs[job_id] = {
             "status": "completed",
+            **controller._job_owner_fields(),
             "updated": 434,
             "status_changes": [{"order_id": "changed"}],
             "orders": [{"order_id": f"bulk-{index}"} for index in range(500)],
@@ -55,7 +59,10 @@ def test_startup_refresh_runs_background_domains_once(tmp_path: Path) -> None:
     def product_refresh(payload):
         calls.append(f"products:{payload['store_id']}")
         job_id = f"product-{payload['store_id']}"
-        controller._product_jobs[job_id] = {"status": "completed"}
+        controller._product_jobs[job_id] = {
+            "status": "completed",
+            **controller._job_owner_fields(),
+        }
         return {"job_id": job_id}
 
     with (
@@ -452,9 +459,10 @@ def test_startup_refresh_rejects_parallel_duplicate(tmp_path: Path) -> None:
     controller._start_product_refresh = mock.Mock(
         return_value={"job_id": "p"}
     )
-    controller._store_jobs["s"] = {"status": "completed"}
-    controller._order_jobs["o"] = {"status": "completed"}
-    controller._product_jobs["p"] = {"status": "completed"}
+    owner = controller._job_owner_fields()
+    controller._store_jobs["s"] = {"status": "completed", **owner}
+    controller._order_jobs["o"] = {"status": "completed", **owner}
+    controller._product_jobs["p"] = {"status": "completed", **owner}
     first = controller.dispatch("startup.refresh.start", {})
     assert entered.wait(2)
     second = controller.dispatch("startup.refresh.start", {})
@@ -465,3 +473,148 @@ def test_startup_refresh_rejects_parallel_duplicate(tmp_path: Path) -> None:
     assert second["started"] is False
     assert second["already_running"] is True
     assert second["run_id"] == first["run_id"]
+def test_startup_product_refresh_uses_bounded_concurrency(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "startup-bounded-products.db")
+    for index in range(70):
+        database.add_store(
+            f"有界商品店铺{index}",
+            f"wx-bounded-product-{index}",
+            "secret",
+        )
+    controller = NextUiController(database)
+    started: list[int] = []
+    active = 0
+    max_active = 0
+    limit_reached = threading.Event()
+    release = threading.Event()
+
+    def product_refresh(payload):
+        nonlocal active, max_active
+        store_id = int(payload["store_id"])
+        started.append(store_id)
+        active += 1
+        max_active = max(max_active, active)
+        job_id = f"product-{store_id}"
+        controller._product_jobs[job_id] = {
+            "status": "running",
+            "message": "running",
+            **controller._job_owner_fields(),
+        }
+        if len(started) == 4:
+            limit_reached.set()
+        return {"job_id": job_id}
+
+    def wait_refresh(jobs, lock, job_id, **_kwargs):
+        nonlocal active
+        if len(started) >= 4 and not release.is_set():
+            assert release.wait(3)
+        active -= 1
+        with lock:
+            job = jobs[job_id]
+            job.update(status="completed", message="completed")
+            return dict(job)
+
+    with (
+        mock.patch.object(controller, "_start_product_refresh", side_effect=product_refresh),
+        mock.patch.object(controller, "_wait_refresh_job", side_effect=wait_refresh),
+    ):
+        controller.dispatch(
+            "startup.refresh.start",
+            {
+                "enabled": {
+                    "stores": False,
+                    "orders": False,
+                    "products": True,
+                    "violations": False,
+                }
+            },
+        )
+        assert limit_reached.wait(2)
+        assert len(started) == 4
+        release.set()
+        controller._startup_refresh_thread.join(5)
+
+    assert len(started) == 70
+    assert len(set(started)) == 70
+    assert max_active <= 4
+
+
+def test_refresh_wait_rejects_job_owned_by_another_account(
+    tmp_path: Path,
+) -> None:
+    controller = NextUiController(
+        Database(tmp_path / "wait-owner.db"),
+        account_label="current-account",
+    )
+    jobs = {
+        "foreign-job": {
+            "status": "running",
+            "account_id": "other-account",
+            "generation": controller._current_generation(),
+        }
+    }
+    result: list[dict] = []
+    wait_thread = threading.Thread(
+        target=lambda: result.append(
+            controller._wait_refresh_job(
+                jobs,
+                threading.Lock(),
+                "foreign-job",
+                timeout=2,
+            )
+        ),
+        daemon=True,
+    )
+    wait_thread.start()
+    wait_thread.join(0.5)
+
+    assert wait_thread.is_alive() is False
+    assert result[0]["status"] == "paused"
+    assert result[0]["safety_stopped"] is True
+
+
+def test_startup_product_refresh_stops_safely_after_account_switch(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "startup-account-switch.db")
+    database.add_store("切换店铺", "wx-switch-product", "secret")
+    controller = NextUiController(database, account_label="current-account")
+    started = threading.Event()
+
+    def product_refresh(_payload):
+        job_id = "product-running"
+        controller._product_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            **controller._job_owner_fields(),
+        }
+        started.set()
+        return {"job_id": job_id}
+
+    with mock.patch.object(
+        controller,
+        "_start_product_refresh",
+        side_effect=product_refresh,
+    ):
+        controller.dispatch(
+            "startup.refresh.start",
+            {
+                "enabled": {
+                    "stores": False,
+                    "orders": False,
+                    "products": True,
+                    "violations": False,
+                }
+            },
+        )
+        assert started.wait(2)
+    controller._freeze_account_work("switch")
+    controller._startup_refresh_thread.join(1)
+
+    assert controller._startup_refresh_thread.is_alive() is False
+    status = controller._startup_refresh_status({})
+    assert status["status"] == "cancelled"
+    assert status["stages"]["products"]["status"] == "cancelled"
+    assert status["stages"]["products"]["result"]["safety_stopped"] is True

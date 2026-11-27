@@ -1,7 +1,12 @@
 {
   "schema_version": 1,
   "enabled": false,
-  "blocker": "正式 Ed25519 私钥托管、签名流程和受控补丁频道尚未由 CTO 建立",
-  "channel_url": "",
-  "keys": []
+  "blocker": "签名热更新已就绪，默认保持关闭；受控发布时需显式启用",
+  "channel_url": "https://api.github.com/repos/Zpf365/langlang-updates/releases/latest",
+  "keys": [
+    {
+      "key_id": "langlang-release-2026-11",
+      "public_key": "tgcH1U7IfcZa9LavY22ZBs8etqO1PXLFADVHj1OzeoM="
+    }
+  ]
 }

@@ -187,9 +187,16 @@ class FrontendServer:
                     )
                     return
                 except ValueError as exc:
+                    error_payload: dict[str, Any] = {
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                    code = str(getattr(exc, "code", "") or "")
+                    if code:
+                        error_payload["code"] = code
                     self._send_json(
                         HTTPStatus.BAD_REQUEST,
-                        {"ok": False, "error": str(exc)},
+                        error_payload,
                     )
                     return
                 except Exception as exc:

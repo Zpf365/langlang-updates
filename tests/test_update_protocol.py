@@ -87,12 +87,16 @@ def test_signed_channel_accepts_compatible_rollout_patch() -> None:
     assert channel.patches[0].files[0].path == "index.html"
 
 
-def test_checked_in_trust_config_stays_disabled_until_key_custody_exists() -> None:
-    trust = load_trust_config(ROOT / "assets")
+def test_checked_in_trust_config_is_closed_by_default_with_signed_channel_ready() -> None:
+    trust = load_trust_config(ROOT)
 
     assert trust.enabled is False
-    assert trust.public_keys == {}
-    assert trust.channel_url == ""
+    assert set(trust.public_keys) == {"langlang-release-2026-11"}
+    assert len(base64.b64decode(trust.public_keys["langlang-release-2026-11"])) == 32
+    assert trust.channel_url == (
+        "https://api.github.com/repos/Zpf365/langlang-updates/"
+        "releases/latest"
+    )
     assert trust.blocker
 
 

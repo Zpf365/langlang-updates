@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   STORE_LIST_SYNC_INTERVAL_MS,
+  getStoreInteractionState,
   startRepeatingSync,
 } from "./storeListSync";
 
@@ -9,6 +10,38 @@ afterEach(() => {
 });
 
 describe("store list live sync", () => {
+  it("keeps login available while a backend window is opening", () => {
+    const state = getStoreInteractionState({
+      hasSelection: true,
+      loginBusy: false,
+      openBackendBusy: true,
+    });
+
+    expect(state.loginActionDisabled).toBe(false);
+    expect(state.openBackendActionDisabled).toBe(true);
+    expect(state.filtersEnabled).toBe(true);
+    expect(state.groupsEnabled).toBe(true);
+    expect(state.selectionEnabled).toBe(true);
+  });
+
+  it("blocks duplicate login and backend opens independently", () => {
+    const loginBusy = getStoreInteractionState({
+      hasSelection: true,
+      loginBusy: true,
+      openBackendBusy: false,
+    });
+    const backendBusy = getStoreInteractionState({
+      hasSelection: true,
+      loginBusy: false,
+      openBackendBusy: true,
+    });
+
+    expect(loginBusy.loginActionDisabled).toBe(true);
+    expect(loginBusy.openBackendActionDisabled).toBe(false);
+    expect(backendBusy.loginActionDisabled).toBe(false);
+    expect(backendBusy.openBackendActionDisabled).toBe(true);
+  });
+
   it("defaults to a low-frequency refresh during long background work", () => {
     expect(STORE_LIST_SYNC_INTERVAL_MS).toBe(3000);
   });

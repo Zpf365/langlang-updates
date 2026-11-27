@@ -2034,3 +2034,154 @@ def test_cancelled_waiting_category_task_does_not_touch_platform(
 
     assert calls == []
     assert task["items"][0]["status"] in {"cancelled", "waiting_category"}
+
+
+def _cancel_boundary_upload_task(store_id: int, store_name: str) -> dict:
+    return {
+        "id": "task-cancel-boundary",
+        "store_id": store_id,
+        "store_name": store_name,
+        "status": "pending",
+        "template": {
+            "name": "cancel-boundary",
+            "duplicate_filter_mode": "off",
+            "auto_open_category": False,
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": f"item-cancel-{index}",
+                "source_product_id": f"source-cancel-{index}",
+                "title": f"Cancellation boundary {index}",
+                "status": "pending",
+                "payload": {
+                    "title": f"Cancellation boundary {index}",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats": ["6033", "6093", "549163"],
+                },
+            }
+            for index in (1, 2)
+        ],
+    }
+
+
+def test_upload_cancel_keeps_completed_inflight_item_and_stops_later_items(
+    tmp_path: Path,
+) -> None:
+    db = Database(
+        tmp_path / "upload-cancel-completed.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Cancel completed",
+        "wx-cancel-completed",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    task = _cancel_boundary_upload_task(store_id, store.name)
+    calls: list[str] = []
+    runner_ref: dict[str, UploadRunner] = {}
+
+    class Service:
+        @classmethod
+        def product_write(cls, _store, _action, payload, **_kwargs):
+            calls.append(str(payload.get("title") or ""))
+            runner_ref["runner"].cancelled.set()
+            return {"product_id": "WX-CANCEL-COMPLETED"}
+
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    )
+    runner_ref["runner"] = runner
+
+    runner.run([task])
+
+    assert calls == ["Cancellation boundary 1"]
+    assert task["items"][0]["status"] == "success"
+    assert task["items"][0]["product_id"] == "WX-CANCEL-COMPLETED"
+    assert task["items"][1]["status"] == "cancelled"
+    assert "未提交" in task["items"][1]["message"]
+
+
+def test_upload_cancel_keeps_inflight_unknown_result_for_verification(
+    tmp_path: Path,
+) -> None:
+    db = Database(
+        tmp_path / "upload-cancel-unknown.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store("Cancel unknown", "wx-cancel-unknown", "secret")
+    store = db.get_store(store_id)
+    task = _cancel_boundary_upload_task(store_id, store.name)
+    calls: list[str] = []
+    runner_ref: dict[str, UploadRunner] = {}
+
+    class Service:
+        @classmethod
+        def product_write(cls, _store, _action, payload, **_kwargs):
+            calls.append(str(payload.get("title") or ""))
+            runner_ref["runner"].cancelled.set()
+            raise TimeoutError("network timeout after submit")
+
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    )
+    runner_ref["runner"] = runner
+
+    runner.run([task])
+
+    assert calls == ["Cancellation boundary 1"]
+    assert task["items"][0]["status"] == "verification_pending"
+    assert "远端提交结果未知" in task["items"][0]["message"]
+    assert task["items"][1]["status"] == "cancelled"
+    assert "未提交" in task["items"][1]["message"]
+
+
+def test_upload_cancel_rechecks_after_pause_before_product_write(
+    tmp_path: Path,
+) -> None:
+    db = Database(
+        tmp_path / "upload-pause-cancel-race.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store("Pause cancel race", "wx-pause-cancel", "secret")
+    store = db.get_store(store_id)
+    task = _cancel_boundary_upload_task(store_id, store.name)
+    calls: list[str] = []
+    runner_ref: dict[str, UploadRunner] = {}
+    stop_checks = 0
+
+    class Service:
+        @classmethod
+        def product_write(cls, _store, _action, payload, **_kwargs):
+            calls.append(str(payload.get("title") or ""))
+            return {"product_id": "SHOULD-NOT-BE-SUBMITTED"}
+
+    def stop_after_pause() -> bool:
+        nonlocal stop_checks
+        stop_checks += 1
+        if stop_checks == 1:
+            runner_ref["runner"].paused.set()
+            runner_ref["runner"].cancelled.set()
+        return False
+
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+        external_stop_requested=stop_after_pause,
+    )
+    runner_ref["runner"] = runner
+
+    runner.run([task])
+
+    assert calls == []
+    assert stop_checks >= 1
+    assert task["items"][0]["status"] == "cancelled"
+    assert "未提交" in task["items"][0]["message"]

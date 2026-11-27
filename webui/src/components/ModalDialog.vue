@@ -6,7 +6,10 @@ defineProps({
   title: { type: String, default: "" },
   subtitle: { type: String, default: "" },
   width: { type: String, default: "720px" },
+  maskClass: { type: String, default: "" },
+  maskStyle: { type: Object, default: () => ({}) },
   panelClass: { type: String, default: "" },
+  panelStyle: { type: Object, default: () => ({}) },
   zIndex: { type: Number, default: 100 },
   confirmLabel: { type: String, default: "" },
   cancelLabel: { type: String, default: "取消" },
@@ -21,14 +24,15 @@ defineEmits(["close", "confirm", "cancel"]);
       <div
         v-if="open"
         class="modal-mask"
-        :style="{ zIndex }"
+        :class="maskClass"
+        :style="[{ zIndex }, maskStyle]"
         role="presentation"
         @mousedown.self="$emit('close')"
       >
         <section
           class="modal-card"
           :class="panelClass"
-          :style="{ maxWidth: width }"
+          :style="[{ maxWidth: width }, panelStyle]"
           role="dialog"
           aria-modal="true"
         >

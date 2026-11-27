@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { beginAccountHandoff, call } from "./api";
+import GlobalTaskPauseControl from "./components/GlobalTaskPauseControl.vue";
 import Icon from "./components/Icon.vue";
 import ModalDialog from "./components/ModalDialog.vue";
 import { readAutoRefreshEnabled } from "./autoRefresh";
@@ -504,6 +505,8 @@ watch(
           <small>v{{ bootstrap.brand.version }}</small>
         </div>
       </div>
+
+      <GlobalTaskPauseControl />
 
       <button
         v-if="availableUpdate && canUseSoftwareUpdate"

@@ -92,6 +92,7 @@ class ActivityAutoRenewalManager:
         *,
         now_provider: Callable[[], datetime] | None = None,
         write_scope: Callable[[Any], Any] | None = None,
+        before_step: Callable[[], bool] | None = None,
     ) -> None:
         self.db = db
         self.service = service
@@ -105,6 +106,11 @@ class ActivityAutoRenewalManager:
         self._next_scan_at = 0
         self._last_result: dict[str, Any] = {}
         self._write_scope = write_scope
+        self._before_step = before_step
+
+    def _can_continue(self) -> bool:
+        callback = self._before_step
+        return True if callback is None else bool(callback())
 
     def _now(self, now: datetime | None = None) -> datetime:
         value = now or self._now_provider()
@@ -599,6 +605,12 @@ class ActivityAutoRenewalManager:
         ):
             return existing
         attempts += 1
+        if not self._can_continue():
+            return {
+                "product_id": product_id,
+                "status": "paused",
+                "message": "账户或任务代次已变化，未提交活动创建",
+            }
         self.db.save_activity_auto_create_run(
             int(store.id),
             product_id,
@@ -957,6 +969,8 @@ class ActivityAutoRenewalManager:
 
     def _loop(self) -> None:
         while not self._stop.wait(5):
+            if not self._can_continue():
+                continue
             try:
                 self.run_due()
             except Exception as exc:
@@ -974,6 +988,13 @@ class ActivityAutoRenewalManager:
         now: datetime | None = None,
         progress: Callable[[str, int, int], None] | None = None,
     ) -> dict[str, Any]:
+        if not self._can_continue():
+            return {
+                "status": "paused",
+                "message": "账户或任务代次已变化，未启动自动续期扫描",
+                "stores": [],
+                "finished_at": self._timestamp(self._now(now)),
+            }
         current = self._now(now)
         timestamp = self._timestamp(current)
         interval_seconds = self._interval_minutes() * 60
@@ -997,7 +1018,11 @@ class ActivityAutoRenewalManager:
         results: list[dict[str, Any]] = []
         total = len(stores)
         auto_budget = {"remaining": AUTO_CREATE_MAX_PER_SCAN}
+        interrupted = False
         for index, store in enumerate(stores, start=1):
+            if not self._can_continue():
+                interrupted = True
+                break
             config = self.db.get_activity_renewal_config(store.id)
             if not int(config.get("enabled") or 0):
                 results.append(
@@ -1034,6 +1059,9 @@ class ActivityAutoRenewalManager:
                 force=force,
                 now=current,
             )
+            if not self._can_continue():
+                interrupted = True
+                break
             auto_result = self._process_new_products(
                 store,
                 current=current,
@@ -1050,7 +1078,7 @@ class ActivityAutoRenewalManager:
         self._last_scan_at = timestamp
         self._next_scan_at = timestamp + interval_seconds
         self._last_result = {
-            "status": "completed",
+            "status": "paused" if interrupted else "completed",
             "finished_at": timestamp,
             "stores": results,
         }
@@ -1276,6 +1304,12 @@ class ActivityAutoRenewalManager:
                 "source_activity_id": source_id,
                 "next_retry_at": wait_until,
                 "message": "检测到中断任务，正在等待官方状态稳定",
+            }
+        if not self._can_continue():
+            return {
+                "status": "paused",
+                "source_activity_id": source_id,
+                "message": "账户或任务代次已变化，未提交活动续期",
             }
         attempts += 1
         self.db.save_activity_renewal_run(

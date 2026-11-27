@@ -27,11 +27,22 @@ describe("store batch login contract", () => {
     expect(loginBranch).toContain("未再重复打开登录窗口");
   });
 
-  it("keeps the operation busy lock and handles a backend busy response", () => {
-    expect(page).toContain("if (storeActionBusy.value) return");
-    expect(page).toContain("storeActionBusy.value = true");
+  it("locks login and backend opening separately and handles a backend busy response", () => {
+    expect(page).toContain(
+      "const actionBusy = isLogin ? storeLoginBusy : storeBackendBusy",
+    );
+    expect(page).toContain("if (actionBusy.value) return");
+    expect(page).toContain("actionBusy.value = true");
     expect(page).toContain("if (result.busy)");
     expect(page).toContain("网页登录任务正在进行");
-    expect(page).toContain("storeActionBusy.value = false");
+    expect(page).toContain("actionBusy.value = false");
+    expect(page).toContain("storeInteractions.loginActionDisabled");
+    expect(page).toContain("storeInteractions.openBackendActionDisabled");
+    expect(page).not.toContain(
+      ':disabled="storeInteractions.selectionActionDisabled" @click="runStoreAction(\'stores.login\')"',
+    );
+    expect(page).not.toContain(
+      ':disabled="storeInteractions.selectionActionDisabled" @click="runStoreAction(\'stores.open-backend\')"',
+    );
   });
 });

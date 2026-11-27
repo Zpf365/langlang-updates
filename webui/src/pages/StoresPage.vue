@@ -3,6 +3,7 @@ import {
   computed,
   onActivated,
   onBeforeUnmount,
+  onDeactivated,
   onMounted,
   reactive,
   ref,
@@ -16,10 +17,17 @@ import ModalDialog from "../components/ModalDialog.vue";
 import StoreExposureValue from "../components/StoreExposureValue.vue";
 import StoreSalesValue from "../components/StoreSalesValue.vue";
 import {
+  cancelStoreRefreshJob,
+  createPageRequestScope,
+  createPageActivityLifecycle,
+  createPageTimer,
   getStoreInteractionState,
   pollStoreRefreshJob,
   runStoreDateRolloverReload,
+  scheduleSingleFollowup,
+  shouldApplyStoreListSnapshot,
   startRepeatingSync,
+  storeRefreshActivityText,
 } from "../storeListSync";
 import {
   readRuntimeNoticeVisible,
@@ -68,7 +76,11 @@ const EXPOSURE_PERIODS = SALES_PERIODS.slice(0, 3);
 const stores = ref([]);
 const groups = ref([]);
 const loading = ref(false);
-const storeActionBusy = ref(false);
+const storeLoginBusy = ref(false);
+const storeBackendBusy = ref(false);
+const storeActionBusy = computed(() => (
+  storeLoginBusy.value || storeBackendBusy.value
+));
 const storeSaveBusy = ref(false);
 const message = ref("");
 const runtimeNoticeStorageKey = computed(() => (
@@ -133,6 +145,12 @@ const refreshProgress = reactive({
   total: 0,
   succeeded: 0,
   failed: 0,
+  completed: 0,
+  cancelled: 0,
+  active: 0,
+  queued: 0,
+  max: 0,
+  max_workers: 0,
   credential_succeeded: 0,
   credential_superseded: 0,
   credential_failed: 0,
@@ -143,6 +161,7 @@ const autoRefresh = useAutoRefresh({
   storageKey: "langlang.auto-refresh.stores",
   refresh: async () => {
     const result = await refreshAll({ automatic: true });
+    if (result.interrupted || result.skipped) return result;
     if (!result.ok) throw new Error(result.message);
     return result;
   },
@@ -162,8 +181,13 @@ const newGroupName = ref("");
 const groupBusy = ref(false);
 let liveStoreSyncStop = null;
 let liveStoreSyncUsers = 0;
+let hydrationSyncActive = false;
+let hydrationFollowup = null;
 let loadedDateKey = "";
-let dateRolloverTimer = null;
+let storeRefreshPollController = null;
+let activeRefreshJobId = "";
+let refreshRunSequence = 0;
+let refreshWasInterrupted = false;
 const form = reactive({
   name: "",
   app_id: "",
@@ -220,7 +244,8 @@ const allFilteredSelected = computed(() => (
 ));
 const storeInteractions = computed(() => getStoreInteractionState({
   hasSelection: selectedStoreIds.value.length > 0,
-  storeActionBusy: storeActionBusy.value,
+  loginBusy: storeLoginBusy.value,
+  openBackendBusy: storeBackendBusy.value,
 }));
 const refreshPercent = computed(() => {
   if (!refreshProgress.total) return refreshProgress.visible ? 8 : 0;
@@ -964,23 +989,36 @@ function closeDialog() {
 }
 
 function applyStoreData(data) {
+  if (!shouldApplyStoreListSnapshot({
+    stores: stores.value,
+    groups: groups.value,
+  }, data)) {
+    return false;
+  }
   stores.value = data.stores || [];
   groups.value = data.groups || [];
   const validIds = new Set(stores.value.map((store) => store.id));
   selectedStoreIds.value = selectedStoreIds.value.filter((id) => validIds.has(id));
   expandedStoreIds.value = expandedStoreIds.value.filter((id) => validIds.has(id));
+  return true;
 }
 
 async function syncStoresQuietly() {
-  const data = await call("stores.list", { search: "" });
-  applyStoreData(data);
-  if (storeActionBusy.value) {
-    message.value =
-      `登录进行中：已登录 ${loggedCount.value} 家，未登录 ${unloggedCount.value} 家`;
-  }
+  return storePageRequests.run({
+    request: () => call("stores.list", { search: "" }),
+    success: (data) => {
+      applyStoreData(data);
+      if (storeLoginBusy.value) {
+        message.value =
+          `登录进行中：已登录 ${loggedCount.value} 家，未登录 ${unloggedCount.value} 家`;
+      }
+    },
+    error: () => {},
+  });
 }
 
 function beginLiveStoreSync() {
+  if (!storePageActivity.isActive()) return;
   liveStoreSyncUsers += 1;
   if (liveStoreSyncStop !== null) return;
   liveStoreSyncStop = startRepeatingSync({
@@ -996,36 +1034,165 @@ function endLiveStoreSync() {
   }
 }
 
-async function load() {
-  loading.value = true;
-  message.value = "";
-  try {
-    const data = await call("stores.list", { search: "" });
-    applyStoreData(data);
-    loadedDateKey = shanghaiDateKey();
-  } catch (cause) {
-    message.value = cause instanceof Error ? cause.message : String(cause);
-  } finally {
-    loading.value = false;
+function finishHydrationSync() {
+  hydrationSyncActive = false;
+  endLiveStoreSync();
+}
+
+function scheduleHydrationSync(createdCount) {
+  if (!storePageActivity.isActive()) return;
+  if (!hydrationSyncActive) {
+    hydrationSyncActive = true;
+    beginLiveStoreSync();
+  } else {
+    hydrationFollowup?.stop();
+  }
+  hydrationFollowup = scheduleSingleFollowup({
+    timeoutMs: Math.max(15000, createdCount * 3000),
+    run: async () => {
+      hydrationFollowup = null;
+      finishHydrationSync();
+      await load();
+      message.value = "新增店铺名称同步已刷新";
+    },
+  });
+  hydrationFollowup.schedule();
+}
+
+function startDateRolloverTimer(
+  token = storePageActivity.capture(),
+) {
+  dateRolloverTimer.start(token);
+}
+
+function pauseStorePageEffects() {
+  const jobId = activeRefreshJobId;
+  refreshWasInterrupted = (
+    refreshWasInterrupted
+    || Boolean(jobId)
+    || Boolean(storeRefreshPollController)
+  );
+  activeRefreshJobId = "";
+  const controller = storeRefreshPollController;
+  storeRefreshPollController = null;
+  controller?.abort();
+  if (jobId) {
+    void cancelStoreRefreshJob({
+      jobId,
+      cancel: (id, reason) => call(
+        "stores.refresh.cancel",
+        { job_id: id, reason },
+        { keepalive: true },
+      ),
+    }).catch(() => {});
+  }
+  autoRefresh.pause();
+  hydrationFollowup?.stop();
+  hydrationFollowup = null;
+  hydrationSyncActive = false;
+  liveStoreSyncUsers = 0;
+  endLiveStoreSync();
+  closeStoreContextMenu();
+  dateRolloverTimer.stop();
+  for (const storeId of Object.keys(revealedSecrets)) {
+    hideSecret(Number(storeId));
+  }
+  for (const storeId of Object.keys(revealedAppIds)) {
+    hideAppId(Number(storeId));
   }
 }
 
-async function reloadAfterDateRollover() {
+async function resumeStorePageEffects({
+  token = storePageActivity.capture(),
+  isCurrent = () => storePageActivity.isActive(),
+} = {}) {
+  await load({ token });
+  if (!isCurrent()) return;
+  if (refreshWasInterrupted) {
+    refreshWasInterrupted = false;
+    await refreshAll({ token });
+    if (!isCurrent()) return;
+  }
+  if (storeActionBusy.value) beginLiveStoreSync();
+  startDateRolloverTimer(token);
+  autoRefresh.resume();
+}
+
+const storePageActivity = createPageActivityLifecycle({
+  pause: pauseStorePageEffects,
+  resume: resumeStorePageEffects,
+});
+const storePageRequests = createPageRequestScope({
+  capture: () => storePageActivity.capture(),
+  isCurrent: (token) => storePageActivity.isCurrent(token),
+});
+const dateRolloverTimer = createPageTimer({
+  capture: () => storePageActivity.capture(),
+  isCurrent: (token) => storePageActivity.isCurrent(token),
+  onFire: (token) => reloadAfterDateRollover(token),
+});
+
+
+async function load({
+  token = storePageActivity.capture(),
+} = {}) {
+  return storePageRequests.run({
+    token,
+    start: () => {
+      loading.value = true;
+      message.value = "";
+    },
+    request: () => call("stores.list", { search: "" }),
+    success: (data) => {
+      applyStoreData(data);
+      loadedDateKey = shanghaiDateKey();
+    },
+    error: (cause) => {
+      message.value = cause instanceof Error ? cause.message : String(cause);
+    },
+    finish: () => {
+      loading.value = false;
+    },
+  });
+}
+
+async function reloadAfterDateRollover(
+  token = storePageActivity.capture(),
+) {
+  if (!storePageActivity.isCurrent(token)) return;
   await runStoreDateRolloverReload({
     loadedDateKey,
     currentDateKey: shanghaiDateKey(),
     loading: loading.value,
     automatic: autoRefresh.enabled.value,
-    load,
-    refresh: refreshAll,
+    load: () => load({ token }),
+    refresh: ({ automatic }) => refreshAll({ automatic, token }),
     onLoaded: (dateKey) => {
-      loadedDateKey = dateKey;
+      if (storePageActivity.isCurrent(token)) {
+        loadedDateKey = dateKey;
+      }
     },
   });
 }
 
-async function refreshAll({ automatic = false } = {}) {
+async function refreshAll({
+  automatic = false,
+  token = storePageActivity.capture(),
+} = {}) {
+  if (!storePageActivity.isCurrent(token)) {
+    return {
+      ok: true,
+      interrupted: false,
+      skipped: true,
+      message: "店铺页面未激活，本次刷新未启动",
+    };
+  }
+  const refreshRunId = ++refreshRunSequence;
+  const pollController = new AbortController();
+  let startedJobId = "";
   loading.value = true;
+  storeRefreshPollController?.abort();
+  storeRefreshPollController = pollController;
   if (!automatic) message.value = "";
   try {
     const storeIds = [...selectedStoreIds.value];
@@ -1036,6 +1203,12 @@ async function refreshAll({ automatic = false } = {}) {
       total: storeIds.length || stores.value.length,
       succeeded: 0,
       failed: 0,
+      completed: 0,
+      cancelled: 0,
+      active: 0,
+      queued: storeIds.length || stores.value.length,
+      max: 0,
+      max_workers: 0,
       credential_succeeded: 0,
       credential_superseded: 0,
       credential_failed: 0,
@@ -1045,6 +1218,25 @@ async function refreshAll({ automatic = false } = {}) {
     const started = await call("stores.refresh.start", {
       store_ids: storeIds.length ? storeIds : undefined,
     });
+    startedJobId = String(started.job_id || "");
+    if (!storePageActivity.isCurrent(token)) {
+      if (startedJobId) {
+        void cancelStoreRefreshJob({
+          jobId: startedJobId,
+          cancel: (id, reason) => call(
+            "stores.refresh.cancel",
+            { job_id: id, reason },
+            { keepalive: true },
+          ),
+        }).catch(() => {});
+      }
+      return {
+        ok: false,
+        interrupted: true,
+        message: "",
+      };
+    }
+    activeRefreshJobId = startedJobId;
     if (started.already_running) {
       message.value = "已有相同店铺范围的后台刷新，正在复用该任务";
     }
@@ -1053,18 +1245,32 @@ async function refreshAll({ automatic = false } = {}) {
       getStatus: (jobId) => call(
         "stores.refresh.status",
         { job_id: jobId },
+        { signal: pollController.signal },
       ),
+      signal: pollController.signal,
       onStatus: (status) => {
-        Object.assign(refreshProgress, status, { visible: true });
+        if (storePageActivity.isCurrent(token)) {
+          Object.assign(refreshProgress, status, { visible: true });
+        }
       },
     });
-    await load();
+    activeRefreshJobId = "";
+    await load({ token });
+    if (!storePageActivity.isCurrent(token)) {
+      return {
+        ok: false,
+        interrupted: true,
+        message: "",
+      };
+    }
     const credentialSummary =
       `凭据恢复 ${result.credential_succeeded || 0}，` +
       `放弃 ${result.credential_superseded || 0}，` +
       `拒绝 ${result.credential_failed || 0}，` +
       `延后 ${result.credential_deferred || 0}`;
-    const summaryMessage = result.errors?.length
+    const summaryMessage = result.status === "cancelled"
+      ? storeRefreshActivityText(result)
+      : result.errors?.length
       ? `${storeIds.length ? "选中店铺" : "全部店铺"}数据刷新 ${result.succeeded}/${result.total} 家；${credentialSummary}；${result.errors.slice(0, 2).join("；")}`
       : `${storeIds.length ? "选中店铺" : "全部店铺"}数据刷新 ${result.succeeded} 家；${credentialSummary}`;
     if (!automatic) message.value = summaryMessage;
@@ -1072,16 +1278,48 @@ async function refreshAll({ automatic = false } = {}) {
     return { ok: true, message: summaryMessage };
   } catch (cause) {
     const errorMessage = cause instanceof Error ? cause.message : String(cause);
+    if (
+      pollController.signal.aborted
+      || !storePageActivity.isCurrent(token)
+    ) {
+      return {
+        ok: false,
+        interrupted: true,
+        message: "",
+      };
+    }
     if (!automatic) message.value = errorMessage;
     refreshProgress.status = "failed";
     refreshProgress.message = errorMessage;
     return { ok: false, message: errorMessage };
   } finally {
+    if (activeRefreshJobId === startedJobId) {
+      activeRefreshJobId = "";
+    }
+    if (
+      refreshRunId !== refreshRunSequence
+      || !storePageActivity.isCurrent(token)
+    ) {
+      return;
+    }
+    if (storeRefreshPollController === pollController) {
+      storeRefreshPollController = null;
+    }
     loading.value = false;
-    if (!automatic) {
+    if (
+      !automatic
+      && !pollController.signal.aborted
+      && storePageActivity.isActive()
+    ) {
       refreshProgress.visible = true;
       window.setTimeout(() => {
-        if (!loading.value && ["completed", "partial", "failed"].includes(refreshProgress.status)) {
+        if (
+          !loading.value
+          && storePageActivity.isCurrent(token)
+          && ["completed", "partial", "failed", "cancelled"].includes(
+            refreshProgress.status,
+          )
+        ) {
           refreshProgress.visible = false;
         }
       }, 2600);
@@ -1246,9 +1484,10 @@ async function runStoreAction(action) {
     message.value = "请先勾选要操作的店铺";
     return;
   }
-  if (storeActionBusy.value) return;
   const isLogin = action === "stores.login";
-  storeActionBusy.value = true;
+  const actionBusy = isLogin ? storeLoginBusy : storeBackendBusy;
+  if (actionBusy.value) return;
+  actionBusy.value = true;
   if (isLogin) {
     beginLiveStoreSync();
     message.value =
@@ -1306,18 +1545,28 @@ async function runStoreAction(action) {
     message.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
     if (isLogin) endLiveStoreSync();
-    storeActionBusy.value = false;
+    actionBusy.value = false;
   }
 }
 
 onMounted(async () => {
+  const token = storePageActivity.capture();
   document.addEventListener("pointerdown", handleContextPointer, true);
   document.addEventListener("keydown", handleContextKey);
-  await load();
-  if (stores.value.length) await refreshAll();
-  dateRolloverTimer = window.setInterval(reloadAfterDateRollover, 60000);
+  await load({ token });
+  if (storePageActivity.isCurrent(token)) {
+    if (stores.value.length) await refreshAll({ token });
+    if (storePageActivity.isCurrent(token)) {
+      startDateRolloverTimer(token);
+    }
+  }
 });
-onActivated(reloadAfterDateRollover);
+onActivated(() => {
+  void storePageActivity.activate();
+});
+onDeactivated(() => {
+  storePageActivity.deactivate();
+});
 onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", handleContextPointer, true);
   document.removeEventListener("keydown", handleContextKey);
@@ -1331,6 +1580,7 @@ onBeforeUnmount(() => {
   secretTimers.clear();
   for (const timer of appIdTimers.values()) clearTimeout(timer);
   appIdTimers.clear();
+  storePageActivity.deactivate();
 });
 </script>
 
@@ -1379,8 +1629,8 @@ onBeforeUnmount(() => {
           :aria-label="`批量操作，已选 ${selectedStoreIds.length} 家店铺`"
           @click="openBatchContextMenu"
         >批量操作{{ selectedStoreIds.length ? ` (${selectedStoreIds.length})` : "" }}</button>
-        <button class="btn muted" type="button" :disabled="storeInteractions.selectionActionDisabled" @click="runStoreAction('stores.login')">{{ storeActionBusy ? "处理中..." : "登录" }}</button>
-        <button class="btn muted" type="button" :disabled="storeInteractions.selectionActionDisabled" @click="runStoreAction('stores.open-backend')">打开后台</button>
+        <button class="btn muted" type="button" :disabled="storeInteractions.loginActionDisabled" @click="runStoreAction('stores.login')">{{ storeLoginBusy ? "处理中..." : "登录" }}</button>
+        <button class="btn muted" type="button" :disabled="storeInteractions.openBackendActionDisabled" @click="runStoreAction('stores.open-backend')">打开后台</button>
         <button class="btn amber" type="button" @click="runStoreAction('stores.clear-cache')">清理缓存</button>
       </div>
     </header>
@@ -1462,7 +1712,7 @@ onBeforeUnmount(() => {
         <span :style="{ width: `${refreshPercent}%` }" />
       </div>
       <strong>{{ refreshProgress.message }}</strong>
-      <small>{{ refreshProgress.current }}/{{ refreshProgress.total }}</small>
+      <small>{{ storeRefreshActivityText(refreshProgress) }}</small>
       <span class="credential-progress">
         凭据：恢复 {{ refreshProgress.credential_succeeded || 0 }} ·
         放弃 {{ refreshProgress.credential_superseded || 0 }} ·
@@ -1834,10 +2084,10 @@ onBeforeUnmount(() => {
       <button role="menuitem" type="button" @click="refreshContextStores">刷新选中项</button>
       <button role="menuitem" type="button" @click="copySelectedStoreIds">复制选中项编号</button>
       <hr />
-      <button role="menuitem" type="button" :disabled="storeActionBusy" @click="runContextStoreAction('stores.login')">批量登录</button>
+      <button role="menuitem" type="button" :disabled="storeInteractions.loginActionDisabled" @click="runContextStoreAction('stores.login')">批量登录</button>
       <button v-if="canUseStoreGroups" role="menuitem" type="button" @click="openBatchGroupDialog(false)">批量设置分组…</button>
       <button v-if="canUseStoreGroups" role="menuitem" type="button" @click="openBatchGroupDialog(true)">新建分组…</button>
-      <button role="menuitem" type="button" :disabled="storeActionBusy" @click="runContextStoreAction('stores.open-backend')">打开后台</button>
+      <button role="menuitem" type="button" :disabled="storeInteractions.openBackendActionDisabled" @click="runContextStoreAction('stores.open-backend')">打开后台</button>
       <button class="danger" role="menuitem" type="button" @click="askBatchDelete">批量删除所选…</button>
     </div>
 

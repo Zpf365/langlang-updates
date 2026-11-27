@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 UNSUPPORTED_ENABLED_FLAGS = {
@@ -12,8 +12,16 @@ UNSUPPORTED_ENABLED_FLAGS = {
 }
 
 
-def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) -> str:
+def run_hosted_store(
+    db: Any,
+    service: Any,
+    store: Any,
+    config: dict[str, Any],
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> str:
     """Run the supported web-console hosting actions for one store."""
+    checkpoint = before_write or (lambda: None)
     unsupported = [
         label
         for key, label in UNSUPPORTED_ENABLED_FLAGS.items()
@@ -54,6 +62,7 @@ def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) 
             ]
 
         if config.get("enable_league") and active_ids:
+            checkpoint()
             result = service.promote_products_to_league(
                 store,
                 active_ids,
@@ -94,6 +103,7 @@ def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) 
                 for row in league.get("items") or []
                 if isinstance(row, dict) and row.get("product_id")
             ]
+            checkpoint()
             commission_errors = service.update_league_ratio(
                 store,
                 league_ids,
@@ -109,6 +119,7 @@ def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) 
                 if int(row.get("status") or 0) == 2
             ][:500]
             for product_id in ids:
+                checkpoint()
                 service.product_write(store, "cancel_audit", product_id=product_id)
             actions.append(f"撤销审核 {len(ids)}")
 
@@ -119,6 +130,7 @@ def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) 
                 if int(row.get("status") or 0) == 3
             ][:500]
             for product_id in ids:
+                checkpoint()
                 service.product_write(store, "delete", product_id=product_id)
             actions.append(f"删除审核失败 {len(ids)}")
 
@@ -130,6 +142,7 @@ def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) 
                 if int(row.get("status") or 0) == 11
             ][:listing_count]
             if ids:
+                checkpoint()
                 service.set_products_listing(store, ids, True)
             actions.append(f"上架 {len(ids)}")
 
@@ -141,10 +154,12 @@ def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) 
                 max_sales=max(0, int(config.get("no_traffic_sales") or 0)),
             )
             if ids:
+                checkpoint()
                 service.private_batch_product_action(store, ids, "recycle")
             actions.append(f"清理无流量 {len(ids)}")
 
         if config.get("enable_cancel_flash_sale"):
+            checkpoint()
             cancel_errors = service.stop_active_limited_discounts(store)
             errors.extend(f"取消限时抢购：{error}" for error in cancel_errors)
             actions.append("取消限时抢购")
@@ -157,6 +172,7 @@ def run_hosted_store(db: Any, service: Any, store: Any, config: dict[str, Any]) 
             except (TypeError, ValueError, json.JSONDecodeError):
                 drafts = []
             if isinstance(drafts, list) and drafts:
+                checkpoint()
                 service.double11_submit(store, drafts)
                 actions.append(f"双11预填报 {len(drafts)}")
             else:

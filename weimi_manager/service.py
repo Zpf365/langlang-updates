@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
 import re
+import tempfile
 import threading
 import time
 import unicodedata
@@ -12,8 +15,8 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Any, Callable
-from urllib.parse import urlparse
+from typing import Any, Callable, Sequence
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from .db import PRODUCT_STATUS, SHANGHAI_TZ, Database, order_status_text
 from .mock import MockShopClient, ProgressCallback
@@ -34,8 +37,15 @@ from .procurement import (
     ProcurementAdapter,
     ProcurementWebSession,
 )
+from .runtime_logging import log_event
 from .shop_private import ShopPrivateClient, ShopPrivateError
 from .source_1688 import rank_category_candidates
+from .upload_content_safety import (
+    ContentSafetyResult,
+    inspect_image_bytes,
+    load_image_source_bytes,
+    sanitize_upload_content,
+)
 from .upload_violations import (
     build_upload_violation_titles,
     is_real_logged_in_store,
@@ -2428,7 +2438,7 @@ class SyncService:
         store: Store,
         client: WechatShopClient,
         payload: dict[str, Any],
-    ) -> None:
+    ) -> set[str]:
         brand_id = str(
             payload.get("brand_id") or "2100000000"
         ).strip()
@@ -2439,7 +2449,7 @@ class SyncService:
                 payload.get("attrs"),
                 brand_id,
             )
-            return
+            return set()
         cache_key = (store.id, category_id, brand_id)
         rule = self._category_rule_cache.get(cache_key)
         if rule is None:
@@ -2453,7 +2463,7 @@ class SyncService:
                     payload.get("attrs"),
                     brand_id,
                 )
-                return
+                return set()
             try:
                 rule = fetch_rule(category_id, brand_id=brand_id)
             except Exception:
@@ -2461,7 +2471,7 @@ class SyncService:
                     payload.get("attrs"),
                     brand_id,
                 )
-                return
+                return set()
             self._category_rule_cache[cache_key] = rule
         attrs = payload.get("attrs")
         attrs = list(attrs) if isinstance(attrs, list) else []
@@ -2495,6 +2505,7 @@ class SyncService:
         category_name = str((rule.get("info") or {}).get("name") or "")
         allowed_attributes: dict[str, dict[str, Any]] = {}
         required_attribute_keys: set[str] = set()
+        required_attribute_names: set[str] = set()
         for attribute in rule.get("product_attr_list") or []:
             if not isinstance(attribute, dict):
                 continue
@@ -2515,6 +2526,7 @@ class SyncService:
             allowed_attributes[name_token] = attribute
             if is_required:
                 required_attribute_keys.add(name_token)
+                required_attribute_names.add(name)
             if name_token == brand_token and brand_id:
                 continue
             current = existing.get(name_token)
@@ -2570,12 +2582,325 @@ class SyncService:
             required_keys=required_attribute_keys,
         )
         payload["attrs"] = attrs
+        return required_attribute_names
+
+    @staticmethod
+    def _log_upload_content_safety(
+        result: ContentSafetyResult,
+    ) -> None:
+        if not result.hits and not result.removed_images:
+            return
+        log_event(
+            "upload_content_safety",
+            hit_count=len(result.hits),
+            removed_images=result.removed_images,
+            fields=",".join(
+                sorted(
+                    {
+                        str(hit.get("field") or "")
+                        for hit in result.hits
+                        if hit.get("field")
+                    }
+                )
+            )[:1000],
+            rules=",".join(
+                sorted(
+                    {
+                        str(hit.get("rule") or "")
+                        for hit in result.hits
+                        if hit.get("rule")
+                    }
+                )
+            )[:1000],
+        )
+
+    @staticmethod
+    def _log_upload_image_audit(
+        audit: list[dict[str, str]],
+    ) -> None:
+        if not audit:
+            return
+        log_event(
+            "upload_image_audit",
+            image_count=len(audit),
+            slots=",".join(
+                str(entry.get("slot") or "")
+                for entry in audit
+            )[:1000],
+            bytes_sha256=",".join(
+                sorted(
+                    {
+                        str(entry.get("bytes_sha256") or "")
+                        for entry in audit
+                        if entry.get("bytes_sha256")
+                    }
+                )
+            )[:1000],
+            controlled_urls=sum(
+                1
+                for entry in audit
+                if str(entry.get("controlled_url") or "").strip()
+            ),
+        )
+
+    @staticmethod
+    def _require_final_skus(payload: dict[str, Any]) -> None:
+        skus = payload.get("skus")
+        if not isinstance(skus, list) or not any(
+            isinstance(item, dict) and bool(item)
+            for item in skus
+        ):
+            raise UploadPreflightError(
+                "SKU列表为空或没有有效SKU"
+            )
+
+    def _sanitize_product_content(
+        self,
+        payload: dict[str, Any],
+        *,
+        required_attribute_keys: Sequence[str] = (),
+        content_image_loader: Callable[[str], bytes] | None = None,
+        content_image_inspector: (
+            Callable[[bytes], Sequence[str]] | None
+        ) = None,
+        image_bytes_cache: dict[str, bytes] | None = None,
+        image_digests: dict[str, str] | None = None,
+        require_skus: bool = True,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, bytes],
+        dict[str, str],
+    ]:
+        cache = (
+            image_bytes_cache
+            if image_bytes_cache is not None
+            else {}
+        )
+        digests = (
+            image_digests
+            if image_digests is not None
+            else {}
+        )
+        if (
+            (content_image_loader is None)
+            != (content_image_inspector is None)
+        ):
+            raise UploadPreflightError(
+                "图片安全检测加载器和检测器必须同时提供"
+            )
+        source_inspector: Callable[[str], Sequence[str]] | None = None
+        if content_image_loader is not None and content_image_inspector is not None:
+            def inspect_source(source: str) -> Sequence[str]:
+                normalized = self._normalize_image_source_url(source)
+                digest = digests.get(normalized)
+                if not digest:
+                    data = content_image_loader(source)
+                    if not isinstance(data, bytes):
+                        raise UploadPreflightError(
+                            "商品图片读取结果不是二进制字节"
+                        )
+                    digest = hashlib.sha256(data).hexdigest()
+                    digests[normalized] = digest
+                    cache[f"{normalized}|{digest}"] = data
+                key = f"{normalized}|{digest}"
+                data = cache.get(key)
+                if data is None:
+                    raise UploadPreflightError(
+                        "商品图片检测字节缓存缺失"
+                    )
+                return content_image_inspector(data)
+
+            source_inspector = inspect_source
+        result = sanitize_upload_content(
+            payload,
+            required_attribute_keys=required_attribute_keys,
+            image_inspector=source_inspector,
+        )
+        self._log_upload_content_safety(result)
+        if require_skus:
+            self._require_final_skus(result.payload)
+        return result.payload, cache, digests
+
+    @staticmethod
+    def _normalize_image_source_url(source: str) -> str:
+        value = str(source or "").strip()
+        parsed = urlparse(value)
+        if parsed.scheme or parsed.netloc:
+            path = parsed.path or "/"
+            query = urlencode(
+                sorted(
+                    parse_qsl(
+                        parsed.query,
+                        keep_blank_values=True,
+                    )
+                )
+            )
+            return (
+                f"{parsed.scheme.casefold()}://"
+                f"{parsed.netloc.casefold()}{path}"
+                + (f"?{query}" if query else "")
+            )
+        try:
+            return str(Path(value).resolve())
+        except OSError:
+            return value
+
+    @staticmethod
+    def _image_slots(
+        payload: dict[str, Any],
+    ) -> list[tuple[str, str]]:
+        slots: list[tuple[str, str]] = []
+        for index, value in enumerate(payload.get("head_imgs") or []):
+            source = str(value or "").strip()
+            if source:
+                slots.append((f"head_imgs[{index}]", source))
+        desc_info = payload.get("desc_info")
+        if isinstance(desc_info, dict):
+            for index, value in enumerate(desc_info.get("imgs") or []):
+                source = str(value or "").strip()
+                if source:
+                    slots.append((f"desc_info.imgs[{index}]", source))
+        for sku_index, sku in enumerate(payload.get("skus") or []):
+            if not isinstance(sku, dict):
+                continue
+            for key in ("thumb_url", "image", "image_url", "sku_image"):
+                source = str(sku.get(key) or "").strip()
+                if source:
+                    slots.append((f"skus[{sku_index}].{key}", source))
+        return slots
+
+    def _materialize_inspected_images(
+        self,
+        payload: dict[str, Any],
+        client: WechatShopClient,
+        *,
+        image_bytes_cache: dict[str, bytes],
+        image_digests: dict[str, str],
+        baseline_payload: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        baseline = {
+            slot: source
+            for slot, source in self._image_slots(
+                baseline_payload or {}
+            )
+        }
+        controlled_by_key: dict[str, str] = {}
+        audit: list[dict[str, str]] = []
+
+        def materialize(source_value: Any, slot: str) -> str:
+            source = str(source_value or "").strip()
+            if not source:
+                return ""
+            normalized = self._normalize_image_source_url(source)
+            digest = image_digests.get(normalized)
+            if not digest:
+                raise UploadPreflightError(
+                    f"商品图片未完成同字节安全检测：{slot}"
+                )
+            key = f"{normalized}|{digest}"
+            data = image_bytes_cache.get(key)
+            if data is None:
+                raise UploadPreflightError(
+                    f"商品图片检测字节缓存缺失：{slot}"
+                )
+            controlled = ""
+            if (
+                self._uses_hosted_product_image(source)
+                and (
+                    baseline_payload is None
+                    or baseline.get(slot) == source
+                )
+            ):
+                controlled = source
+            else:
+                controlled = controlled_by_key.get(key, "")
+                if not controlled:
+                    controlled = self._upload_product_image_bytes(
+                        client,
+                        data,
+                        source,
+                    )
+                    controlled_by_key[key] = controlled
+            audit.append(
+                {
+                    "slot": slot,
+                    "source_url": source,
+                    "bytes_sha256": digest,
+                    "controlled_url": controlled,
+                }
+            )
+            return controlled
+
+        result = deepcopy(payload)
+        result["head_imgs"] = [
+            materialize(value, f"head_imgs[{index}]")
+            for index, value in enumerate(
+                result.get("head_imgs") or []
+            )
+        ]
+        desc_info = result.get("desc_info")
+        if isinstance(desc_info, dict):
+            desc_info["imgs"] = [
+                materialize(
+                    value,
+                    f"desc_info.imgs[{index}]",
+                )
+                for index, value in enumerate(
+                    desc_info.get("imgs") or []
+                )
+            ]
+        for sku_index, sku in enumerate(result.get("skus") or []):
+            if not isinstance(sku, dict):
+                continue
+            for key in ("thumb_url", "image", "image_url", "sku_image"):
+                if key in sku:
+                    sku[key] = materialize(
+                        sku.get(key),
+                        f"skus[{sku_index}].{key}",
+                    )
+        self._log_upload_image_audit(audit)
+        return result, audit
+
+    @staticmethod
+    def _upload_product_image_bytes(
+        client: WechatShopClient,
+        data: bytes,
+        source: str,
+    ) -> str:
+        uploader = getattr(client, "upload_product_image", None)
+        if not callable(uploader):
+            raise UploadPreflightError(
+                "当前图片客户端不支持上传已检测字节"
+            )
+        if not data:
+            raise UploadPreflightError("商品图片内容为空")
+        suffix = Path(urlparse(source).path).suffix.casefold()
+        if suffix not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+            suffix = ".jpg"
+        temporary = tempfile.NamedTemporaryFile(
+            suffix=suffix,
+            delete=False,
+        )
+        try:
+            temporary.write(data)
+            temporary.close()
+            return str(uploader(temporary.name))
+        finally:
+            try:
+                Path(temporary.name).unlink()
+            except FileNotFoundError:
+                pass
 
     def _prepare_product_payload(
         self,
         store: Store,
         client: WechatShopClient,
         payload: dict[str, Any],
+        *,
+        content_image_loader: Callable[[str], bytes] | None = None,
+        content_image_inspector: (
+            Callable[[bytes], Sequence[str]] | None
+        ) = None,
     ) -> dict[str, Any]:
         prepared = normalize_sku_sale_attrs(payload)
         defaults = self._product_payload_defaults(store, client)
@@ -2609,17 +2934,48 @@ class SyncService:
             client,
             prepared,
         )
-        self._apply_required_category_attributes(
+        required_attribute_names = self._apply_required_category_attributes(
             store,
             client,
             prepared,
-        )
+        ) or set()
         if prepared.get("_specified_category_id"):
             self._validate_specified_product_category(
                 store,
                 client,
                 prepared,
             )
+
+        if (
+            content_image_loader is None
+            and content_image_inspector is None
+            and isinstance(client, WechatShopClient)
+        ):
+            content_image_loader = load_image_source_bytes
+            content_image_inspector = inspect_image_bytes
+        secure_image_mode = (
+            content_image_loader is not None
+            and content_image_inspector is not None
+        )
+        (
+            prepared,
+            image_bytes_cache,
+            image_digests,
+        ) = self._sanitize_product_content(
+            prepared,
+            required_attribute_keys=required_attribute_names,
+            content_image_loader=content_image_loader,
+            content_image_inspector=content_image_inspector,
+        )
+        image_audit: list[dict[str, str]] = []
+        if secure_image_mode:
+            prepared, prepared_audit = self._materialize_inspected_images(
+                prepared,
+                client,
+                image_bytes_cache=image_bytes_cache,
+                image_digests=image_digests,
+            )
+            image_audit.extend(prepared_audit)
 
         image_cache: dict[str, str] = {}
 
@@ -2628,20 +2984,63 @@ class SyncService:
             if not url:
                 return ""
             if self._uses_hosted_product_image(url):
+                if secure_image_mode and url not in image_bytes_cache:
+                    raise UploadPreflightError(
+                        "商品图片未完成同字节安全检测"
+                    )
                 return url
             if url not in image_cache:
                 image_cache[url] = client.upload_product_image_url(url)
             return image_cache[url]
 
-        head_images = [
-            upload
-            for upload in (prepare_url(url) for url in prepared.get("head_imgs") or [])
-            if upload
-        ]
+        head_images = (
+            [
+                str(url)
+                for url in prepared.get("head_imgs") or []
+                if str(url).strip()
+            ]
+            if secure_image_mode
+            else [
+                upload
+                for upload in (
+                    prepare_url(url)
+                    for url in prepared.get("head_imgs") or []
+                )
+                if upload
+            ]
+        )
+        defaults_materialized = False
+        if len(head_images) < 3:
+            (
+                defaults,
+                image_bytes_cache,
+                image_digests,
+            ) = self._sanitize_product_content(
+                defaults,
+                content_image_loader=content_image_loader,
+                content_image_inspector=content_image_inspector,
+                image_bytes_cache=image_bytes_cache,
+                image_digests=image_digests,
+                require_skus=False,
+            )
+            if secure_image_mode:
+                defaults, defaults_audit = (
+                    self._materialize_inspected_images(
+                        defaults,
+                        client,
+                        image_bytes_cache=image_bytes_cache,
+                        image_digests=image_digests,
+                    )
+                )
+                image_audit.extend(defaults_audit)
+                defaults_materialized = True
         fallback_heads = [
             str(url)
             for url in defaults.get("head_imgs") or []
-            if self._uses_hosted_product_image(str(url))
+            if (
+                secure_image_mode
+                or self._uses_hosted_product_image(str(url))
+            )
         ]
         for url in fallback_heads:
             if url not in head_images:
@@ -2650,17 +3049,70 @@ class SyncService:
                 break
         prepared["head_imgs"] = list(dict.fromkeys(head_images))[:9]
         if len(prepared["head_imgs"]) < 3:
-            raise ValueError(f"{store.name}商品主图少于3张：当前仅 {len(prepared['head_imgs'])} 张")
+            raise UploadPreflightError(
+                f"{store.name} 商品主图少于3张："
+                f"安全图片仅 {len(prepared['head_imgs'])} 张"
+            )
 
         desc_info = dict(prepared.get("desc_info") or {})
-        detail_images = [
-            upload for upload in (prepare_url(url) for url in desc_info.get("imgs") or []) if upload
-        ]
+        detail_images = (
+            [
+                str(url)
+                for url in desc_info.get("imgs") or []
+                if str(url).strip()
+            ]
+            if secure_image_mode
+            else [
+                upload
+                for upload in (
+                    prepare_url(url)
+                    for url in desc_info.get("imgs") or []
+                )
+                if upload
+            ]
+        )
         if not detail_images:
+            if defaults is not None and not defaults_materialized:
+                (
+                    defaults,
+                    image_bytes_cache,
+                    image_digests,
+                ) = self._sanitize_product_content(
+                    {
+                        **defaults,
+                        "desc_info": {
+                            **(defaults.get("desc_info") or {}),
+                            "imgs": list(
+                                (defaults.get("desc_info") or {}).get(
+                                    "imgs"
+                                )
+                                or []
+                            ),
+                        },
+                    },
+                    content_image_loader=content_image_loader,
+                    content_image_inspector=content_image_inspector,
+                    image_bytes_cache=image_bytes_cache,
+                    image_digests=image_digests,
+                    require_skus=False,
+                )
+                if secure_image_mode:
+                    defaults, defaults_audit = (
+                        self._materialize_inspected_images(
+                            defaults,
+                            client,
+                            image_bytes_cache=image_bytes_cache,
+                            image_digests=image_digests,
+                        )
+                    )
+                    image_audit.extend(defaults_audit)
             fallback_details = [
                 str(url)
                 for url in (defaults.get("desc_info") or {}).get("imgs") or []
-                if self._uses_hosted_product_image(str(url))
+                if (
+                    secure_image_mode
+                    or self._uses_hosted_product_image(str(url))
+                )
             ]
             detail_images = fallback_details[:1]
         if not detail_images and prepared["head_imgs"]:
@@ -2677,6 +3129,7 @@ class SyncService:
             "_deposit_limit_cents",
         ):
             prepared.pop(key, None)
+        prepared["_upload_image_audit"] = image_audit
         return prepared
 
     def _ensure_product_category(
@@ -3019,6 +3472,7 @@ class SyncService:
         listing_mode: str = "",
     ) -> dict[str, Any]:
         self._require_platform_write(store, "product_write")
+        image_audit: list[dict[str, str]] = []
         if action == "delete":
             return self._delete_product_remote(
                 store,
@@ -3059,13 +3513,122 @@ class SyncService:
                 client,
                 payload,
             )
+            image_audit = list(
+                prepared.pop("_upload_image_audit", []) or []
+            )
             if listing_mode == "draft":
                 prepared["listing"] = 0
             elif listing_mode:
                 prepared["listing"] = 1
             result = client.add_product(prepared)
         elif action == "update":
-            result = client.update_product(payload or {})
+            original_payload = deepcopy(payload or {})
+            update_loader = (
+                load_image_source_bytes
+                if isinstance(client, WechatShopClient)
+                else None
+            )
+            update_inspector = (
+                inspect_image_bytes
+                if isinstance(client, WechatShopClient)
+                else None
+            )
+            (
+                payload_data,
+                image_bytes_cache,
+                image_digests,
+            ) = self._sanitize_product_content(
+                payload or {},
+                content_image_loader=update_loader,
+                content_image_inspector=update_inspector,
+                require_skus=True,
+            )
+            baseline_payload: dict[str, Any] = {}
+            baseline_product_id = str(
+                product_id
+                or payload_data.get("product_id")
+                or payload_data.get("id")
+                or ""
+            ).strip()
+            if baseline_product_id:
+                cached = self.db.get_product(
+                    store.id,
+                    baseline_product_id,
+                )
+                if cached:
+                    try:
+                        baseline_payload = json.loads(
+                            str(cached.get("raw_json") or "{}")
+                        )
+                    except (TypeError, ValueError):
+                        baseline_payload = {}
+                    if not isinstance(baseline_payload, dict):
+                        baseline_payload = {}
+            if update_loader is not None and update_inspector is not None:
+                payload_data, image_audit = (
+                    self._materialize_inspected_images(
+                        payload_data,
+                        client,
+                        image_bytes_cache=image_bytes_cache,
+                        image_digests=image_digests,
+                        baseline_payload=baseline_payload,
+                    )
+                )
+                original_head = [
+                    str(value).strip()
+                    for value in original_payload.get("head_imgs") or []
+                    if str(value).strip()
+                ]
+                if original_head and len(
+                    payload_data.get("head_imgs") or []
+                ) < 3:
+                    raise UploadPreflightError(
+                        "编辑商品主图少于3张：安全图片不足"
+                    )
+                original_detail = list(
+                    (original_payload.get("desc_info") or {}).get(
+                        "imgs"
+                    )
+                    or []
+                )
+                if original_detail and not any(
+                    str(value).strip()
+                    for value in (
+                        payload_data.get("desc_info") or {}
+                    ).get("imgs")
+                    or []
+                ):
+                    raise UploadPreflightError(
+                        "编辑商品详情图片清理后为空"
+                    )
+                original_sku = original_payload.get("skus") or []
+                current_sku = payload_data.get("skus") or []
+                for sku_index, sku in enumerate(original_sku):
+                    if not isinstance(sku, dict) or sku_index >= len(
+                        current_sku
+                    ):
+                        continue
+                    current = current_sku[sku_index]
+                    if not isinstance(current, dict):
+                        continue
+                    for key in (
+                        "thumb_url",
+                        "image",
+                        "image_url",
+                        "sku_image",
+                    ):
+                        if (
+                            str(sku.get(key) or "").strip()
+                            and not str(
+                                current.get(key) or ""
+                            ).strip()
+                        ):
+                            raise UploadPreflightError(
+                                "编辑商品SKU图片清理后为空："
+                                f"skus[{sku_index}].{key}"
+                            )
+            payload = payload_data
+            result = client.update_product(payload)
         elif action == "cancel_audit":
             try:
                 result = client.cancel_product_audit(product_id)
@@ -3079,6 +3642,8 @@ class SyncService:
             raise ValueError("不支持的商品操作")
         if int(result.get("errcode") or 0) != 0:
             raise RuntimeError(str(result.get("errmsg") or "微信商品接口返回失败"))
+        if image_audit:
+            result["image_audit"] = image_audit
         if action == "add" and int(result.get("errcode") or 0) == 0:
             self.db.adjust_upload_metrics(
                 store.id,
@@ -5523,6 +6088,7 @@ class SyncService:
         item_states: dict[str, dict[str, Any]] = {}
         errors: list[str] = []
         cancelled = False
+        state_lock = threading.Lock()
 
         def record(
             product_id: str,
@@ -5541,16 +6107,17 @@ class SyncService:
             }
             if fallback_action:
                 row["fallback_action"] = fallback_action
-            item_states[product_id] = row
-            if status in {"failed", "pending"}:
-                errors.append(f"{product_id}: {message}")
-            self.db.log_product_operation(
-                store.id,
-                product_id,
-                action,
-                status,
-                message,
-            )
+            with state_lock:
+                item_states[product_id] = row
+                if status in {"failed", "pending"}:
+                    errors.append(f"{product_id}: {message}")
+                self.db.log_product_operation(
+                    store.id,
+                    product_id,
+                    action,
+                    status,
+                    message,
+                )
 
         if (
             store.app_id == "demo-store"
@@ -5682,46 +6249,79 @@ class SyncService:
                             action="彻底删除",
                         )
         else:
-            private = ShopPrivateClient(self.db, store)
+            chunks = [
+                (offset, ids[offset : offset + chunk_size])
+                for offset in range(0, len(ids), chunk_size)
+            ]
+            worker_limit = max(
+                1,
+                min(8, int(os.cpu_count() or 1), len(chunks)),
+            )
+            progress_lock = threading.Lock()
+            completed_items = 0
 
-            def recycle_presence() -> set[str]:
-                products = private.scan_products(
-                    "recycle",
-                    max_pages=None,
-                    page_size=100,
+            def product_action(product_id: str) -> str:
+                product = self.db.get_product(store.id, product_id) or {}
+                return (
+                    "彻底删除"
+                    if int(product.get("status") or -1) == 6
+                    else "移入回收站"
                 )
-                return {
-                    str(product.product_id)
-                    for product in products
-                    if getattr(product, "product_id", "")
-                }
 
-            for offset in range(0, len(ids), chunk_size):
-                chunk = ids[offset : offset + chunk_size]
+            def mark_cancelled(product_id: str, message: str) -> None:
+                nonlocal cancelled
+                if product_id in item_states:
+                    return
+                cancelled = True
+                record(
+                    product_id,
+                    "cancelled",
+                    message,
+                    action=product_action(product_id),
+                )
+
+            def report_progress(chunk_size_current: int) -> None:
+                nonlocal completed_items
+                with progress_lock:
+                    completed_items = min(
+                        len(ids),
+                        completed_items + chunk_size_current,
+                    )
+                    current = completed_items
+                if progress:
+                    progress(
+                        f"正在批量删除 {current}/{len(ids)}",
+                        current,
+                        len(ids),
+                    )
+
+            def process_chunk(
+                _offset: int,
+                chunk: list[str],
+            ) -> None:
+                nonlocal cancelled
+                private_client = ShopPrivateClient(self.db, store)
+
+                def recycle_presence() -> set[str]:
+                    products = private_client.scan_products(
+                        "recycle",
+                        max_pages=None,
+                        page_size=100,
+                    )
+                    return {
+                        str(product.product_id)
+                        for product in products
+                        if getattr(product, "product_id", "")
+                    }
+
                 if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    for product_id in ids[offset:]:
-                        record(
+                    for product_id in chunk:
+                        mark_cancelled(
                             product_id,
-                            "cancelled",
                             "已取消，未执行平台写操作",
-                            action=(
-                                "彻底删除"
-                                if int(
-                                    (
-                                        self.db.get_product(
-                                            store.id,
-                                            product_id,
-                                        )
-                                        or {}
-                                    ).get("status")
-                                    or -1
-                                )
-                                == 6
-                                else "移入回收站"
-                            ),
                         )
-                    break
+                    report_progress(len(chunk))
+                    return
 
                 to_recycle: list[str] = []
                 to_delete: list[str] = []
@@ -5763,10 +6363,19 @@ class SyncService:
                             )
                         to_delete = confirmed_to_delete
 
+                if cancel_event is not None and cancel_event.is_set():
+                    for product_id in chunk:
+                        mark_cancelled(
+                            product_id,
+                            "已取消，未执行平台写操作",
+                        )
+                    report_progress(len(chunk))
+                    return
+
                 recycled_confirmed: list[str] = []
                 if to_recycle:
                     try:
-                        result = private.batch_product_action(
+                        result = private_client.batch_product_action(
                             to_recycle,
                             "recycle",
                         )
@@ -5778,12 +6387,22 @@ class SyncService:
                                 )
                             )
                     except Exception as exc:
+                        outcome = (
+                            "pending"
+                            if self._product_write_result_pending(exc)
+                            else "failed"
+                        )
                         for product_id in to_recycle:
                             record(
                                 product_id,
-                                "pending",
-                                "移入回收站请求结果未知，缓存已保留，待核实："
-                                + str(exc),
+                                outcome,
+                                (
+                                    "移入回收站请求结果未知，缓存已保留，待核实："
+                                    + str(exc)
+                                    if outcome == "pending"
+                                    else "移入回收站被平台明确拒绝，"
+                                    "缓存已保留：" + str(exc)
+                                ),
                                 action="移入回收站",
                             )
                     else:
@@ -5857,9 +6476,11 @@ class SyncService:
                                 "已取消，未执行彻底删除",
                                 action="彻底删除",
                             )
-                elif hard_delete and real_candidates:
+                    report_progress(len(chunk))
+                    return
+                if hard_delete and real_candidates:
                     try:
-                        result = private.batch_product_action(
+                        result = private_client.batch_product_action(
                             real_candidates,
                             "real",
                         )
@@ -5871,12 +6492,22 @@ class SyncService:
                                 )
                             )
                     except Exception as exc:
+                        outcome = (
+                            "pending"
+                            if self._product_write_result_pending(exc)
+                            else "failed"
+                        )
                         for product_id in real_candidates:
                             record(
                                 product_id,
-                                "pending",
-                                "彻底删除请求结果未知，缓存已保留，待核实："
-                                + str(exc),
+                                outcome,
+                                (
+                                    "彻底删除请求结果未知，缓存已保留，待核实："
+                                    + str(exc)
+                                    if outcome == "pending"
+                                    else "彻底删除被平台明确拒绝，"
+                                    "缓存已保留：" + str(exc)
+                                ),
                                 action="彻底删除",
                             )
                     else:
@@ -5912,36 +6543,18 @@ class SyncService:
                                         action="彻底删除",
                                     )
 
-                if progress:
-                    progress(
-                        f"正在批量删除 {min(offset + len(chunk), len(ids))}/{len(ids)}",
-                        min(offset + len(chunk), len(ids)),
-                        len(ids),
-                    )
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    for product_id in ids[offset + len(chunk):]:
-                        record(
-                            product_id,
-                            "cancelled",
-                            "已取消，未执行平台写操作",
-                            action=(
-                                "彻底删除"
-                                if int(
-                                    (
-                                        self.db.get_product(
-                                            store.id,
-                                            product_id,
-                                        )
-                                        or {}
-                                    ).get("status")
-                                    or -1
-                                )
-                                == 6
-                                else "移入回收站"
-                            ),
-                        )
-                    break
+                report_progress(len(chunk))
+
+            with ThreadPoolExecutor(
+                max_workers=worker_limit,
+                thread_name_prefix="product-delete",
+            ) as executor:
+                futures = [
+                    executor.submit(process_chunk, offset, chunk)
+                    for offset, chunk in chunks
+                ]
+                for future in as_completed(futures):
+                    future.result()
 
         for product_id in ids:
             if product_id not in item_states:

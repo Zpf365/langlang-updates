@@ -380,6 +380,8 @@ export function useAutoRefresh({
     statusText,
     beginManual: () => scheduler?.beginManual() ?? true,
     endManual: () => scheduler?.endManual(),
+    pause: () => scheduler?.pause(),
+    resume: () => scheduler?.resume(),
     toggle: () => {
       enabled.value = !enabled.value;
     },

@@ -2839,6 +2839,80 @@ def test_webui_upload_product_service_uses_current_write_scope(
     assert service.calls == [(store_id, "add", {"title": "商品"})]
 
 
+@pytest.mark.parametrize("runner_state", ["cancelled", "paused"])
+def test_scoped_upload_wrapper_rechecks_stop_after_global_pause(
+    tmp_path: Path,
+    runner_state: str,
+) -> None:
+    database = Database(tmp_path / "upload-pause-cancel-wrapper.db")
+    store_id = database.add_store(
+        "暂停取消真实wrapper",
+        "wx-upload-wrapper-cancel",
+        "secret",
+    )
+    store = database.get_store(store_id)
+
+    class GuardedService:
+        def __init__(self) -> None:
+            self.platform_write_authorizer = None
+            self.calls = []
+
+        def product_write(self, current_store, action, payload, **_kwargs):
+            self.platform_write_authorizer(
+                current_store.app_id,
+                "product_write",
+            )
+            self.calls.append((current_store.id, action, payload))
+            return {"product_id": "SHOULD-NOT-EXIST"}
+
+    service = GuardedService()
+    controller = NextUiController(database, product_service=service)
+    wrapped = _ScopedUploadProductService(controller, service)
+    runner = SimpleNamespace(
+        cancelled=threading.Event(),
+        paused=threading.Event(),
+    )
+    wrapped.bind_runner(runner)
+    generation = controller._current_generation()
+    controller._global_task_pause_gate.pause(
+        account_id=controller._account_id(),
+        generation=generation,
+        reason="wrapper-test",
+    )
+    errors: list[BaseException] = []
+    finished = threading.Event()
+
+    def write() -> None:
+        try:
+            wrapped.product_write(
+                store,
+                "add",
+                {"title": "暂停后取消"},
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=write, daemon=True)
+    worker.start()
+    time.sleep(0.1)
+    assert not finished.is_set()
+
+    getattr(runner, runner_state).set()
+    controller._global_task_pause_gate.resume(
+        account_id=controller._account_id(),
+        generation=generation,
+        reason="wrapper-test-resume",
+    )
+    assert finished.wait(3)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], PermissionError)
+    assert "已取消或暂停" in str(errors[0])
+    assert service.calls == []
+
+
 def test_webui_upload_run_rpc_executes_selected_persisted_task(
     tmp_path: Path,
 ) -> None:

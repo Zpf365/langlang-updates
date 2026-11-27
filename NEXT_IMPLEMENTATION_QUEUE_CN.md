@@ -37,7 +37,7 @@
 
 ### 1.9.02 桥接版本更新骨架
 
-状态：`VERIFY_FINAL_HEALTH_FIX`
+状态：`VERIFY_CLOSED_LOOP_CANDIDATE`
 
 - CTO 任务：`TASK-20261127-026`。
 - 内部候选继续使用 `1.9.01.1`；公共桥接版本只能提升为三段 `1.9.02`，
@@ -61,6 +61,75 @@
 - 架构复核放行后的最终健康收口提交：`6f24b66`。主进程只创建一个
   `StartupHealthCoordinator`；AuthWindow、FrontendServer、QWebEngine 与 JS
   只报告阶段，最终 marker 由协调器单点写入。
+
+### 1.9.02.2 今日候选集成
+
+状态：`VERIFY`
+
+- 分支：`hotfix/integration-1.9.02.2`；基线：`b2a2449`。
+- 本机验证候选元数据：`package_version=1.9.02.2`、
+  `product_version=1.9.02`；发布说明为 `RELEASE_NOTES_1.9.02.2.md`。
+  未修改线上 `update_manifest.json`。
+- 已集成第三方上货内容清洗 `b719c1b`、`5511d57`、`e86ceaa`；
+  全局暂停 `c5e07fa`、`7de8a60`、`f014292`、`af468e2`、`68c9394`；
+  刷新与账户生命周期 `76c7256`、`d08b756`，并纳入其必需前序
+  `e0c0242`、`2758784`。
+- 店铺管理 `9b4ec45` 已包含在基线，本轮未重复集成；另合入店铺登录和
+  后台打开独立忙碌锁修复。
+- 店铺刷新改为专用有界队列池：按可用 CPU/内存选择 6–12 路并发，店铺不足时
+  使用实际店数；`WEIMI_STORE_REFRESH_WORKERS` 复用并夹取到 6–12。
+- `stores.refresh.cancel` 停止派发新店、等待已开始刷新结束，并向
+  `active/max/queued/completed/failed/cancelled` 报告准确状态。页面离开会先
+  请求后端取消再停止轮询；每店启动前仍经过全局暂停门，账号 generation 防止
+  晚到结果写入。
+- 定向 pytest `71 passed`；相关既有回归 `51 passed`；受影响 Vitest
+  `33 passed`；店铺登录/刷新/同步定向 Vitest `18 passed`；Python
+  `py_compile` 通过。
+- 未提交 Git，未打包、部署或发布。真实平台内容上传、暂停恢复和账户切换
+  人工流程尚未验证。
+
+### 1.9.02 签名 WebUI 热更新本地闭环
+
+- 公钥 `langlang-release-2026-11` 已进入
+  `assets/update_public_keys.json`；私钥只位于仓库外受限目录，未进入
+  仓库、日志、候选包或 Release。
+- 正式信任配置默认 `enabled: false`，客户端默认不请求或激活热更新；
+  显式启用后只从固定 GitHub Release API 发现唯一
+  `hot_update_channel.json`，并继续按 Ed25519 签名、版本兼容、ZIP 和逐文件
+  SHA256 校验失败关闭。
+- 新增确定性封装、独立验签和仓库外密钥初始化工具；打包器拒绝仓库内私钥、
+  符号链接、越权路径、危险文件类型、未知规则和缺 `index.html` 的包。
+- 集成后热更新与既有更新协议定向 pytest 为 `70 passed, 1 skipped`；
+  未上传资产、未修改 Release、未打包完整应用、未部署或提交 Git。
+- 真实 `webui/dist` 热包、Qt 实际 reload 和 GitHub 频道资产尚未验证。
+
+### 1.9.02.2 店铺刷新自适应并发
+
+- 分支 `hotfix/store-refresh-perf-1.9.02.2` 已合入专用队列池；合成 105 店、
+  每店 50ms I/O 等待时，单路线性约 `5.32s`，本机自适应 12 路约 `0.459s`。
+- 刷新取消、全局暂停和账号 generation 已融合：取消打断等待中的店铺，
+  全局暂停阻止下一店开始，账号切换丢弃旧代际晚到结果。
+- 刷新、账户切换、全局暂停、上货和内容清洗组合定向 pytest `197 passed`；
+  刷新页面、账号切换、自动刷新和暂停控件定向 Vitest `6 files / 44 passed`。
+- 真实 100+ 店铺平台刷新、打包、部署和发布未执行。
+
+### 1.9.02.2 全局暂停后台调度闭环
+
+- 后台 scheduler 在自动化到期、托管计划、采购自动化和活动续期前检查
+  `GlobalTaskPauseGate`；暂停时不启动新的到期任务。
+- 已运行自动化在后续任务和平台调用前检查暂停、任务取消与账号代次；当前
+  原子请求完成后等待恢复，恢复时由原 worker 继续，账号切换后不续跑。
+- 上传真实 wrapper 绑定实际 runner；全局暂停等待恢复时同时校验任务取消、
+  本地暂停与 account generation，恢复后已取消/暂停的任务不会进入底层平台写。
+- 托管、采购自动化和活动续期在每次平台写前执行同类检查；未知写入结果继续
+  按原协议标记待核实，不因暂停改成成功或失败。
+- 店铺登录与打开后台使用按 `store_id` 的独立 Profile 操作锁：同店互斥、
+  异店并行，成功或异常路径均释放。
+- 刷新终态保留历史任务，仅回收已结束 worker、私有 cancel event 和
+  dispatch lock；`running` 与 `paused` 任务保留续跑对象。
+- 本轮全局暂停、后台调度、刷新取消、Profile 锁和商品结果分类组合定向
+  pytest `186 passed`；相关 WebUI Vitest `7 files / 49 passed`。
+
 ### 商品取消与批量删除热修复（TASK-20261127-008 / 012）
 
 状态：`VERIFY`
@@ -81,6 +150,14 @@
   回读失败时不调用 real、不删缓存并保持待核实。单件删除与刷新共用同店租约，
   双向冲突在进入 service 前拒绝。定向 pytest `32 passed`，`py_compile`
   通过；按要求本轮未运行全量测试和 build。
+- 1.9.02.2 已合入取消覆盖增强：商品批删受控分块并发为
+  `min(8, CPU, 实际分块数)`；取消后当前平台原子请求继续收敛，排队分块只记
+  已取消，在途未知结果保持待核实。上货回归覆盖成功完成、未知结果和后续
+  未提交商品三种边界。
+- 取消/删除、单件删除复核、上货、全局暂停和内容清洗合并定向 pytest
+  `127 passed`；取消/删除与上传页面 Vitest `3 files / 12 passed`。
+- 平台明确拒绝、商品不存在或无效请求记为 `failed`；仅超时、断连、
+  不完整响应和 `ShopPrivateWriteUncertainError` 保持 `pending`。
 - 真实平台批量删除、彻底删除、撤回审核和刷新取消尚未验证；未发布、未部署。
 ### TASK-20261127-024 WebUI 类目错误按需刷新独立修复
 

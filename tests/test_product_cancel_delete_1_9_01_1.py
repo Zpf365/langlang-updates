@@ -262,11 +262,11 @@ def test_batch_delete_uses_platform_chunks_and_one_verification_per_chunk(
         ids,
     )
 
-    assert [len(product_ids) for product_ids, _way in private_calls] == [
-        20,
-        20,
-        5,
-    ]
+    assert sorted(
+        len(product_ids)
+        for product_ids, _way in private_calls
+    ) == [5, 20, 20]
+    assert {way for _product_ids, way in private_calls} == {"recycle"}
     assert len(scans) == 3
     assert result["cancelled"] is False
     assert result["counts"]["success"] == 45
@@ -314,6 +314,109 @@ def test_batch_delete_does_not_report_unknown_remote_result_as_success(
     )
 
 
+def test_batch_delete_explicit_recycle_rejection_is_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-batch-delete-rejected.db")
+    store_id = database.add_store(
+        "明确拒绝店铺",
+        "wx-batch-delete-rejected",
+        "secret",
+    )
+    _seed_product(database, store_id, "rejected-product")
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, _product_ids, _way):
+            raise ShopPrivateError(
+                "商家后台拒绝请求（HTTP 403），请重新扫码"
+            )
+
+        def scan_products(self, _tab_key, **_kwargs):
+            return []
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    monkeypatch.setattr("os.cpu_count", lambda: 1)
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+
+    result = service.batch_delete_products(
+        database.get_store(store_id),
+        ["rejected-product"],
+    )
+
+    assert result["counts"] == {
+        "success": 0,
+        "failed": 1,
+        "cancelled": 0,
+        "pending": 0,
+    }
+    assert result["items"][0]["status"] == "failed"
+    assert "明确拒绝" in result["items"][0]["message"]
+    assert database.get_product(store_id, "rejected-product") is not None
+
+
+def test_batch_delete_invalid_product_real_delete_is_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-batch-delete-invalid.db")
+    store_id = database.add_store(
+        "无效商品店铺",
+        "wx-batch-delete-invalid",
+        "secret",
+    )
+    _seed_product(database, store_id, "invalid-delete-product")
+    recycled: set[str] = set()
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, product_ids, way):
+            if way == "recycle":
+                recycled.update(product_ids)
+                return {"success": True}
+            raise ShopPrivateError("商品不存在或已删除")
+
+        def scan_products(self, _tab_key, **_kwargs):
+            return [
+                SimpleNamespace(product_id=product_id)
+                for product_id in sorted(recycled)
+            ]
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    monkeypatch.setattr("os.cpu_count", lambda: 1)
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+
+    result = service.batch_delete_products(
+        database.get_store(store_id),
+        ["invalid-delete-product"],
+        hard_delete=True,
+    )
+
+    assert result["counts"] == {
+        "success": 0,
+        "failed": 1,
+        "cancelled": 0,
+        "pending": 0,
+    }
+    assert result["items"][0]["status"] == "failed"
+    assert result["items"][0]["action"] == "彻底删除"
+    assert "明确拒绝" in result["items"][0]["message"]
+    assert database.get_product(store_id, "invalid-delete-product") is not None
+
+
 def test_batch_delete_cancel_finishes_current_chunk_then_stops_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -347,6 +450,7 @@ def test_batch_delete_cancel_finishes_current_chunk_then_stops_writes(
         "weimi_manager.service.ShopPrivateClient",
         PrivateClient,
     )
+    monkeypatch.setattr("os.cpu_count", lambda: 1)
     service = SyncService(database)
     service._require_platform_write = lambda *_args, **_kwargs: None
 
@@ -362,6 +466,319 @@ def test_batch_delete_cancel_finishes_current_chunk_then_stops_writes(
     assert result["counts"]["success"] == 20
     assert result["counts"]["cancelled"] == 25
     assert result["counts"]["pending"] == 0
+
+
+def test_batch_delete_uses_controlled_parallel_chunks_with_cpu_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-batch-delete-parallel.db")
+    store_id = database.add_store(
+        "并行批删店铺",
+        "wx-batch-delete-parallel",
+        "secret",
+    )
+    ids = [f"parallel-{index:02d}" for index in range(45)]
+    for product_id in ids:
+        _seed_product(database, store_id, product_id)
+
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    both_active = threading.Event()
+    release = threading.Event()
+    calls: list[tuple[str, ...]] = []
+    recycled: set[str] = set()
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, product_ids, _way):
+            nonlocal active, peak_active
+            with state_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                calls.append(tuple(product_ids))
+                if active >= 2:
+                    both_active.set()
+            release.wait(2)
+            with state_lock:
+                active -= 1
+                recycled.update(product_ids)
+            return {"success": True}
+
+        def scan_products(self, _tab_key, **_kwargs):
+            with state_lock:
+                present = sorted(recycled)
+            return [
+                SimpleNamespace(product_id=product_id)
+                for product_id in present
+            ]
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    monkeypatch.setattr("os.cpu_count", lambda: 2)
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def run_delete() -> None:
+        try:
+            results.append(
+                service.batch_delete_products(
+                    database.get_store(store_id),
+                    ids,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_delete, daemon=True)
+    worker.start()
+    parallel_started = both_active.wait(1)
+    release.set()
+    worker.join(3)
+
+    assert not worker.is_alive()
+    assert not errors
+    assert parallel_started
+    assert peak_active == 2
+    assert sorted(len(product_ids) for product_ids in calls) == [5, 20, 20]
+    assert results[0]["counts"]["success"] == 45
+
+
+def test_batch_delete_cancel_stops_queued_chunks_after_inflight_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-batch-delete-parallel-cancel.db")
+    store_id = database.add_store(
+        "并行批删取消店铺",
+        "wx-batch-delete-parallel-cancel",
+        "secret",
+    )
+    ids = [f"parallel-cancel-{index:02d}" for index in range(65)]
+    for product_id in ids:
+        _seed_product(database, store_id, product_id)
+
+    cancel_event = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    both_active = threading.Event()
+    release = threading.Event()
+    calls: list[tuple[str, ...]] = []
+    recycled: set[str] = set()
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, product_ids, _way):
+            nonlocal active
+            with state_lock:
+                active += 1
+                calls.append(tuple(product_ids))
+                if active >= 2:
+                    both_active.set()
+            release.wait(2)
+            with state_lock:
+                active -= 1
+                recycled.update(product_ids)
+            return {"success": True}
+
+        def scan_products(self, _tab_key, **_kwargs):
+            with state_lock:
+                present = sorted(recycled)
+            return [
+                SimpleNamespace(product_id=product_id)
+                for product_id in present
+            ]
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    monkeypatch.setattr("os.cpu_count", lambda: 2)
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def run_delete() -> None:
+        try:
+            results.append(
+                service.batch_delete_products(
+                    database.get_store(store_id),
+                    ids,
+                    cancel_event=cancel_event,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_delete, daemon=True)
+    worker.start()
+    parallel_started = both_active.wait(1)
+    cancel_event.set()
+    release.set()
+    worker.join(3)
+
+    assert not worker.is_alive()
+    assert not errors
+    assert parallel_started
+    assert len(calls) == 2
+    assert results[0]["cancelled"] is True
+    assert results[0]["counts"] == {
+        "success": 40,
+        "failed": 0,
+        "cancelled": 25,
+        "pending": 0,
+    }
+
+
+def test_batch_delete_cancel_keeps_inflight_unknown_result_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-batch-delete-unknown-cancel.db")
+    store_id = database.add_store(
+        "并行批删未知店铺",
+        "wx-batch-delete-unknown-cancel",
+        "secret",
+    )
+    ids = [f"unknown-cancel-{index:02d}" for index in range(45)]
+    for product_id in ids:
+        _seed_product(database, store_id, product_id)
+
+    cancel_event = threading.Event()
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, _product_ids, _way):
+            cancel_event.set()
+            raise TimeoutError("network timeout after submit")
+
+        def scan_products(self, _tab_key, **_kwargs):
+            return []
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    monkeypatch.setattr("os.cpu_count", lambda: 1)
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+
+    result = service.batch_delete_products(
+        database.get_store(store_id),
+        ids,
+        batch_size=20,
+        cancel_event=cancel_event,
+    )
+
+    assert result["cancelled"] is True
+    assert result["counts"] == {
+        "success": 0,
+        "failed": 0,
+        "cancelled": 25,
+        "pending": 20,
+    }
+    assert {
+        row["status"]
+        for row in result["items"]
+        if row["product_id"] in ids[:20]
+    } == {"pending"}
+    assert all(
+        database.get_product(store_id, product_id) is not None
+        for product_id in ids
+    )
+
+
+def test_batch_delete_parallel_workers_never_exceed_eight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-batch-delete-worker-cap.db")
+    store_id = database.add_store(
+        "并行上限店铺",
+        "wx-batch-delete-worker-cap",
+        "secret",
+    )
+    ids = [f"worker-cap-{index:03d}" for index in range(200)]
+    for product_id in ids:
+        _seed_product(database, store_id, product_id)
+
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    eight_active = threading.Event()
+    release = threading.Event()
+    recycled: set[str] = set()
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, product_ids, _way):
+            nonlocal active, peak_active
+            with state_lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                if active >= 8:
+                    eight_active.set()
+            release.wait(2)
+            with state_lock:
+                active -= 1
+                recycled.update(product_ids)
+            return {"success": True}
+
+        def scan_products(self, _tab_key, **_kwargs):
+            with state_lock:
+                present = sorted(recycled)
+            return [
+                SimpleNamespace(product_id=product_id)
+                for product_id in present
+            ]
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    monkeypatch.setattr("os.cpu_count", lambda: 32)
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def run_delete() -> None:
+        try:
+            results.append(
+                service.batch_delete_products(
+                    database.get_store(store_id),
+                    ids,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_delete, daemon=True)
+    worker.start()
+    eight_started = eight_active.wait(2)
+    time.sleep(0.1)
+    release.set()
+    worker.join(3)
+
+    assert not worker.is_alive()
+    assert not errors
+    assert eight_started
+    assert peak_active == 8
+    assert results[0]["counts"]["success"] == 200
 
 
 def test_hard_delete_moves_to_recycle_then_permanently_deletes_in_one_task(

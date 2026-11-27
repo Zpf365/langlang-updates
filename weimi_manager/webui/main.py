@@ -285,6 +285,10 @@ def main(argv: list[str] | None = None) -> int:
                 auth_client=service.client,
                 auth_service=service,
                 team_service=team_service,
+                global_task_state_path=(
+                    base_paths.data_dir.parent
+                    / "global_task_control.json"
+                ),
             )
             result = run_desktop(
                 controller,

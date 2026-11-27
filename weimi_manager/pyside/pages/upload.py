@@ -81,6 +81,7 @@ class UploadRunner:
         *,
         progress: Callable[[str, int, int], None] | None = None,
         external_stop_requested: Callable[[], bool] | None = None,
+        start_guard: Callable[[], bool] | None = None,
     ) -> None:
         self.workspace = workspace
         self.db = workspace.db
@@ -91,6 +92,7 @@ class UploadRunner:
         self.cancelled = threading.Event()
         self.progress = progress
         self.external_stop_requested = external_stop_requested
+        self.start_guard = start_guard
         self._jobs_total = 0
         self._jobs_completed = 0
         self.adapter = _PayloadAdapter(self.db)
@@ -233,6 +235,10 @@ class UploadRunner:
             if self.paused.is_set():
                 item["status"] = "paused"
                 item["message"] = "等待继续"
+                continue
+            if self.start_guard is not None and not self.start_guard():
+                item["status"] = "paused"
+                item["message"] = "全局任务状态已变化，等待人工恢复"
                 continue
             template = task.get("template") or {}
             category_business_type = str(
@@ -451,6 +457,21 @@ class UploadRunner:
             try:
 
                 def submit_product():
+                    stop_reason = stop_requested()
+                    if stop_reason == "cancelled":
+                        raise UploadCancelled(
+                            "上传任务已取消，未提交当前商品",
+                            category_ids=category_ids,
+                        )
+                    if stop_reason in {"paused", "external"}:
+                        raise UploadPaused(
+                            (
+                                "上传任务已暂停，未提交当前商品"
+                                if stop_reason == "paused"
+                                else "账户或任务代次已变化，未提交当前商品"
+                            ),
+                            category_ids=category_ids,
+                        )
                     return self.service.product_write(
                         store,
                         "add",
