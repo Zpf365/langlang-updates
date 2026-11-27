@@ -181,9 +181,9 @@ def test_startup_update_stage_receives_real_progress_callback(
     assert launches == ["1.8.80"]
 
 
-def _require_tk() -> None:
+def _require_tk(root_factory: type[tk.Tk] = tk.Tk) -> None:
     try:
-        root = tk.Tk()
+        root = root_factory()
         root.withdraw()
         root.destroy()
     except tk.TclError as exc:
@@ -222,7 +222,6 @@ def test_startup_update_ui_failure_returns_to_current_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _require_tk()
     info = UpdateInfo(
         current_version="1.8.79",
         latest_version="1.8.80",
@@ -232,6 +231,7 @@ def test_startup_update_ui_failure_returns_to_current_version(
     )
     release_worker = threading.Event()
     observations: dict[str, object] = {}
+    failure_checks = {"count": 0}
 
     def stage(_info, _target, *, progress):
         progress("正在下载更新包", 256, 1024)
@@ -239,9 +239,52 @@ def test_startup_update_ui_failure_returns_to_current_version(
         raise RuntimeError("磁盘空间不足")
 
     OriginalTk = tk.Tk
+    live_roots: set[tk.Tk] = set()
 
-    class AutoFailTk(OriginalTk):
+    class HiddenAutoFailTk(OriginalTk):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._test_hidden = True
+            self.withdraw()
+            self.bind("<Map>", self._keep_hidden, add="+")
+            live_roots.add(self)
+
+        def _keep_hidden(self, _event=None) -> None:
+            if getattr(self, "_test_hidden", False):
+                super().withdraw()
+
+        def deiconify(self) -> None:
+            self.withdraw()
+
+        def state(self, newstate: str | None = None):
+            if newstate is not None and getattr(
+                self,
+                "_test_hidden",
+                False,
+            ):
+                self.withdraw()
+                return super().state()
+            return super().state(newstate)
+
+        def destroy(self) -> None:
+            live_roots.discard(self)
+            super().destroy()
+
         def mainloop(self, n: int = 0):
+            def inspect_visibility() -> None:
+                self.deiconify()
+                observations["state_after_deiconify"] = self.state()
+                self.state("normal")
+                observations["state_after_normal_request"] = self.state()
+                self.update_idletasks()
+                observations["window_state"] = self.state()
+                observations["window_viewable"] = bool(
+                    self.winfo_viewable()
+                )
+                observations["window_mapped"] = bool(
+                    self.winfo_ismapped()
+                )
+
             def begin() -> None:
                 button = _find_button(self, "立即更新")
                 assert button is not None
@@ -251,17 +294,37 @@ def test_startup_update_ui_failure_returns_to_current_version(
                 release_worker.set()
 
             def inspect_failure() -> None:
-                observations["texts"] = _visible_text_values(self)
                 button = _find_button(self, "继续使用当前版本")
+                if button is None and failure_checks["count"] < 60:
+                    failure_checks["count"] += 1
+                    self.after(50, inspect_failure)
+                    return
+                observations["failure_inspected"] = True
+                observations["texts"] = _visible_text_values(self)
                 assert button is not None
                 button.invoke()
 
+            def abort_stalled_loop() -> None:
+                if "failure_inspected" not in observations:
+                    observations["watchdog_destroyed"] = True
+                    self.destroy()
+
+            self.after(0, inspect_visibility)
             self.after(30, begin)
             self.after(180, release_failure)
             self.after(420, inspect_failure)
-            return super().mainloop(n)
+            self.after(4000, abort_stalled_loop)
+            result = super().mainloop(n)
+            try:
+                observations["root_exists_after"] = bool(
+                    self.winfo_exists()
+                )
+            except tk.TclError:
+                observations["root_exists_after"] = False
+            return result
 
-    monkeypatch.setattr(startup_update.tk, "Tk", AutoFailTk)
+    _require_tk(HiddenAutoFailTk)
+    monkeypatch.setattr(startup_update.tk, "Tk", HiddenAutoFailTk)
     try:
         should_exit = startup_update._run_update_flow(
             info,
@@ -278,3 +341,11 @@ def test_startup_update_ui_failure_returns_to_current_version(
     assert should_exit is False
     assert any("更新失败" in text for text in observations["texts"])
     assert any("磁盘空间不足" in text for text in observations["texts"])
+    assert observations["state_after_deiconify"] == "withdrawn"
+    assert observations["state_after_normal_request"] == "withdrawn"
+    assert observations["window_state"] == "withdrawn"
+    assert observations["window_viewable"] is False
+    assert observations["window_mapped"] is False
+    assert observations["root_exists_after"] is False
+    assert "watchdog_destroyed" not in observations
+    assert live_roots == set()
