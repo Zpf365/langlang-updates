@@ -350,8 +350,8 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain(':aria-expanded="isStoreExpanded(store.id)"');
     expect(source).toContain('class="store-detail-grid"');
     expect(source).toContain("商品曝光人数/商品点击次数");
-    expect(source).toContain("--store-sales-color: #466d5c;");
-    expect(source).toContain("--store-refund-color: #8a5058;");
+    expect(source).toContain("--store-sales-color: #236347;");
+    expect(source).toContain("--store-refund-color: #963F47;");
     expect(source).toContain("资金与保证金");
     expect(source).toContain("体验分");
     expect(source).toContain("result[`${summaryKey}_orders`]");

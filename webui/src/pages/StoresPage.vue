@@ -1492,7 +1492,7 @@ onBeforeUnmount(() => {
               <th rowspan="2" class="sticky-index sticky-column">序号</th>
               <th rowspan="2" class="sticky-name sticky-column">店铺</th>
               <th rowspan="2">商品</th>
-              <th colspan="4" class="overview-group-head">销售/退款（金额/单量）</th>
+              <th colspan="4" class="overview-group-head"><span class="sales-header-tone">销售/</span><span class="refund-header-tone">退款</span><span class="metric-header-neutral">（金额/单量）</span></th>
               <th colspan="3" class="overview-group-head">凭据与登录</th>
               <th rowspan="2">操作</th>
             </tr>
@@ -1672,7 +1672,7 @@ onBeforeUnmount(() => {
               <th colspan="3" class="exposure-group-head">商品曝光人数/商品点击次数</th>
               <th rowspan="2">在线商品数</th>
               <th rowspan="2">今日上新</th>
-              <th colspan="4" class="sales-group-head">销售/退款（金额/单量）</th>
+              <th colspan="4" class="sales-group-head"><span class="sales-header-tone">销售/</span><span class="refund-header-tone">退款</span><span class="metric-header-neutral">（金额/单量）</span></th>
               <th rowspan="2">可提现余额</th>
               <th rowspan="2">待结算余额</th>
               <th rowspan="2">体验分</th>
@@ -2313,6 +2313,18 @@ onBeforeUnmount(() => {
    color: var(--store-refund-color);
  }
 
+ .sales-header-tone {
+   color: var(--store-sales-color);
+ }
+
+ .refund-header-tone {
+   color: var(--store-refund-color);
+ }
+
+ .metric-header-neutral {
+   color: #5e6f7e;
+ }
+
  .store-overview-card {
    flex: 1;
    min-height: 0;
@@ -2331,8 +2343,8 @@ onBeforeUnmount(() => {
    --store-table-heading-font-size: 11px;
    --store-table-data-font-size: 11px;
    --store-table-secondary-font-size: 10px;
-   --store-table-sales-single-font-size: 13px;
-   --store-table-sales-double-font-size: 11px;
+   --store-table-sales-single-font-size: 14.5px;
+   --store-table-sales-double-font-size: 12px;
    width: max-content;
    min-width: 100%;
    table-layout: auto;
@@ -2739,8 +2751,8 @@ onBeforeUnmount(() => {
 }
 
 .store-page {
-   --store-sales-color: #466d5c;
-   --store-refund-color: #8a5058;
+   --store-sales-color: #236347;
+   --store-refund-color: #963F47;
    --store-table-unknown-color: #929aa2;
   height: 100%;
   min-height: 0;
@@ -2768,8 +2780,8 @@ onBeforeUnmount(() => {
    --store-table-heading-font-size: 13px;
    --store-table-data-font-size: 13px;
    --store-table-secondary-font-size: 12px;
-   --store-table-sales-single-font-size: 14px;
-   --store-table-sales-double-font-size: 11px;
+   --store-table-sales-single-font-size: 14.5px;
+   --store-table-sales-double-font-size: 12px;
   width: max-content;
   min-width: 100%;
   table-layout: auto;

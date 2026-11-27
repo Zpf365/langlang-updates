@@ -30,7 +30,7 @@ defineProps({
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 1px;
+  gap: 2px;
   line-height: 1.15;
   font-variant-numeric: tabular-nums;
 }
@@ -39,20 +39,22 @@ defineProps({
 .store-refund-line {
   display: block;
   white-space: nowrap;
-  font-size: var(--store-table-sales-double-font-size, 11px);
+  font-size: var(--store-table-sales-double-font-size, 12px);
+  font-weight: 600;
+  line-height: 1.3;
 }
 
 .single-line .store-sale-line {
-  font-size: var(--store-table-sales-single-font-size, 14px);
+  font-size: var(--store-table-sales-single-font-size, 14.5px);
   font-weight: 600;
 }
 
 .sale-tone {
-  color: var(--store-sales-color, #466d5c);
+  color: var(--store-sales-color, #236347);
 }
 
 .refund-tone {
-  color: var(--store-refund-color, #8a5058);
+  color: var(--store-refund-color, #963F47);
 }
 
 .unknown {
