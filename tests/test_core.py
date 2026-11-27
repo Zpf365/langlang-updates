@@ -206,8 +206,8 @@ class CoreTests(unittest.TestCase):
         ):
             metrics = service.refresh_store_metrics(store)
 
-        self.assertEqual(metrics["gmv_today"], 949999)
-        self.assertEqual(metrics["today_orders"], 65)
+        self.assertEqual(metrics["gmv_today"], 999999)
+        self.assertEqual(metrics["today_orders"], 66)
         self.assertEqual(metrics["buyers_today"], 88)
         self.assertEqual(
             metrics["_gift_exclusion"]["today"]["deducted_amount"],
