@@ -1,8 +1,4 @@
 const countFormatter = new Intl.NumberFormat("zh-CN");
-const amountFormatter = new Intl.NumberFormat("zh-CN", {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-});
 
 function numeric(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -10,11 +6,45 @@ function numeric(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function fractionText(hundredths) {
+  if (hundredths === 0) return "";
+  return hundredths % 10 === 0
+    ? `.${hundredths / 10}`
+    : `.${String(hundredths).padStart(2, "0")}`;
+}
+
+function wanText(hundredths, hasRemainder) {
+  const whole = Math.floor(hundredths / 100);
+  return `${countFormatter.format(whole)}${fractionText(hundredths % 100)}万${hasRemainder ? "+" : ""}`;
+}
+
+function formatCountValue(value) {
+  const count = numeric(value);
+  if (count === null) return "—";
+  const sign = count < 0 ? "-" : "";
+  const absolute = Math.abs(count);
+  if (absolute >= 10000) {
+    return `${sign}${wanText(Math.floor(absolute / 100), absolute % 100 !== 0)}`;
+  }
+  return `${sign}${countFormatter.format(absolute)}`;
+}
+
+function formatCentsValue(value) {
+  const cents = numeric(value);
+  if (cents === null) return "—";
+  const sign = cents < 0 ? "-" : "";
+  const absolute = Math.abs(Math.trunc(cents));
+  if (absolute >= 1000000) {
+    return `${sign}${wanText(Math.floor(absolute / 10000), absolute % 10000 !== 0)}`;
+  }
+  return `${sign}${countFormatter.format(Math.floor(absolute / 100))}${fractionText(absolute % 100)}`;
+}
+
 function pairDisplay(amountValue, countValue, formatAmount) {
   const amount = numeric(amountValue);
   const count = numeric(countValue);
   const amountText = amount === null ? "—" : formatAmount(amount);
-  const countText = count === null ? "—" : countFormatter.format(count);
+  const countText = formatCountValue(count);
   return {
     amount,
     count,
@@ -25,20 +55,19 @@ function pairDisplay(amountValue, countValue, formatAmount) {
 }
 
 export function plainMoneyText(value) {
-  const amount = numeric(value);
-  return amount === null ? "—" : amountFormatter.format(amount / 100);
+  return formatCentsValue(value);
 }
 
 export function salesDisplay(presentation = {}) {
   const sale = pairDisplay(
     presentation.value,
     presentation.orderValue,
-    (value) => amountFormatter.format(value / 100),
+    formatCentsValue,
   );
   const refund = pairDisplay(
     presentation.refundAmount,
     presentation.refundOrderCount,
-    (value) => amountFormatter.format(value / 100),
+    formatCentsValue,
   );
   const showRefund = Boolean(presentation.showRefund);
   return {
@@ -64,7 +93,7 @@ export function exposureDisplay(store, key, presentation = {}) {
   const exposed = pairDisplay(
     people,
     count,
-    (value) => countFormatter.format(value),
+    formatCountValue,
   );
   return {
     people: exposed.amount,

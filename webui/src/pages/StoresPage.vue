@@ -1510,7 +1510,10 @@ onBeforeUnmount(() => {
             <template v-for="(store, index) in filteredStores" :key="store.id">
               <tr
                 class="overview-main-row"
-                :class="{ selected: selectedStoreIds.includes(store.id) }"
+                :class="{
+                  selected: selectedStoreIds.includes(store.id),
+                  'row-alternate': index % 2 === 1,
+                }"
                 @contextmenu.prevent.stop="openStoreContextMenu($event, store)"
               >
                 <td class="selection-column sticky-select sticky-column" data-label="选择">
@@ -1577,7 +1580,11 @@ onBeforeUnmount(() => {
                   >{{ isStoreExpanded(store.id) ? "收起" : "详情" }}</button>
                 </td>
               </tr>
-              <tr v-if="isStoreExpanded(store.id)" class="overview-details-row">
+              <tr
+                v-if="isStoreExpanded(store.id)"
+                class="overview-details-row"
+                :class="{ 'row-alternate': index % 2 === 1 }"
+              >
                 <td :colspan="STORE_OVERVIEW_COLUMN_COUNT">
                   <div class="store-detail-grid">
                     <section>
@@ -1692,7 +1699,10 @@ onBeforeUnmount(() => {
             <tr
               v-for="(store, index) in filteredStores"
               :key="store.id"
-              :class="{ selected: selectedStoreIds.includes(store.id) }"
+              :class="{
+                selected: selectedStoreIds.includes(store.id),
+                'row-alternate': index % 2 === 1,
+              }"
               @contextmenu.prevent.stop="openStoreContextMenu($event, store)"
             >
               <td class="selection-column sticky-select sticky-column">
@@ -2357,7 +2367,7 @@ onBeforeUnmount(() => {
  .store-overview-table th.sticky-column,
  .store-overview-table td.sticky-column {
    position: sticky;
-   background: #fff;
+   background: var(--store-row-bg, #fff);
  }
 
  .store-overview-table th.sticky-column {
@@ -2377,7 +2387,7 @@ onBeforeUnmount(() => {
    padding: 5px;
    border-bottom: 1px solid #edf1f4;
    color: #4a5d6c;
-   background: #fff;
+   background: var(--store-row-bg, #fff);
    font-size: var(--store-table-data-font-size);
    text-align: center;
    vertical-align: middle;
@@ -2414,8 +2424,28 @@ onBeforeUnmount(() => {
    min-width: 118px;
  }
 
- .overview-main-row.selected td {
-   background: #edf7ff;
+ .store-overview-table tbody tr {
+   --store-row-bg: #fff;
+ }
+
+ .store-overview-table tbody tr.row-alternate {
+   --store-row-bg: #f7f9fb;
+ }
+
+ .store-overview-table tbody tr:hover {
+   --store-row-bg: #f1f6f9;
+ }
+
+ .store-overview-table tbody tr.selected {
+   --store-row-bg: #eaf3fb;
+ }
+
+ .overview-main-row:hover + .overview-details-row {
+   --store-row-bg: #f1f6f9;
+ }
+
+ .overview-main-row.selected + .overview-details-row {
+   --store-row-bg: #eaf3fb;
  }
 
  .overview-store-cell {
@@ -2479,7 +2509,7 @@ onBeforeUnmount(() => {
 
  .overview-details-row > td {
    padding: 0;
-   background: #f8fafb;
+   background: var(--store-row-bg, #fff);
  }
 
  .store-detail-grid {
@@ -2762,7 +2792,7 @@ onBeforeUnmount(() => {
 .store-table td.sticky-column {
   position: sticky;
   z-index: 4;
-  background: #fff;
+  background: var(--store-row-bg, #fff);
 }
 
 .store-table th.sticky-column {
@@ -2794,6 +2824,7 @@ onBeforeUnmount(() => {
   height: 58px;
   padding: 5px 10px;
   box-sizing: border-box;
+  background: var(--store-row-bg, #fff);
   font-size: var(--store-table-data-font-size);
   line-height: 1.3;
   text-align: center;
@@ -2817,13 +2848,21 @@ onBeforeUnmount(() => {
   min-width: 54px;
 }
 
-.store-table tbody tr.selected {
-  background: #edf7ff;
-  box-shadow: inset 3px 0 #4a9fe8;
+.store-table tbody tr {
+  --store-row-bg: #fff;
 }
 
-.store-table tbody tr.selected td.sticky-column {
-  background: #edf7ff;
+.store-table tbody tr.row-alternate {
+  --store-row-bg: #f7f9fb;
+}
+
+.store-table tbody tr:hover {
+  --store-row-bg: #f1f6f9;
+}
+
+.store-table tbody tr.selected {
+  --store-row-bg: #eaf3fb;
+  box-shadow: inset 3px 0 #4a9fe8;
 }
 
 .app-id-cell {

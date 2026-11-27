@@ -385,6 +385,19 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("summaryMoney(summary.refund_today)");
   });
 
+  it("binds alternating and interaction backgrounds to every row cell", () => {
+    expect(source.match(/'row-alternate': index % 2 === 1/g)).toHaveLength(3);
+    expect(source).toContain("background: var(--store-row-bg, #fff);");
+    expect(source).toContain(".store-overview-table tbody tr:hover");
+    expect(source).toContain(".store-overview-table tbody tr.selected");
+    expect(source).toContain(".overview-main-row:hover + .overview-details-row");
+    expect(source).toContain(".overview-main-row.selected + .overview-details-row");
+    expect(source).toContain(".store-table tbody tr:hover");
+    expect(source).toContain(".store-table tbody tr.selected");
+    expect(source).not.toContain(".store-table tbody tr.selected td.sticky-column");
+    expect(source).not.toContain(".overview-main-row.selected td {");
+  });
+
   it("shows refund rows only for real refund data or unknown values", () => {
     const noRefund = salesPresentation(
       {
