@@ -511,6 +511,8 @@ class NextUiController:
         self._product_batch_jobs: dict[str, dict[str, Any]] = {}
         self._product_batch_jobs_lock = threading.Lock()
         self._product_task_registry_lock = threading.RLock()
+        self._product_store_leases: dict[int, str] = {}
+        self._product_store_leases_lock = threading.RLock()
         self._product_backend_jobs: dict[str, dict[str, Any]] = {}
         self._product_backend_jobs_lock = threading.Lock()
         self._store_jobs: dict[str, dict[str, Any]] = {}
@@ -673,6 +675,55 @@ class NextUiController:
         if str(job.get("account_id") or "") != current_account:
             raise PermissionError(f"{label}不属于当前账户，已拒绝读取")
 
+    def _claim_product_store_leases(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> list[int]:
+        normalized = sorted(
+            {
+                int(store_id)
+                for store_id in store_ids
+                if int(store_id) > 0
+            }
+        )
+        with self._product_store_leases_lock:
+            conflicts = [
+                store_id
+                for store_id in normalized
+                if store_id in self._product_store_leases
+            ]
+            if conflicts:
+                raise ValueError(
+                    "所选店铺商品正在执行另一任务，请等待或取消后再试："
+                    + ", ".join(map(str, conflicts))
+                )
+            for store_id in normalized:
+                self._product_store_leases[store_id] = owner
+        return normalized
+
+    def _release_product_store_leases(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> None:
+        with self._product_store_leases_lock:
+            for store_id in store_ids:
+                if self._product_store_leases.get(int(store_id)) == owner:
+                    self._product_store_leases.pop(int(store_id), None)
+
+    @contextmanager
+    def _product_store_lease(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> Iterator[list[int]]:
+        normalized = self._claim_product_store_leases(store_ids, owner)
+        try:
+            yield normalized
+        finally:
+            self._release_product_store_leases(normalized, owner)
+
     @staticmethod
     def _public_product_task(
         job: dict[str, Any],
@@ -747,16 +798,19 @@ class NextUiController:
         if job.get("status") not in ACCOUNT_TASK_TERMINAL_STATUSES:
             if job.get("kind") == "refresh":
                 job["message"] = (
-                    "上次商品刷新随程序退出中断，未继续执行；请重新刷新"
+                    "上次商品刷新随程序退出中断；当前结果待核实，请重新刷新"
                 )
+                job["status"] = "verification_pending"
+                job["verification_pending"] = True
             else:
                 job["message"] = (
-                    "上次商品批量操作随程序退出中断；未完成项请重新查询"
-                    "或标记待核实"
+                    "上次商品批量操作随程序退出中断；未完成项已恢复为待核实"
                 )
                 items = list(job.get("items") or [])
                 for row in items:
-                    if isinstance(row, dict) and row.get("status") not in {
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("status") not in {
                         "success",
                         "failed",
                         "cancelled",
@@ -765,13 +819,24 @@ class NextUiController:
                         row["status"] = "pending"
                         row["message"] = "程序中断，未获得平台执行结论"
                 job["items"] = items
-                job["pending"] = sum(
-                    1
-                    for row in items
-                    if isinstance(row, dict)
-                    and row.get("status") == "pending"
-                )
-            job["status"] = "failed"
+                counts = {
+                    status: sum(
+                        1
+                        for row in items
+                        if isinstance(row, dict)
+                        and row.get("status") == status
+                    )
+                    for status in ("success", "failed", "cancelled", "pending")
+                }
+                job["counts"] = counts
+                job["success"] = counts["success"]
+                job["failed"] = counts["failed"]
+                job["cancelled_count"] = counts["cancelled"]
+                job["pending"] = counts["pending"]
+                job["total"] = len(items)
+                job["current"] = len(items)
+                job["status"] = "verification_pending"
+                job["verification_pending"] = True
             self._persist_product_task(job)
         return job
 
@@ -10553,7 +10618,11 @@ class NextUiController:
         service = self._require_product_service()
         store = self._require_store(self._store_id(payload))
         tab_key = str(payload.get("tab_key") or "sales")
-        result = service.refresh_product_tab(store, tab_key)
+        with self._product_store_lease(
+            [store.id],
+            f"manual-refresh:{store.id}",
+        ):
+            result = service.refresh_product_tab(store, tab_key)
         errors = list(getattr(result, "errors", []) or [])
         if not isinstance(result, dict):
             result_data = asdict(result)
@@ -10603,6 +10672,8 @@ class NextUiController:
         generation = self._current_generation()
         owner = self._job_owner_fields()
         cancel_event = threading.Event()
+        job_id = uuid.uuid4().hex
+        lease_id = f"refresh:{job_id}"
         with self._product_jobs_lock:
             for existing in self._product_jobs.values():
                 if (
@@ -10610,25 +10681,29 @@ class NextUiController:
                     and self._job_is_active(existing)
                 ):
                     return {"job_id": existing["job_id"], "already_running": True}
-            job_id = uuid.uuid4().hex
-            self._product_jobs[job_id] = {
-                "job_id": job_id,
-                **owner,
-                "kind": "refresh",
-                "action": "refresh",
-                "store_id": store.id,
-                "tab_key": tab_keys[0],
-                "tab_keys": tab_keys,
-                "status": "starting",
-                "current": 0,
-                "total": 0,
-                "message": "正在连接微信小店…",
-                "errors": [],
-                "products": [],
-                "cancel_requested": False,
-                "_cancel_event": cancel_event,
-            }
-            self._persist_product_task(self._product_jobs[job_id])
+            self._claim_product_store_leases([store.id], lease_id)
+            try:
+                self._product_jobs[job_id] = {
+                    "job_id": job_id,
+                    **owner,
+                    "kind": "refresh",
+                    "action": "refresh",
+                    "store_id": store.id,
+                    "tab_key": tab_keys[0],
+                    "tab_keys": tab_keys,
+                    "status": "starting",
+                    "current": 0,
+                    "total": 0,
+                    "message": "正在连接微信小店…",
+                    "errors": [],
+                    "products": [],
+                    "cancel_requested": False,
+                    "_cancel_event": cancel_event,
+                }
+                self._persist_product_task(self._product_jobs[job_id])
+            except Exception:
+                self._release_product_store_leases([store.id], lease_id)
+                raise
 
         def update(**changes: Any) -> None:
             with self._product_jobs_lock:
@@ -10657,7 +10732,7 @@ class NextUiController:
                 total=max(0, int(total)),
             )
 
-        def worker() -> None:
+        def worker_body() -> None:
             update(status="running", message="正在读取商品目录…")
             try:
                 errors: list[str] = []
@@ -10827,6 +10902,12 @@ class NextUiController:
                     errors=[str(exc)],
                 )
 
+        def worker() -> None:
+            try:
+                worker_body()
+            finally:
+                self._release_product_store_leases([store.id], lease_id)
+
         threading.Thread(
             target=worker,
             name=f"webui-product-refresh-{store.id}",
@@ -10949,51 +11030,65 @@ class NextUiController:
         owner = self._job_owner_fields()
         cancel_event = threading.Event()
         store_ids = list(dict.fromkeys(row["store_id"] for row in normalized))
+        lease_id = f"delete:{job_id}"
         with self._product_batch_jobs_lock:
-            with self._product_jobs_lock:
-                if any(
-                    self._job_is_active(job)
-                    and int(job.get("store_id") or 0) in store_ids
-                    for job in self._product_jobs.values()
-                ):
-                    raise ValueError("所选店铺商品正在刷新，请先等待或取消刷新")
             if any(
                 self._job_is_active(job)
                 and int(job.get("store_id") or 0) in store_ids
                 for job in self._product_batch_jobs.values()
             ):
                 raise ValueError("所选店铺已有商品批量操作正在运行")
-            self._product_batch_jobs[job_id] = {
-                "job_id": job_id,
-                **owner,
-                "kind": "batch",
-                "action": action,
-                "label": labels[action],
-                "store_id": store_ids[0] if len(store_ids) == 1 else 0,
-                "store_ids": store_ids,
-                "status": "starting",
-                "message": f"正在准备{labels[action]}…",
-                "current": 0,
-                "total": len(normalized),
-                "success": 0,
-                "failed": 0,
-                "pending": 0,
-                "cancelled_count": 0,
-                "counts": {
+            if action in {"delete", "recycle"}:
+                self._claim_product_store_leases(store_ids, lease_id)
+            else:
+                with self._product_jobs_lock:
+                    if any(
+                        self._job_is_active(job)
+                        and int(job.get("store_id") or 0) in store_ids
+                        for job in self._product_jobs.values()
+                    ):
+                        raise ValueError(
+                            "所选店铺商品正在刷新，请先等待或取消刷新"
+                        )
+            try:
+                self._product_batch_jobs[job_id] = {
+                    "job_id": job_id,
+                    **owner,
+                    "kind": "batch",
+                    "action": action,
+                    "label": labels[action],
+                    "store_id": store_ids[0] if len(store_ids) == 1 else 0,
+                    "store_ids": store_ids,
+                    "status": "starting",
+                    "message": f"正在准备{labels[action]}…",
+                    "current": 0,
+                    "total": len(normalized),
                     "success": 0,
                     "failed": 0,
-                    "cancelled": 0,
                     "pending": 0,
-                },
-                "items": normalized,
-                "errors": [],
-                "cancel_requested": False,
-                "_cancel_event": cancel_event,
-            }
-            self._persist_product_task(self._product_batch_jobs[job_id])
-            initial = self._public_product_task(
-                self._product_batch_jobs[job_id]
-            )
+                    "cancelled_count": 0,
+                    "counts": {
+                        "success": 0,
+                        "failed": 0,
+                        "cancelled": 0,
+                        "pending": 0,
+                    },
+                    "items": normalized,
+                    "errors": [],
+                    "cancel_requested": False,
+                    "_cancel_event": cancel_event,
+                }
+                self._persist_product_task(self._product_batch_jobs[job_id])
+                initial = self._public_product_task(
+                    self._product_batch_jobs[job_id]
+                )
+            except Exception:
+                if action in {"delete", "recycle"}:
+                    self._release_product_store_leases(
+                        store_ids,
+                        lease_id,
+                    )
+                raise
 
         def counts_locked(job: dict[str, Any]) -> dict[str, int]:
             items = [
@@ -11110,7 +11205,7 @@ class NextUiController:
                 _progress_store_id=store_id,
             )
 
-        def worker() -> None:
+        def worker_body() -> None:
             update(status="running", message=f"正在执行{labels[action]}…")
             grouped: dict[int, list[dict[str, Any]]] = {}
             for row in normalized:
@@ -11275,7 +11370,10 @@ class NextUiController:
                                     public.get("message")
                                     or "已取消，未确认平台写入"
                                 )
-                            elif public.get("verification_pending"):
+                            elif (
+                                public.get("verification_pending")
+                                or int(public.get("pending") or 0) > 0
+                            ):
                                 status = "pending"
                                 message = str(
                                     public.get("message")
@@ -11318,17 +11416,18 @@ class NextUiController:
                             row["status"] = "cancelled"
                             row["message"] = "已取消，未执行平台写操作"
                     counts = counts_locked(job)
-                if cancel_stopped or counts["cancelled"] > 0:
+                if counts["pending"]:
+                    status = "verification_pending"
+                    message = (
+                        f"{labels[action]}结果待核实：成功 {counts['success']} 个，"
+                        f"失败 {counts['failed']} 个，"
+                        f"待核实 {counts['pending']} 个"
+                    )
+                elif cancel_stopped or counts["cancelled"] > 0:
                     status = "cancelled"
                     message = (
                         f"{labels[action]}已取消：成功 {counts['success']} 个，"
                         f"失败 {counts['failed']} 个，取消 {counts['cancelled']} 个，"
-                        f"待核实 {counts['pending']} 个"
-                    )
-                elif counts["pending"]:
-                    status = "verification_pending"
-                    message = (
-                        f"{labels[action]}结果待核实：成功 {counts['success']} 个，"
                         f"待核实 {counts['pending']} 个"
                     )
                 elif counts["failed"] and counts["success"]:
@@ -11376,6 +11475,16 @@ class NextUiController:
                     message=f"{labels[action]}失败：{exc}",
                     errors=[str(exc)],
                 )
+
+        def worker() -> None:
+            try:
+                worker_body()
+            finally:
+                if action in {"delete", "recycle"}:
+                    self._release_product_store_leases(
+                        store_ids,
+                        lease_id,
+                    )
 
         threading.Thread(
             target=worker,
@@ -15050,7 +15159,11 @@ class NextUiController:
                 product_id,
                 title,
                 "撤回审核",
-                "failed",
+                (
+                    "pending"
+                    if getattr(exc, "verification_pending", False)
+                    else "failed"
+                ),
                 str(exc),
             )
             raise
@@ -15103,6 +15216,8 @@ class NextUiController:
             for value in public.get("errors") or []
             if str(value).strip()
         ]
+        pending_count = int(public.get("pending") or 0)
+        failed_count = int(public.get("failed") or 0)
         for product_id in product_ids:
             error = next(
                 (
@@ -15117,7 +15232,13 @@ class NextUiController:
                 product_id,
                 str((self.db.get_product(store.id, product_id) or {}).get("title") or ""),
                 action,
-                "failed" if error else "success",
+                (
+                    "pending"
+                    if error and pending_count and not failed_count
+                    else "failed"
+                    if error
+                    else "success"
+                ),
                 error,
             )
         return public

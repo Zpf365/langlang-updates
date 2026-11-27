@@ -44,6 +44,7 @@ from .upload_violations import (
 )
 from .wechat_api import (
     WechatApiError,
+    WechatTransportError,
     WechatShopClient,
     normalize_sku_sale_attrs,
     parse_shipping_account,
@@ -411,6 +412,12 @@ class ProductDeleteUncertainError(RuntimeError):
     verification_pending = True
 
 
+class ProductWriteUncertainError(RuntimeError):
+    """A product write was submitted but its result cannot be determined."""
+
+    verification_pending = True
+
+
 class SyncService:
     def __init__(
         self,
@@ -469,6 +476,25 @@ class SyncService:
                 f"{str(action)}"
             )
         authorizer(str(store.app_id), str(action))
+
+    @staticmethod
+    def _product_write_result_pending(exc: BaseException) -> bool:
+        if bool(getattr(exc, "verification_pending", False)):
+            return True
+        if isinstance(
+            exc,
+            (
+                WechatTransportError,
+                TimeoutError,
+                ConnectionError,
+                json.JSONDecodeError,
+            ),
+        ):
+            return True
+        return (
+            isinstance(exc, WechatApiError)
+            and exc.category == "transport"
+        )
 
     def validate_store(self, store: Store) -> None:
         client = self.client_for(store)
@@ -2851,7 +2877,14 @@ class SyncService:
         elif action == "update":
             result = client.update_product(payload or {})
         elif action == "cancel_audit":
-            result = client.cancel_product_audit(product_id)
+            try:
+                result = client.cancel_product_audit(product_id)
+            except Exception as exc:
+                if self._product_write_result_pending(exc):
+                    raise ProductWriteUncertainError(
+                        "撤回审核请求已发出但结果未知，待核实：" + str(exc)
+                    ) from exc
+                raise
         else:
             raise ValueError("不支持的商品操作")
         if int(result.get("errcode") or 0) != 0:
@@ -5509,6 +5542,37 @@ class SyncService:
                     else:
                         to_recycle.append(product_id)
 
+                if hard_delete and to_delete:
+                    try:
+                        pre_read_present = recycle_presence()
+                    except Exception as exc:
+                        for product_id in to_delete:
+                            record(
+                                product_id,
+                                "pending",
+                                "缓存标记为回收站，但删除前回收站回读失败；"
+                                "未调用彻底删除，待核实：" + str(exc),
+                                action="彻底删除",
+                            )
+                        to_delete = []
+                    else:
+                        confirmed_to_delete = [
+                            product_id
+                            for product_id in to_delete
+                            if product_id in pre_read_present
+                        ]
+                        for product_id in to_delete:
+                            if product_id in pre_read_present:
+                                continue
+                            record(
+                                product_id,
+                                "pending",
+                                "缓存标记为回收站，但删除前回读未找到商品；"
+                                "未调用彻底删除，待核实",
+                                action="彻底删除",
+                            )
+                        to_delete = confirmed_to_delete
+
                 recycled_confirmed: list[str] = []
                 if to_recycle:
                     try:
@@ -5722,10 +5786,10 @@ class SyncService:
                 or counts["pending"] > 0
             )
         )
-        if cancelled:
-            status = "cancelled"
-        elif counts["pending"]:
+        if counts["pending"]:
             status = "verification_pending"
+        elif cancelled:
+            status = "cancelled"
         elif counts["failed"] and counts["success"]:
             status = "partial"
         elif counts["failed"]:
@@ -6408,14 +6472,15 @@ class SyncService:
         run_id = self.db.start_sync_run(store.id, action)
         total = len(product_ids)
         success_count = 0
+        pending_count = 0
         failures: list[str] = []
         cancelled = False
         status_code = 5 if listed else 11
         status_text = PRODUCT_STATUS[status_code]
 
-        def apply_one(product_id: str) -> tuple[str, str | None]:
+        def apply_one(product_id: str) -> tuple[str, str | None, str]:
             if cancel_event and cancel_event.is_set():
-                return product_id, "cancelled"
+                return product_id, "cancelled", "cancelled"
             try:
                 if private is not None:
                     result = private.batch_product_action([product_id], "offshelf")
@@ -6437,17 +6502,24 @@ class SyncService:
                     action,
                     "success",
                 )
-                return product_id, None
+                return product_id, None, "success"
             except Exception as exc:
                 message = str(exc)
+                outcome = (
+                    "pending"
+                    if self._product_write_result_pending(exc)
+                    else "failed"
+                )
+                if outcome == "pending":
+                    message = "平台请求结果未知，待核实：" + message
                 self.db.log_product_operation(
                     store.id,
                     product_id,
                     action,
-                    "failed",
+                    outcome,
                     message,
                 )
-                return product_id, message
+                return product_id, message, outcome
 
         executor = ThreadPoolExecutor(max_workers=max(1, min(workers, 8)))
         futures = {executor.submit(apply_one, product_id): product_id for product_id in product_ids}
@@ -6460,11 +6532,14 @@ class SyncService:
                 if future.cancelled():
                     continue
                 try:
-                    product_id, error = future.result()
+                    product_id, error, outcome = future.result()
                 except CancelledError:
                     continue
-                if error is None:
+                if outcome == "success":
                     success_count += 1
+                elif outcome == "pending":
+                    pending_count += 1
+                    failures.append(f"{product_id}: {error}")
                 elif error != "cancelled":
                     failures.append(f"{product_id}: {error}")
                 if progress:
@@ -6476,17 +6551,30 @@ class SyncService:
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
-        message = f"批量{'上架' if listed else '下架'}：成功 {success_count}，失败 {len(failures)}"
-        status = "cancelled" if cancelled else ("success" if not failures else "partial")
+        failed_count = len(failures) - pending_count
+        message = (
+            f"批量{'上架' if listed else '下架'}：成功 {success_count}，"
+            f"失败 {failed_count}，待核实 {pending_count}"
+        )
+        status = (
+            "verification_pending"
+            if pending_count
+            else "cancelled"
+            if cancelled
+            else "success"
+            if not failures
+            else "partial"
+        )
         self.db.finish_sync_run(run_id, status, success_count, message)
         return SyncResult(
             action,
             total,
             message,
             success=success_count,
-            failed=len(failures),
+            failed=failed_count,
             cancelled=cancelled,
             errors=failures[:20],
+            pending=pending_count,
         )
 
     def update_product_stock(

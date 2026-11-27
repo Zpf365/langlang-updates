@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from weimi_manager.db import Database
 from weimi_manager.models import Product, SyncResult
 from weimi_manager.service import SyncService
+from weimi_manager.shop_private import (
+    ShopPrivateClient,
+    ShopPrivateError,
+    ShopPrivateWriteUncertainError,
+)
+from weimi_manager.wechat_api import (
+    WechatNetworkError,
+    WechatTimeoutError,
+)
 from weimi_manager.webui.controller import NextUiController
 
 
@@ -662,3 +673,504 @@ def test_failed_store_does_not_prevent_next_store_batch_and_stays_pending(
         "first-product": "pending",
         "second-product": "success",
     }
+
+
+def test_cached_recycle_product_missing_on_pre_read_never_calls_real_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-pre-read-missing.db")
+    store_id = database.add_store("前置回读店铺", "wx-pre-read-missing", "secret")
+    _seed_product(database, store_id, "cached-recycle", 6)
+    calls: list[tuple[tuple[str, ...], str]] = []
+    scans = 0
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, product_ids, way):
+            calls.append((tuple(product_ids), way))
+            return {"success": True}
+
+        def scan_products(self, _tab_key, **_kwargs):
+            nonlocal scans
+            scans += 1
+            return []
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+
+    result = service.batch_delete_products(
+        database.get_store(store_id),
+        ["cached-recycle"],
+        hard_delete=True,
+    )
+
+    assert scans == 1
+    assert calls == []
+    assert result["counts"]["pending"] == 1
+    assert result["items"][0]["status"] == "pending"
+    assert database.get_product(store_id, "cached-recycle") is not None
+
+
+def test_cached_recycle_product_pre_read_failure_never_calls_real_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "product-pre-read-failure.db")
+    store_id = database.add_store("前置失败店铺", "wx-pre-read-failure", "secret")
+    _seed_product(database, store_id, "cached-recycle-failure", 6)
+    calls: list[tuple[tuple[str, ...], str]] = []
+
+    class PrivateClient:
+        def __init__(self, _database, _store):
+            pass
+
+        def batch_product_action(self, product_ids, way):
+            calls.append((tuple(product_ids), way))
+            return {"success": True}
+
+        def scan_products(self, _tab_key, **_kwargs):
+            raise ShopPrivateError("回收站读取失败")
+
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        PrivateClient,
+    )
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+
+    result = service.batch_delete_products(
+        database.get_store(store_id),
+        ["cached-recycle-failure"],
+        hard_delete=True,
+    )
+
+    assert calls == []
+    assert result["counts"]["pending"] == 1
+    assert result["items"][0]["status"] == "pending"
+    assert database.get_product(store_id, "cached-recycle-failure") is not None
+
+
+def test_listing_transport_unknown_is_pending_but_explicit_error_is_failed(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-listing-classification.db")
+    store_id = database.add_store("分类店铺", "wx-listing-classification", "secret")
+
+    class Client:
+        def set_product_listing(self, product_id, _listed):
+            if product_id == "transport-unknown":
+                raise WechatTimeoutError("response timeout after submit")
+            raise RuntimeError("平台明确拒绝")
+
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+    service.client_for = lambda _store: Client()
+
+    result = service.set_products_listing(
+        database.get_store(store_id),
+        ["transport-unknown", "explicit-error"],
+        True,
+        workers=1,
+    )
+
+    assert result.success == 0
+    assert result.failed == 1
+    assert result.pending == 1
+    assert result.verification_pending is True
+
+
+def test_cancel_audit_transport_unknown_is_marked_verification_pending(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-audit-classification.db")
+    store_id = database.add_store("审核分类店铺", "wx-audit-classification", "secret")
+
+    class Client:
+        def cancel_product_audit(self, _product_id):
+            raise WechatNetworkError("connection reset after submit")
+
+    service = SyncService(database)
+    service._require_platform_write = lambda *_args, **_kwargs: None
+
+    with pytest.raises(Exception) as raised:
+        service.product_write(
+            database.get_store(store_id),
+            "cancel_audit",
+            product_id="audit-product",
+            client=Client(),
+        )
+
+    assert getattr(raised.value, "verification_pending", False) is True
+    assert "待核实" in str(raised.value)
+
+
+def test_private_product_batch_transport_failure_is_uncertain(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "private-transport-uncertain.db")
+    store_id = database.add_store("私有传输店铺", "wx-private-uncertain", "secret")
+    database.set_web_session(
+        store_id,
+        {
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "test-session",
+                    "domain": ".weixin.qq.com",
+                    "path": "/",
+                    "secure": True,
+                }
+            ]
+        },
+        "已登录",
+        "测试会话",
+    )
+    client = ShopPrivateClient(
+        database,
+        database.get_store(store_id),
+    )
+    client._sleep = lambda _seconds: None
+
+    def fail_post(*_args, **_kwargs):
+        raise requests.ConnectionError("connection reset after submit")
+
+    client.session.post = fail_post
+
+    with pytest.raises(ShopPrivateWriteUncertainError) as raised:
+        client.batch_product_action(["private-product"], "recycle")
+
+    assert getattr(raised.value, "verification_pending", False) is True
+
+
+def test_pending_batch_item_prioritizes_verification_pending_task(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-pending-task.db")
+    store_id = database.add_store("待核实任务店铺", "wx-pending-task", "secret")
+
+    class PendingService:
+        def __init__(self) -> None:
+            self.platform_write_authorizer = None
+
+        def set_products_listing(self, _store, product_ids, _listed, **_kwargs):
+            return SyncResult(
+                "product_listing",
+                len(product_ids),
+                "请求已发出但结果未知",
+                success=0,
+                failed=0,
+                pending=len(product_ids),
+                errors=["请求已发出但结果未知"],
+            )
+
+    controller = NextUiController(database, product_service=PendingService())
+    started = controller.dispatch(
+        "products.batch.start",
+        {
+            "action": "listing",
+            "items": [{"store_id": store_id, "product_id": "pending-product"}],
+        },
+    )
+    final = _wait_for_status(
+        controller,
+        "products.batch.status",
+        started["job_id"],
+    )
+
+    assert final["status"] == "verification_pending"
+    assert final["items"][0]["status"] == "pending"
+
+
+def test_restart_recovers_running_product_task_as_verification_pending(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-restart-task.db")
+    job_id = "restart-batch"
+    database.set_setting(
+        "webui_product_task_jobs",
+        json.dumps(
+            {
+                "tasks": {
+                    job_id: {
+                        "job_id": job_id,
+                        "kind": "batch",
+                        "action": "delete",
+                        "label": "批量彻底删除",
+                        "account_id": "",
+                        "generation": 0,
+                        "status": "running",
+                        "store_id": 1,
+                        "store_ids": [1],
+                        "current": 1,
+                        "total": 3,
+                        "success": 9,
+                        "failed": 8,
+                        "pending": 0,
+                        "cancelled_count": 7,
+                        "counts": {
+                            "success": 9,
+                            "failed": 8,
+                            "cancelled": 7,
+                            "pending": 0,
+                        },
+                        "items": [
+                            {
+                                "store_id": 1,
+                                "product_id": "done",
+                                "status": "success",
+                                "message": "完成",
+                            },
+                            {
+                                "store_id": 1,
+                                "product_id": "running",
+                                "status": "running",
+                                "message": "处理中",
+                            },
+                            {
+                                "store_id": 1,
+                                "product_id": "queued",
+                                "status": "queued",
+                                "message": "等待执行",
+                            },
+                        ],
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+    )
+    controller = NextUiController(database)
+
+    restored = controller.dispatch(
+        "products.batch.status",
+        {"job_id": job_id},
+    )
+
+    assert restored["status"] == "verification_pending"
+    assert restored["counts"] == {
+        "success": 1,
+        "failed": 0,
+        "cancelled": 0,
+        "pending": 2,
+    }
+    assert restored["success"] == 1
+    assert restored["failed"] == 0
+    assert restored["pending"] == 2
+    assert restored["cancelled_count"] == 0
+    assert restored["current"] == 3
+    assert restored["total"] == 3
+    assert [row["status"] for row in restored["items"]] == [
+        "success",
+        "pending",
+        "pending",
+    ]
+
+
+def test_restart_recovers_running_refresh_as_verification_pending(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-restart-refresh.db")
+    job_id = "restart-refresh"
+    database.set_setting(
+        "webui_product_task_jobs",
+        json.dumps(
+            {
+                "tasks": {
+                    job_id: {
+                        "job_id": job_id,
+                        "kind": "refresh",
+                        "action": "refresh",
+                        "account_id": "",
+                        "generation": 0,
+                        "status": "cancelling",
+                        "store_id": 1,
+                        "tab_keys": ["sales"],
+                        "current": 1,
+                        "total": 2,
+                        "message": "正在取消",
+                        "errors": [],
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+    )
+    controller = NextUiController(database)
+
+    restored = controller.dispatch(
+        "products.refresh.status",
+        {"job_id": job_id},
+    )
+
+    assert restored["status"] == "verification_pending"
+    assert restored["current"] == 1
+    assert restored["total"] == 2
+
+
+def test_delete_first_blocks_async_and_manual_refresh_for_same_store(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-delete-first-lease.db")
+    store_id = database.add_store("删除租约店铺", "wx-delete-lease", "secret")
+    started_wait = threading.Event()
+    release = threading.Event()
+
+    class BlockingDeleteService:
+        def __init__(self) -> None:
+            self.platform_write_authorizer = None
+            self.refresh_calls = 0
+
+        def batch_delete_products(self, store, product_ids, **_kwargs):
+            started_wait.set()
+            assert release.wait(3)
+            return {
+                "cancelled": False,
+                "items": [
+                    {
+                        "store_id": store.id,
+                        "product_id": product_id,
+                        "status": "success",
+                        "message": "完成",
+                    }
+                    for product_id in product_ids
+                ],
+                "counts": {
+                    "success": len(product_ids),
+                    "failed": 0,
+                    "cancelled": 0,
+                    "pending": 0,
+                },
+            }
+
+        def refresh_product_tab(self, *_args, **_kwargs):
+            self.refresh_calls += 1
+            raise AssertionError("同店刷新不应在删除租约期间执行")
+
+    service = BlockingDeleteService()
+    controller = NextUiController(database, product_service=service)
+    delete_job = controller.dispatch(
+        "products.batch.start",
+        {
+            "action": "delete",
+            "items": [{"store_id": store_id, "product_id": "lease-product"}],
+        },
+    )
+    assert started_wait.wait(3)
+    try:
+        with pytest.raises(ValueError, match="正在执行"):
+            controller.dispatch(
+                "products.refresh.start",
+                {"store_id": store_id},
+            )
+        with pytest.raises(ValueError, match="正在执行"):
+            controller.dispatch(
+                "products.refresh",
+                {"store_id": store_id},
+            )
+    finally:
+        release.set()
+    _wait_for_status(
+        controller,
+        "products.batch.status",
+        delete_job["job_id"],
+    )
+    assert service.refresh_calls == 0
+
+
+def test_async_refresh_first_blocks_delete_for_same_store(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-refresh-first-lease.db")
+    store_id = database.add_store("刷新租约店铺", "wx-refresh-lease", "secret")
+    started_wait = threading.Event()
+    release = threading.Event()
+
+    class BlockingRefreshService:
+        def __init__(self) -> None:
+            self.platform_write_authorizer = None
+            self.delete_calls = 0
+
+        def refresh_product_tab(self, _store, _tab, *, cancel_event=None, **_kwargs):
+            started_wait.set()
+            assert cancel_event is not None
+            assert release.wait(3)
+            return SyncResult("product_query", 0, "刷新结束", cancelled=True)
+
+        def batch_delete_products(self, *_args, **_kwargs):
+            self.delete_calls += 1
+            raise AssertionError("刷新租约期间不应执行删除")
+
+    service = BlockingRefreshService()
+    controller = NextUiController(database, product_service=service)
+    controller.dispatch(
+        "products.refresh.start",
+        {"store_id": store_id},
+    )
+    assert started_wait.wait(3)
+    try:
+        with pytest.raises(ValueError, match="正在执行"):
+            controller.dispatch(
+                "products.batch.start",
+                {
+                    "action": "delete",
+                    "items": [{"store_id": store_id, "product_id": "lease-product"}],
+                },
+            )
+    finally:
+        release.set()
+    assert service.delete_calls == 0
+
+
+def test_manual_refresh_first_blocks_delete_for_same_store(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-manual-refresh-lease.db")
+    store_id = database.add_store("手动刷新租约店铺", "wx-manual-lease", "secret")
+    started_wait = threading.Event()
+    release = threading.Event()
+
+    class BlockingManualRefreshService:
+        def __init__(self) -> None:
+            self.platform_write_authorizer = None
+
+        def refresh_product_tab(self, _store, _tab, **_kwargs):
+            started_wait.set()
+            assert release.wait(3)
+            return SyncResult("product_query", 0, "刷新结束", success=0)
+
+        def batch_delete_products(self, *_args, **_kwargs):
+            raise AssertionError("手动刷新租约期间不应执行删除")
+
+    service = BlockingManualRefreshService()
+    controller = NextUiController(database, product_service=service)
+    errors: list[BaseException] = []
+
+    def run_manual_refresh() -> None:
+        try:
+            controller.dispatch("products.refresh", {"store_id": store_id})
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_manual_refresh, daemon=True)
+    worker.start()
+    assert started_wait.wait(3)
+    try:
+        with pytest.raises(ValueError, match="正在执行"):
+            controller.dispatch(
+                "products.batch.start",
+                {
+                    "action": "delete",
+                    "items": [{"store_id": store_id, "product_id": "lease-product"}],
+                },
+            )
+    finally:
+        release.set()
+        worker.join(3)
+    assert not errors

@@ -15,6 +15,8 @@ import {
 } from "../productSorting";
 import {
   PRODUCT_BATCH_TERMINAL_STATUSES,
+  productSelectionKey,
+  productSelectionState,
   runProductBatchJob,
 } from "../productBatchOperations";
 
@@ -143,13 +145,14 @@ const displayStart = computed(() => (
   displayedCount.value ? (currentPage.value - 1) * perPage.value + 1 : 0
 ));
 const displayEnd = computed(() => displayStart.value + Math.max(0, displayedCount.value - 1));
-function productSelectionKey(item) {
-  return `${Number(item.store_id || 0)}:${String(item.product_id || "")}`;
-}
-
-const selectedProducts = computed(() => products.value.filter((item) => (
-  selectedIds.value.includes(productSelectionKey(item))
+const effectiveSelection = computed(() => productSelectionState(
+  selectedIds.value,
+  filtered.value,
+));
+const selectedProducts = computed(() => filtered.value.filter((item) => (
+  effectiveSelection.value.ids.includes(productSelectionKey(item))
 )));
+const selectedCount = computed(() => effectiveSelection.value.count);
 const allSelectedInRecycle = computed(() => (
   selectedProducts.value.length > 0
   && selectedProducts.value.every((item) => Number(item.status) === 6)
@@ -193,6 +196,12 @@ watch(operationLogExpanded, (expanded) => {
     localStorage.setItem(OPERATION_LOG_EXPANDED_KEY, expanded ? "1" : "0");
   } catch {
     // Keep the in-memory preference when local storage is unavailable.
+  }
+});
+watch(filtered, (rows) => {
+  const state = productSelectionState(selectedIds.value, rows);
+  if (state.ids.length !== selectedIds.value.length) {
+    selectedIds.value = state.ids;
   }
 });
 
@@ -259,6 +268,7 @@ function productOperationStatusLabel(status) {
     cancelled: "已取消",
     paused: "已暂停",
     verification_pending: "待核实",
+    status_unavailable: "状态暂不可读",
   }[status] || status || "记录";
 }
 
@@ -330,7 +340,7 @@ async function locateQueriedProduct() {
   const productId = String(query.get("product_id") || "").trim();
   if (!productId) return false;
   if (!filters.store_id || isAllStores.value) {
-    products.value = [];
+    applyProductCollection([]);
     focusedProductId.value = "";
     productFocusMessage.value = "无法定位商品：必须指定具体店铺，不能使用全部店铺。";
     note.value = productFocusMessage.value;
@@ -349,7 +359,7 @@ async function locateQueriedProduct() {
         `店铺 ${selectedStoreLabel.value} 未返回商品 ${productId}`,
       );
     }
-    products.value = [product];
+    applyProductCollection([product]);
     filters.search = productId;
     activeStatus.value = "all";
     selectedIds.value = [productSelectionKey(product)];
@@ -365,7 +375,7 @@ async function locateQueriedProduct() {
       .find((element) => element.dataset.productId === productId)
       ?.scrollIntoView({ block: "center", behavior: "smooth" });
   } catch (cause) {
-    products.value = [];
+    applyProductCollection([]);
     focusedProductId.value = "";
     productFocusMessage.value = (
       `定位商品失败：${selectedStoreLabel.value} · ${productId} · `
@@ -385,16 +395,25 @@ async function clearProductFocus() {
   await loadProducts();
 }
 
+function applyProductCollection(nextProducts) {
+  products.value = Array.isArray(nextProducts) ? nextProducts : [];
+  const nextSelection = productSelectionState(
+    selectedIds.value,
+    products.value,
+  );
+  selectedIds.value = nextSelection.ids;
+}
+
 async function loadProducts() {
   if (!filters.store_id) return;
   loading.value = true;
   note.value = "";
   try {
-    products.value = (await call("products.list", {
+    const nextProducts = (await call("products.list", {
       store_id: filters.store_id,
       search: filters.search,
     })).products || [];
-    selectedIds.value = [];
+    applyProductCollection(nextProducts);
     currentPage.value = 1;
   } catch (cause) {
     note.value = cause instanceof Error ? cause.message : String(cause);
@@ -443,7 +462,9 @@ async function refreshProducts() {
     if (job.status === "failed") {
       throw new Error(job.message || "商品刷新失败");
     }
-    products.value = job.products || products.value;
+    if (Array.isArray(job.products)) {
+      applyProductCollection(job.products);
+    }
     const errors = job.errors || [];
     note.value = errors.length
       ? errors.join("；")
@@ -531,7 +552,7 @@ function toggleAllPages() {
 }
 
 async function setListing(listed) {
-  if (!selectedIds.value.length) {
+  if (!selectedCount.value) {
     note.value = "请先选择商品";
     return;
   }
@@ -562,6 +583,11 @@ function applyBatchProgress(job, type, label) {
   actionProgress.label = label;
   actionProgress.jobId = String(job.job_id || actionProgress.jobId || "");
   actionProgress.status = job.status || "running";
+  if (job.status === "status_unavailable") {
+    actionProgress.cancelRequested = false;
+    note.value = job.message || "任务状态暂不可读，正在自动重试";
+    return;
+  }
   actionProgress.current = Number(job.current || 0);
   actionProgress.total = Number(job.total || actionProgress.total || 0);
   actionProgress.productId = String(job.active_product_id || "");
@@ -601,6 +627,11 @@ async function runSelectedBatch(action, rows, label, type) {
       rows,
       action,
       request: call,
+      onStarted: (startedJob) => applyBatchProgress(
+        startedJob,
+        type,
+        label,
+      ),
       onUpdate: (currentJob) => applyBatchProgress(currentJob, type, label),
     });
     applyBatchProgress(job, type, label);
@@ -686,7 +717,9 @@ async function restoreProductTasks() {
         } else if (job.status === "failed") {
           note.value = job.message || "商品刷新失败";
         } else {
-          products.value = job.products || products.value;
+          if (Array.isArray(job.products)) {
+            applyProductCollection(job.products);
+          }
           note.value = job.message || note.value;
         }
         loading.value = false;
@@ -778,7 +811,7 @@ function setCancelAudit(product = null) {
   if (product) {
     selectedIds.value = [productSelectionKey(product)];
   }
-  if (!selectedIds.value.length) {
+  if (!selectedCount.value) {
     note.value = "请先选择商品";
     return;
   }
