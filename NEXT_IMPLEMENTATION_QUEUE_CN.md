@@ -11,7 +11,7 @@
 
 ### 正式发布：澜琅 1.9.03
 
-状态：`IN_PROGRESS`
+状态：`RELEASED`
 
 - 用户已明确授权将已验收内部候选 `1.9.02.2` 提升为三段公开版本
   `1.9.03`，创建 GitHub Latest Release 并更新本机安装。
@@ -20,6 +20,20 @@
 - 按用户授权不重复运行全量 pytest/Vitest；执行 production WebUI 构建、
   PyInstaller 完整构建、ZIP/manifest/SHA256 审计、在线回读和本机安装验证。
 - 不得移动或修改既有 `v1.9.02` 标签。
+- 发布准备提交：`43065d1`；正式清单提交与 Release 目标：
+  `5924030`；标签：`v1.9.03`。
+- Release：`https://github.com/Zpf365/langlang-updates/releases/tag/v1.9.03`。
+- 正式 ZIP SHA256：
+  `29fac67dc38a774eda3879de160447722c5f44d5b860e3d806af297b25960e53`；
+  外置 manifest SHA256：
+  `3231eac5f629958532d33e69ae1af74dba634dded78ea80e11d3914fcd88a9bb`；
+  EXE SHA256：
+  `906c3cb0baf2c926000a0d43ef8aded941092457d981615f0a049f4b195c2b47`。
+- GitHub API、Latest 下载地址和远端 ZIP 已回读一致，`required_files` 全部命中。
+- 本机 `D:\WG\LangLang` 已升级至 `1.9.03`；旧程序与数据备份时间戳为
+  `20261127-232934`，数据库、账号、认证、配置和日志保留。
+- 本机 PID `35976` 启动成功；窗口标题为“澜琅 · 登录 重构1.9.03”，
+  启动更新检查为 current/latest `1.9.03`、`available=false`。
 
 ### 公开发布：澜琅 1.9.01
 
