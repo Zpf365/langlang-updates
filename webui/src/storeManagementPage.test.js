@@ -55,7 +55,8 @@ describe("store management score and deposit presentation", () => {
   });
 
   it("renders grouped exposure, online products and today new observation", () => {
-    expect(source).toContain('<th colspan="3" class="exposure-group-head">商品曝光人数</th>');
+    expect(source).toContain('<h4>商品曝光（人数/次数）</h4>');
+    expect(source).toContain('<th colspan="3" class="exposure-group-head">商品曝光（人数/次数）</th>');
     expect(source).toContain("<th class=\"count-cell\">今日</th>");
     expect(source).toContain("<th class=\"count-cell\">昨日</th>");
     expect(source).toContain("<th class=\"count-cell\">7日</th>");
@@ -127,11 +128,11 @@ describe("store management score and deposit presentation", () => {
     expect(exposurePresentation({
       product_exposure_counts: { today: 21 },
       product_exposure_people: { today: null },
-    }, "today").text).toBe("— / —");
+    }, "today").text).toBe("— / 21");
     expect(exposurePresentation({
       product_exposure_counts: { today: null },
       product_exposure_people: { today: 17 },
-    }, "today").text).toBe("— / —");
+    }, "today").text).toBe("17 / —");
     expect(exposurePresentation({
       product_exposure_counts: { today: 0 },
       product_exposure_people: { today: 0 },
@@ -199,6 +200,23 @@ describe("store management score and deposit presentation", () => {
         today: null,
       },
     }, "today", { today: "2026-11-27" });
+    const missingPeople = exposurePresentation({
+      ...store,
+      product_exposure_people: {
+        ...store.product_exposure_people,
+        today: null,
+      },
+    }, "today", { today: "2026-11-27" });
+    const zeroMissingCount = exposurePresentation({
+      ...store,
+      product_exposure_people: { today: 0 },
+      product_exposure_counts: { today: null },
+    }, "today", { today: "2026-11-27" });
+    const zeroMissingPeople = exposurePresentation({
+      ...store,
+      product_exposure_people: { today: null },
+      product_exposure_counts: { today: 0 },
+    }, "today", { today: "2026-11-27" });
     const legacyOnly = exposurePresentation({
       exposure_people: { today: 999 },
       exposure_counts: { today: 888 },
@@ -215,7 +233,10 @@ describe("store management score and deposit presentation", () => {
 
     expect(today.text).toBe("1,234 / 5,678");
     expect(zero.text).toBe("0 / 0");
-    expect(missingCount.text).toBe("— / —");
+    expect(missingCount.text).toBe("1,234 / —");
+    expect(missingPeople.text).toBe("— / 5,678");
+    expect(zeroMissingCount.text).toBe("0 / —");
+    expect(zeroMissingPeople.text).toBe("— / 0");
     expect(legacyOnly.text).toBe("— / —");
     expect(failed.text).toBe("125,600 / 150,000");
     expect(failed.title).toContain("本次读取失败");
@@ -318,7 +339,7 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("销售 / 退款（金额 / 单量）");
     expect(source).toContain(':aria-expanded="isStoreExpanded(store.id)"');
     expect(source).toContain('class="store-detail-grid"');
-    expect(source).toContain("商品曝光人数");
+    expect(source).toContain("商品曝光（人数/次数）");
     expect(source).toContain("资金与保证金");
     expect(source).toContain("体验分");
     expect(source).toContain("result[`${summaryKey}_orders`]");

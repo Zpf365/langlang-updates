@@ -196,12 +196,9 @@ export function exposurePresentation(store, key, { today = shanghaiDateKey() } =
         ? "暂无真实值"
         : "沿用最后成功值"
   );
-  const pairComplete = people !== null && count !== null;
   return {
     value: people,
-    text: pairComplete
-      ? `${formatCount(people)} / ${formatCount(count)}`
-      : "— / —",
+    text: `${formatCount(people)} / ${formatCount(count)}`,
     stale,
     title:
       `${labels[key]}人数 ${formatCount(people)}` +

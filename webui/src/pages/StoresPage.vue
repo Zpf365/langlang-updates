@@ -1584,7 +1584,7 @@ onBeforeUnmount(() => {
                 <td :colspan="STORE_OVERVIEW_COLUMN_COUNT">
                   <div class="store-detail-grid">
                     <section>
-                      <h4>商品曝光人数</h4>
+                      <h4>商品曝光（人数/次数）</h4>
                       <div v-for="key in ['today', 'yesterday', 'seven_days']" :key="key" class="detail-line">
                         <span>{{ { today: '今日', yesterday: '昨日', seven_days: '7日' }[key] }}</span>
                         <strong :title="exposurePresentation(store, key).title">{{ exposurePresentation(store, key).text }}</strong>
@@ -1684,7 +1684,7 @@ onBeforeUnmount(() => {
               </th>
               <th class="sticky-index sticky-column" rowspan="2">序号</th>
               <th class="sticky-name sticky-column" rowspan="2">店铺名称</th>
-              <th colspan="3" class="exposure-group-head">商品曝光人数</th>
+              <th colspan="3" class="exposure-group-head">商品曝光（人数/次数）</th>
               <th rowspan="2">在线商品数</th>
               <th rowspan="2">今日上新</th>
               <th colspan="4" class="sales-group-head">销售 / 退款（金额 / 单量）</th>
