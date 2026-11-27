@@ -89,7 +89,7 @@ export function exposureDisplay(store, key, presentation = {}) {
     : numeric(store?.product_exposure_people?.[key]);
   const count = presentation.stale
     ? null
-    : numeric(store?.product_exposure_counts?.[key]);
+    : numeric(store?.exposure_click_counts?.[key]);
   const exposed = pairDisplay(
     people,
     count,

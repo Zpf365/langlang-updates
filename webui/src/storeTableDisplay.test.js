@@ -74,7 +74,7 @@ describe("store table display adapter", () => {
     expect(display.salesText).not.toMatch(/销|退|单/);
   });
 
-  it("formats exposure people per reveal count and preserves zero", () => {
+  it("pairs exposure people with product click counts and preserves zero", () => {
     const unknown = exposureDisplay(
       {},
       "today",
@@ -83,7 +83,24 @@ describe("store table display adapter", () => {
     const realZero = exposureDisplay(
       {
         product_exposure_people: { today: 0 },
-        product_exposure_counts: { today: 0 },
+        exposure_click_counts: { today: 0 },
+      },
+      "today",
+      { stale: false },
+    );
+    const mixed = exposureDisplay(
+      {
+        product_exposure_people: { today: 16754 },
+        product_exposure_counts: { today: 21084 },
+        exposure_click_counts: { today: 500 },
+      },
+      "today",
+      { stale: false },
+    );
+    const missingClicks = exposureDisplay(
+      {
+        product_exposure_people: { today: 17 },
+        product_exposure_counts: { today: 21 },
       },
       "today",
       { stale: false },
@@ -91,7 +108,7 @@ describe("store table display adapter", () => {
     const long = exposureDisplay(
       {
         product_exposure_people: { today: 12345678 },
-        product_exposure_counts: { today: 98765432 },
+        exposure_click_counts: { today: 98765432 },
       },
       "today",
       { stale: false },
@@ -101,6 +118,8 @@ describe("store table display adapter", () => {
     expect(unknown.unknown).toBe(true);
     expect(realZero.text).toBe("0/0");
     expect(realZero.unknown).toBe(false);
+    expect(mixed.text).toBe("1.67万+/500");
+    expect(missingClicks.text).toBe("17/—");
     expect(long.text).toBe("1,234.56万+/9,876.54万+");
   });
 
@@ -109,6 +128,7 @@ describe("store table display adapter", () => {
       {
         product_exposure_people: { seven_days: 16754 },
         product_exposure_counts: { seven_days: 21084 },
+        exposure_click_counts: { seven_days: 500 },
       },
       "seven_days",
       { stale: true, title: "数据不是今天" },
@@ -153,7 +173,7 @@ describe("store table display adapter", () => {
     const exposureWithLargeCount = exposureDisplay(
       {
         product_exposure_people: { today: 10000 },
-        product_exposure_counts: { today: 12345 },
+        exposure_click_counts: { today: 12345 },
       },
       "today",
       { stale: false },

@@ -57,9 +57,9 @@ describe("store management score and deposit presentation", () => {
   });
 
   it("renders grouped exposure, online products and today new observation", () => {
-    expect(source).toContain('<h4>商品曝光（人数/次数）</h4>');
+    expect(source).toContain('<h4>商品曝光人数/商品点击次数</h4>');
     expect(source).toContain(
-      '<th colspan="3" class="exposure-group-head">商品曝光（人数/次数）</th>',
+      '<th colspan="3" class="exposure-group-head">商品曝光人数/商品点击次数</th>',
     );
     expect(source).toContain("<th class=\"count-cell\">今日</th>");
     expect(source).toContain("<th class=\"count-cell\">昨日</th>");
@@ -349,7 +349,9 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("红色：退款金额/单量");
     expect(source).toContain(':aria-expanded="isStoreExpanded(store.id)"');
     expect(source).toContain('class="store-detail-grid"');
-    expect(source).toContain("商品曝光（人数/次数）");
+    expect(source).toContain("商品曝光人数/商品点击次数");
+    expect(source).toContain("--store-sales-color: #466d5c;");
+    expect(source).toContain("--store-refund-color: #8a5058;");
     expect(source).toContain("资金与保证金");
     expect(source).toContain("体验分");
     expect(source).toContain("result[`${summaryKey}_orders`]");

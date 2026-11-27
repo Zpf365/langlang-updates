@@ -7,7 +7,6 @@ import StoreExposureValue from "./components/StoreExposureValue.vue";
 import StoreSalesValue from "./components/StoreSalesValue.vue";
 
 const mounted = [];
-
 async function mount(component, props) {
   const host = document.createElement("div");
   document.body.append(host);
