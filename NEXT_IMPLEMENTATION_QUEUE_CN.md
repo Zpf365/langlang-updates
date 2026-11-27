@@ -37,7 +37,7 @@
 
 ### 1.9.02 桥接版本更新骨架
 
-状态：`VERIFY_FINAL_HEALTH_FIX`
+状态：`DONE_PUBLISHED`
 
 - CTO 任务：`TASK-20261127-026`。
 - 内部候选继续使用 `1.9.01.1`；公共桥接版本只能提升为三段 `1.9.02`，
@@ -61,6 +61,12 @@
 - 架构复核放行后的最终健康收口提交：`6f24b66`。主进程只创建一个
   `StartupHealthCoordinator`；AuthWindow、FrontendServer、QWebEngine 与 JS
   只报告阶段，最终 marker 由协调器单点写入。
+- 公开发布提交：`af0231c`；tag：`v1.9.02`。
+- GitHub Release 已发布为 Latest：
+  `https://github.com/Zpf365/langlang-updates/releases/tag/v1.9.02`。
+- 最终 ZIP SHA256：
+  `e5031d4dbb2e465579e27700a2619581726d5f957473a668ba7995f652b8be84`。
+- 详细报告：`RELEASE_REPORT_v1.9.02_CN.md`。
 ### 商品取消与批量删除热修复（TASK-20261127-008 / 012）
 
 状态：`VERIFY`
