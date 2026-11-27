@@ -183,6 +183,20 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
         )._list_stores({})["stores"]
     }
     row = listed[store_a]
+    assert row["product_exposure_people"] == {
+        "today": 16754,
+        "yesterday": 0,
+        "seven_days": 125600,
+    }
+    assert row["product_exposure_counts"] == {
+        "today": 21084,
+        "yesterday": 0,
+        "seven_days": 150000,
+    }
+    assert row["exposure_meta"]["source"] == "官方曝光接口"
+    assert row["exposure_meta"]["as_of_date"] == "2026-11-22"
+    assert row["exposure_meta"]["count_status"]["today"] == "updated"
+    assert row["exposure_meta"]["people_status"]["today"] == "updated"
     assert row["exposure_metrics"] == {
         "today": 16754,
         "yesterday": 0,
@@ -238,6 +252,8 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
     assert row["new_products_today_meta"]["as_of_date"] == "2026-11-22"
     assert listed[unscanned]["new_products_today"] is None
     assert listed[no_new]["new_products_today"] == 0
+    assert listed[store_b]["product_exposure_people"]["today"] is None
+    assert listed[store_b]["product_exposure_counts"]["today"] is None
 
 
 def test_new_products_do_not_reappear_or_disappear_with_catalog_state(

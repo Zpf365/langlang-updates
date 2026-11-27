@@ -108,7 +108,7 @@ describe("store management score and deposit presentation", () => {
       },
     });
 
-    expect(exposure.text).toBe("16,754");
+    expect(exposure.text).toBe("16,754 / 21,084");
     expect(exposure.title).toContain("今日商品曝光人数 16,754");
     expect(exposure.title).toContain("商品曝光次数 21,084");
     expect(exposure.title).toContain("商品点击人数 321");
@@ -123,23 +123,105 @@ describe("store management score and deposit presentation", () => {
   });
 
   it("does not turn missing exposure or online counts into zero", () => {
-    expect(exposurePresentation({}, "today").text).toBe("—");
+    expect(exposurePresentation({}, "today").text).toBe("— / —");
     expect(exposurePresentation({
       product_exposure_counts: { today: 21 },
       product_exposure_people: { today: null },
-    }, "today").text).toBe("—");
+    }, "today").text).toBe("— / —");
     expect(exposurePresentation({
       product_exposure_counts: { today: null },
       product_exposure_people: { today: 17 },
-    }, "today").text).toBe("17");
+    }, "today").text).toBe("— / —");
     expect(exposurePresentation({
       product_exposure_counts: { today: 0 },
       product_exposure_people: { today: 0 },
-    }, "today").text).toBe("0");
+    }, "today").text).toBe("0 / 0");
     expect(onlineProductsPresentation({
       online_products: null,
       online_products_meta: { source: "" },
     }).text).toBe("—");
+  });
+
+  it("renders product exposure people and count as one pair per period", () => {
+    const store = {
+      product_exposure_people: {
+        today: 1234,
+        yesterday: 0,
+        seven_days: 125600,
+      },
+      product_exposure_counts: {
+        today: 5678,
+        yesterday: 0,
+        seven_days: 150000,
+      },
+      exposure_people: {
+        today: 999,
+        yesterday: 999,
+        seven_days: 999,
+      },
+      exposure_counts: {
+        today: 888,
+        yesterday: 888,
+        seven_days: 888,
+      },
+      exposure_meta: {
+        status: {
+          today: "updated",
+          yesterday: "updated",
+          seven_days: "failed",
+        },
+        count_status: {
+          today: "updated",
+          yesterday: "updated",
+          seven_days: "failed",
+        },
+        people_status: {
+          today: "updated",
+          yesterday: "updated",
+          seven_days: "failed",
+        },
+        as_of_date: "2026-11-27",
+        source: "Compass 商品转化",
+        error: "7日读取失败",
+      },
+    };
+
+    const today = exposurePresentation(store, "today", {
+      today: "2026-11-27",
+    });
+    const zero = exposurePresentation(store, "yesterday", {
+      today: "2026-11-27",
+    });
+    const missingCount = exposurePresentation({
+      ...store,
+      product_exposure_counts: {
+        ...store.product_exposure_counts,
+        today: null,
+      },
+    }, "today", { today: "2026-11-27" });
+    const legacyOnly = exposurePresentation({
+      exposure_people: { today: 999 },
+      exposure_counts: { today: 888 },
+      recommend_exposure_people: 777,
+      recommend_exposure_count: 666,
+      exposure_meta: {
+        status: { today: "updated" },
+        as_of_date: "2026-11-27",
+      },
+    }, "today", { today: "2026-11-27" });
+    const failed = exposurePresentation(store, "seven_days", {
+      today: "2026-11-27",
+    });
+
+    expect(today.text).toBe("1,234 / 5,678");
+    expect(zero.text).toBe("0 / 0");
+    expect(missingCount.text).toBe("— / —");
+    expect(legacyOnly.text).toBe("— / —");
+    expect(failed.text).toBe("125,600 / 150,000");
+    expect(failed.title).toContain("本次读取失败");
+    expect(failed.title).toContain("数据日期 2026-11-27");
+    expect(failed.title).toContain("Compass 商品转化");
+    expect(failed.title).toContain("7日读取失败");
   });
 
   it("never publishes recommendation traffic as product exposure", () => {
@@ -162,8 +244,8 @@ describe("store management score and deposit presentation", () => {
       },
     }, "today", { today: "2026-11-27" });
 
-    expect(legacyOnly.text).toBe("—");
-    expect(compass.text).toBe("17");
+    expect(legacyOnly.text).toBe("— / —");
+    expect(compass.text).toBe("17 / 21");
     expect(compass.title).toContain("商品曝光次数 21");
   });
 
@@ -202,7 +284,7 @@ describe("store management score and deposit presentation", () => {
     expect(sales.salesText).toBe("销 — · —单");
     expect(sales.showRefund).toBe(false);
     expect(exposure.stale).toBe(true);
-    expect(exposure.text).toBe("—");
+    expect(exposure.text).toBe("— / —");
     expect(newProducts.text).toBe("—");
     expect(newProducts.title).toContain("今日尚未完成商品目录扫描");
   });
@@ -606,7 +688,7 @@ describe("store management score and deposit presentation", () => {
       },
     }, "today", { today: "2026-11-27" });
 
-    expect(exposure.text).toBe("—");
+    expect(exposure.text).toBe("— / —");
     expect(exposure.title).toContain("数据日期 2026-11-25");
     expect(exposure.title).toContain("Compass 超时");
   });
