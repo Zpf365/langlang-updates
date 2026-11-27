@@ -67,6 +67,9 @@
 - 最终 ZIP SHA256：
   `e5031d4dbb2e465579e27700a2619581726d5f957473a668ba7995f652b8be84`。
 - 详细报告：`RELEASE_REPORT_v1.9.02_CN.md`。
+- 线上 manifest Qt DLL 路径热修：源码提交 `0feee63`；仅替换外置
+  manifest 资产，ZIP 未重建、SHA256 未变化。manifest SHA256：
+  `ef4794fdc671783932b0cdbe577e5fc9c777775c0ef8a5c15a367bdfd7236586`。
 ### 商品取消与批量删除热修复（TASK-20261127-008 / 012）
 
 状态：`VERIFY`

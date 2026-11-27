@@ -72,3 +72,22 @@
 - 如需撤回公开更新，将 `update_manifest.json` 恢复为 `v1.9.01` 对应版本并
   重新验证 Latest；不得在用户有在途写入时强制重启客户端。
 - 本次不使用签名热包或实验通道；签名公钥配置保持关闭。
+
+## 线上 manifest 路径热修
+
+- 用户实际更新报错：manifest 要求
+  `_internal/PySide6/Qt6WebEngineCore.dll` 和 `Qt6WebEngineWidgets.dll`，
+  但实际 ZIP 位于 `_internal/Qt6WebEngineCore.dll` 和
+  `_internal/Qt6WebEngineWidgets.dll`。
+- 源码提交：`0feee63`。
+- 修正 `DEFAULT_REQUIRED_UPDATE_FILES`，后续打包器不会再写错。
+- 实际 ZIP 对照全部 required_files（含 glob）：通过。
+- 新增 `tests/test_release_zip_v1_9_02.py`，直接验证线上候选 ZIP 与修正
+  manifest 的 required_files 完全一致。
+- 只覆盖 GitHub Release 的 `update_manifest.json` 资产；ZIP 未重建。
+- 新 manifest SHA256：
+  `ef4794fdc671783932b0cdbe577e5fc9c777775c0ef8a5c15a367bdfd7236586`
+- ZIP SHA256 保持：
+  `e5031d4dbb2e465579e27700a2619581726d5f957473a668ba7995f652b8be84`
+- 在线回读两项无 `PySide6` 前缀的 Qt DLL 路径均为 true；GitHub Latest 仍为
+  `v1.9.02`。
