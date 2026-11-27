@@ -32,3 +32,27 @@
 
 - 本候选仅允许内部验证。
 - 必须收到 CTO/用户明确公开发布授权后，才可生成三段公开版本并发布。
+
+## 验证证据
+
+- 店铺合并定向 pytest：`70 passed`。
+- 上货合并定向 pytest：`45 passed`。
+- 上传并发与品牌回归：`2 passed`。
+- WebUI 定向 Vitest：`7 files / 53 tests passed`。
+- production build：`111 modules transformed`，退出码 `0`。
+- PyInstaller：Python `3.12.13`，退出码 `0`。
+- ZIP 解包隔离启动：登录页 ready，进程持续存活 12 秒，
+  `errors.log` 为空，日志版本为 `1.9.00.1`。
+
+## 候选产物
+
+- 程序目录：
+  `D:\11.18新项目微信\微信群控\1.8.47\发布文件\1.9.00.1\dist\LangLang`。
+- ZIP：
+  `D:\11.18新项目微信\微信群控\1.8.47\发布文件\1.9.00.1\package\LangLang-1.9.00.1-win64.zip`。
+- ZIP 大小：`591279534` 字节。
+- ZIP SHA256：
+  `0664f300b78545f1fa528bd09776ef8426c661e57a7a0793bd82a189a3f50844`。
+- EXE SHA256：
+  `5076826cbf5d5403dec8fd46fcd18a6eb79cc38e7d7f38d348591e8d00fcddfe`。
+- 候选 manifest：版本 `1.9.00.1`，下载地址为空，未写入在线更新清单。
