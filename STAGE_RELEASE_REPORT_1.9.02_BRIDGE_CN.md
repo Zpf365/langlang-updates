@@ -8,6 +8,7 @@
 - 店铺候选提交：`9b4ec45`
 - 桥接骨架提交：`24a9206`
 - 独立复审返工 1 提交：`6267132`
+- 最终健康协调器提交：`6f24b66`
 - 当前源码/内部包版本：`1.9.01.1`
 - 用户可见产品版本：`1.9.01`
 - 后续公共桥接版本：`1.9.02`，仍需最终集成 QA 和版本提升
@@ -81,6 +82,28 @@
 - 相关 Python 文件 `py_compile`：通过。
 - Ruff（返工文件）：通过。
 - 本轮未跑全量、未运行 production build、未打包、未发布、未部署。
+
+## 架构复核放行后的最终健康修复
+
+- 删除 `main.py` 中 AuthWindow 构造完成、事件循环开始前的健康写入。
+- `main.py` 每次进程只创建一个 `StartupHealthCoordinator`。
+- AuthWindow 通过 `after(0)` 证明事件循环实际进入，再要求
+  `winfo_viewable()` 连续稳定探测后才上报登录页健康。
+- WebUI 路径必须同时具备 AuthWindow 阶段、FrontendServer 启动、
+  `loadFinished(True)` 和 JS `langlangReady=1`，协调器才写最终 marker。
+- AuthWindow、FrontendServer、QWebEngine 和 JS 均不再直接调用 health writer。
+- 协调器在单锁和单次 guard 下写入；marker 包含 attempt id、version 和
+  startup nonce。旧或错误 attempt 不会产生 marker。
+- 安装器在新版启动前清除旧 marker；只有 version + attempt id 匹配才删除
+  回滚备份，超时或进程退出时先终止/等待异常新版进程再恢复。
+
+最终健康修复验证：
+
+- updater/startup/health/runtime/startup-health 定向 pytest：
+  `43 passed, 1 deselected`。
+- 相关 Python 文件 `py_compile`：通过。
+- 本轮新增/修改文件 Ruff：通过。
+- 未跑全量、未运行 production build、未打包、未发布、未部署。
 
 ## 剩余风险
 

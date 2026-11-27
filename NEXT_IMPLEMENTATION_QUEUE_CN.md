@@ -37,7 +37,7 @@
 
 ### 1.9.02 桥接版本更新骨架
 
-状态：`VERIFY_REWORK_1`
+状态：`VERIFY_FINAL_HEALTH_FIX`
 
 - CTO 任务：`TASK-20261127-026`。
 - 内部候选继续使用 `1.9.01.1`；公共桥接版本只能提升为三段 `1.9.02`，
@@ -58,6 +58,9 @@
 - 独立复审第 1 次返工提交：`6267132`。已修复临时目录清理、
   频道回放早校验、busy 延迟激活、撤销待 reload、健康 nonce/回滚前停进程；
   仅跑更新协议/存储/runtime/health/updater 定向 pytest 和 py_compile。
+- 架构复核放行后的最终健康收口提交：`6f24b66`。主进程只创建一个
+  `StartupHealthCoordinator`；AuthWindow、FrontendServer、QWebEngine 与 JS
+  只报告阶段，最终 marker 由协调器单点写入。
 
 - 统筹总工负责任务拆分、文件锁、跨模块共享逻辑、回归、版本、候选包和发布签收。
 - 模块会话只在被明确派单后读取相关代码；不得提交 Git、打包、发布或覆盖本机。
