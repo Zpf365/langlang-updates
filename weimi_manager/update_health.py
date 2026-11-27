@@ -132,6 +132,7 @@ def write_update_health(
     project_dir: Path,
     version: str,
     attempt_id: str,
+    startup_nonce: str = "",
     *,
     local_app_data: Path | None = None,
 ) -> Path:
@@ -142,6 +143,7 @@ def write_update_health(
         {
             "version": str(version),
             "attempt_id": str(attempt_id),
+            "startup_nonce": str(startup_nonce),
             "install_path": str(target),
             "healthy_at": datetime.now(UTC).isoformat(),
         },
@@ -152,7 +154,9 @@ def write_update_health(
 def mark_pending_update_healthy(
     project_dir: Path,
     version: str,
+    startup_nonce: str = "",
     *,
+    attempt_id: str = "",
     local_app_data: Path | None = None,
 ) -> Path | None:
     target = Path(project_dir).resolve()
@@ -161,16 +165,20 @@ def mark_pending_update_healthy(
         local_app_data=local_app_data,
     )
     attempt_install_path = str(attempt.get("install_path") or "").strip()
+    stored_attempt_id = str(attempt.get("attempt_id") or "")
+    expected_attempt_id = str(attempt_id or stored_attempt_id)
     if (
-        str(attempt.get("attempt_id") or "")
+        stored_attempt_id
         and str(attempt.get("version") or "") == str(version)
         and attempt_install_path
         and Path(attempt_install_path).resolve() == target
+        and expected_attempt_id == stored_attempt_id
     ):
         return write_update_health(
             target,
             version,
-            str(attempt["attempt_id"]),
+            stored_attempt_id,
+            startup_nonce,
             local_app_data=local_app_data,
         )
     return None

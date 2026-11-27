@@ -8,7 +8,8 @@ from pathlib import Path
 from .. import __version__
 from ..hot_update_store import HotUpdateStore
 from ..runtime_logging import log_event
-from ..update_health import mark_pending_update_healthy, update_root_for_install
+from ..startup_health import StartupHealthCoordinator
+from ..update_health import update_root_for_install
 from ..update_protocol import load_trust_config
 from ..update_rules import rule_validators
 from ..update_runtime import (
@@ -36,6 +37,7 @@ def run_desktop(
     *,
     resource_dir: Path,
     title: str = "澜琅 · 微信小店版",
+    startup_health: StartupHealthCoordinator | None = None,
 ) -> str:
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-features=UseSkiaRenderer")
 
@@ -71,6 +73,8 @@ def run_desktop(
 
     server = FrontendServer(active_frontend_root, controller)
     server.start()
+    if startup_health is not None:
+        startup_health.report_server_started()
     controller.start_automation_scheduler()
     controller.start_activity_renewal_scheduler()
     controller.start_analytics_reporter()
@@ -180,16 +184,8 @@ def run_desktop(
                         ready_probe["settled"] = True
                         if hot_runtime is not None:
                             hot_runtime.mark_webui_ready(True)
-                        try:
-                            mark_pending_update_healthy(
-                                controller.project_dir,
-                                __version__,
-                            )
-                        except OSError as exc:
-                            log_event(
-                                "update.health.write_failed",
-                                error=str(exc),
-                            )
+                        if startup_health is not None:
+                            startup_health.report_webui_ready()
                     return
                 QTimer.singleShot(120, probe)
 
@@ -222,6 +218,8 @@ def run_desktop(
     app.aboutToQuit.connect(close_server)
     def handle_page_loaded(ok: bool) -> None:
         reveal_loaded_page(ok)
+        if ok and startup_health is not None:
+            startup_health.report_webui_loaded()
         start_ready_probe(ok)
 
     page.loadFinished.connect(handle_page_loaded)

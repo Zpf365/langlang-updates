@@ -44,6 +44,7 @@ def test_update_health_marker_records_attempt_nonce_atomically(
         project,
         "1.9.02",
         local_app_data=tmp_path / "local",
+        startup_nonce="startup-nonce",
     )
     payload = read_update_health(
         project,
@@ -53,6 +54,7 @@ def test_update_health_marker_records_attempt_nonce_atomically(
     assert path.is_file()
     assert payload["version"] == "1.9.02"
     assert payload["attempt_id"] == attempt.attempt_id
+    assert payload["startup_nonce"] == "startup-nonce"
     assert payload["install_path"] == str(project.resolve())
     assert not list(path.parent.glob("*.tmp"))
 

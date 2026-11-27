@@ -21,7 +21,7 @@ from ..runtime_logging import (
     log_event,
 )
 from ..single_instance import SingleInstanceGuard
-from ..update_health import mark_pending_update_healthy
+from ..startup_health import StartupHealthCoordinator
 from .controller import NextUiController
 from .desktop import run_desktop
 
@@ -204,6 +204,10 @@ def _legacy_workbench_action(
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     base_paths = AppPaths.discover()
+    startup_health = StartupHealthCoordinator(
+        base_paths.project_dir,
+        __version__,
+    )
     manager = get_runtime_log_manager() or configure_runtime_logging(
         base_paths.project_dir
     )
@@ -286,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
                 controller,
                 resource_dir=paths.resource_dir,
                 title=f"澜琅 · 微信小店版 {auth_context.username or ''}".strip(),
+                startup_health=startup_health,
             )
             log_event(
                 "webui.desktop_finished",
@@ -318,18 +323,33 @@ def main(argv: list[str] | None = None) -> int:
 
         while True:
             auth_window = AuthWindow(base_paths, service)
-            if getattr(sys, "frozen", False):
+            stable_probe = {"count": 0}
+
+            def probe_auth_window() -> None:
                 try:
-                    mark_pending_update_healthy(
-                        base_paths.project_dir,
-                        __version__,
-                    )
-                except OSError as exc:
-                    log_event("update.health.write_failed", error=str(exc))
+                    exists = bool(auth_window.winfo_exists())
+                    viewable = exists and bool(auth_window.winfo_viewable())
+                except Exception:
+                    return
+                if not exists:
+                    return
+                if viewable:
+                    stable_probe["count"] = int(stable_probe["count"]) + 1
+                    if int(stable_probe["count"]) >= 2:
+                        startup_health.report_auth_stable()
+                        return
+                else:
+                    stable_probe["count"] = 0
+                auth_window.after(125, probe_auth_window)
+
+            if startup_health.active:
+                auth_window.after(0, startup_health.report_auth_loop_entered)
+                auth_window.after(125, probe_auth_window)
             auth_window.mainloop()
             auth_context = auth_window.result
             if auth_context is None:
                 return 0
+            startup_health.expect_webui()
             result = run_account_webui(auth_context)
             if result == "closed":
                 return 0
