@@ -4,11 +4,11 @@ import { describe, expect, it } from "vitest";
 const ordersPage = readFileSync(
   new URL("./pages/OrdersParityPage.vue", import.meta.url),
   "utf8",
-);
+).replaceAll("\r\n", "\n");
 const orderRow = readFileSync(
   new URL("./components/OrderTableRow.vue", import.meta.url),
   "utf8",
-);
+).replaceAll("\r\n", "\n");
 const clipboard = readFileSync(
   new URL("./clipboard.js", import.meta.url),
   "utf8",

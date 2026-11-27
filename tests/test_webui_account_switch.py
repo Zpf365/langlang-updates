@@ -326,8 +326,18 @@ def test_webui_outer_loop_reopens_login_and_uses_account_paths(
     assert controller.call_args_list[0].kwargs["auth_service"] is service
     assert controller.call_args_list[1].kwargs["auth_context"] is second_context
     assert run_desktop.call_args_list == [
-        mock.call(first_controller, resource_dir=tmp_path, title="澜琅 · 微信小店版 一号"),
-        mock.call(second_controller, resource_dir=tmp_path, title="澜琅 · 微信小店版 二号"),
+        mock.call(
+            first_controller,
+            resource_dir=tmp_path,
+            title="澜琅 · 微信小店版 一号",
+            startup_health=mock.ANY,
+        ),
+        mock.call(
+            second_controller,
+            resource_dir=tmp_path,
+            title="澜琅 · 微信小店版 二号",
+            startup_health=mock.ANY,
+        ),
     ]
     guard.close.assert_called_once_with()
 

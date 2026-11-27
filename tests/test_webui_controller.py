@@ -2857,10 +2857,18 @@ def test_webui_upload_run_rpc_executes_selected_persisted_task(
             return {"product_id": "WX-RUN-1"}
 
     class FakeRunner:
-        def __init__(self, workspace, tasks, *, progress=None):
+        def __init__(
+            self,
+            workspace,
+            tasks,
+            *,
+            progress=None,
+            external_stop_requested=None,
+        ):
             self.workspace = workspace
             self.tasks = tasks
             self.progress = progress
+            self.external_stop_requested = external_stop_requested
             self.paused = threading.Event()
             self.cancelled = threading.Event()
 

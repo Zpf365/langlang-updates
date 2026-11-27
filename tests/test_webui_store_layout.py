@@ -8,17 +8,21 @@ def test_store_table_uses_reference_row_density_and_internal_scroll() -> None:
         Path(__file__).parents[1] / "webui" / "src" / "pages" / "StoresPage.vue"
     ).read_text(encoding="utf-8")
 
-    assert ".store-page {\n  height: 100%;\n  min-height: 0;" in source
+    assert ".store-page {" in source
+    store_page_block = source.split(".store-page {", 1)[1].split("}", 1)[0]
+    assert "height: 100%;" in store_page_block
+    assert "min-height: 0;" in store_page_block
     assert "overflow: hidden;\n  background: #fff;" in source
     assert ".store-table-card > .table-scroll {\n  flex: 1 1 auto;\n  min-height: 0;\n  overflow: auto;" in source
-    assert ".store-table td {\n  height: 46px;" in source
+    table_cell_block = source.split(".store-table td {", 1)[1].split("}", 1)[0]
+    assert "height: 58px;" in table_cell_block
     assert '<td class="app-id-cell">' in source
     assert "maskAppId(store.app_id)" in source
     assert ':title="store.app_id"' not in source
     assert "trimHint(store.app_id)" not in source
     assert ".secret-reveal {\n  width: 100%;\n  min-width: 0;\n  display: flex;" in source
-    assert ".secret-placeholder {\n  display: block;\n  min-width: 0;\n  overflow: hidden;" in source
-    assert "text-overflow: ellipsis" in source
+    assert ".secret-placeholder {\n  display: block;\n  min-width: 0;\n  overflow: visible;" in source
+    assert "text-overflow: clip" in source
     assert 'from "../storeScores";' in source
     assert "scorePresentation(store, key)" in source
     score_source = (
@@ -47,8 +51,8 @@ def test_store_table_uses_reference_row_density_and_internal_scroll() -> None:
     assert "refreshProgress.total" in source
     assert 'v-if="storeViewMode === STORE_VIEW_OVERVIEW"' in source
     assert 'class="table-scroll overview-table-scroll"' in source
-    assert ".overview-table-scroll {\n   width: 100%;\n   min-width: 0;\n   overflow-x: hidden;" in source
-    assert "销售 / 退款（金额 / 单量）" in source
+    assert ".overview-table-scroll {\n   width: 100%;\n   min-width: 0;\n   overflow-x: auto;" in source
+    assert "销售/退款（金额/单量）" in source
     assert ":aria-expanded=\"isStoreExpanded(store.id)\"" in source
     assert '<th rowspan="2">AppSecret</th>' in source
     secret_header = source.index('<th rowspan="2">AppSecret</th>')

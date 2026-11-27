@@ -91,7 +91,7 @@ def test_desktop_shows_webview_before_load_and_reveals_after_finish() -> None:
     ).read_text(encoding="utf-8")
 
     assert source.index("window.show()") < source.index("view.load(QUrl(server.entry_url))")
-    assert "page.loadFinished.connect(reveal_loaded_page)" in source
+    assert "page.loadFinished.connect(handle_page_loaded)" in source
     assert "window.raise_()" in source
     assert "window.activateWindow()" in source
     assert "QTimer.singleShot(120, view.update)" in source

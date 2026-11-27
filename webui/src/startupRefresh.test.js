@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 const source = readFileSync(
   new URL("./App.vue", import.meta.url),
   "utf8",
-);
+).replaceAll("\r\n", "\n");
 
 describe("startup background refresh", () => {
   it("starts one backend scheduler with all four persisted switches", () => {
