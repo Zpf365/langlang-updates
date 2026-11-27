@@ -5,6 +5,12 @@ import {
   buildUploadTemplatePayload,
   validateLadderRules,
 } from "../uploadTemplate";
+import {
+  categoryApplicationLabel,
+  categoryApplicationReason,
+  categorySelectionMatchesStore,
+  categorySelectable,
+} from "../uploadCategoryState";
 import Icon from "./Icon.vue";
 import ModalDialog from "./ModalDialog.vue";
 
@@ -63,6 +69,7 @@ const categoryOptions = computed(() => (
   props.storeOptions?.[String(categoryContextStoreId.value)]
     ?.category_options || {}
 ));
+const categoryLoading = computed(() => Boolean(categoryOptions.value.loading));
 const categoryRoot = computed(() => (
   categoryRoots.value.find(
     (node) => String(node.category_id) === String(categoryRootId.value),
@@ -192,12 +199,19 @@ function flattenCategoryLeaves(node) {
 }
 
 function loadCategoryOptions(refresh = false) {
+  if (categoryLoading.value) return;
   const storeId = Number(categoryContextStoreId.value || 0);
   if (!storeId) return;
   emit("load-categories", storeId, Boolean(refresh));
 }
 
 function changeCategoryContext() {
+  if (!categorySelectionMatchesStore(
+    form.specified_category_store_id,
+    categoryContextStoreId.value,
+  )) {
+    clearSpecifiedCategory();
+  }
   categoryRootId.value = "";
   categoryParentId.value = "";
   loadCategoryOptions(false);
@@ -231,7 +245,7 @@ function selectCategoryParent(node) {
 }
 
 function chooseCategory(node) {
-  if (node.available === false) return;
+  if (!categorySelectable(node)) return;
   form.category_mode = "specified";
   form.specified_category_store_id = String(categoryContextStoreId.value);
   form.specified_category_ids = (
@@ -556,9 +570,10 @@ function submit() {
                 <button
                   type="button"
                   class="inline-link"
-                  :disabled="!categoryContextStoreId"
+                  :disabled="!categoryContextStoreId || categoryLoading"
+                  :aria-busy="categoryLoading"
                   @click="loadCategoryOptions(true)"
-                >重新读取</button>
+                >{{ categoryLoading ? "读取中…" : "重新读取" }}</button>
               </div>
 
               <p
@@ -579,6 +594,12 @@ function submit() {
               >
                 当前显示过期类目缓存；可手动重新读取。
               </p>
+              <p
+                v-if="categoryOptions.warning"
+                class="category-cache-note danger-text"
+              >
+                {{ categoryOptions.warning }}
+              </p>
 
               <div v-if="!categoryContextStoreId" class="category-empty">
                 请先选择用于读取官方类目的店铺。
@@ -593,7 +614,7 @@ function submit() {
                 v-else-if="!categoryRoots.length"
                 class="category-empty"
               >
-                正在读取本店官方生效类目…
+                正在读取官方类目和申请状态…
               </div>
               <div v-else class="category-columns">
                 <div class="category-column">
@@ -626,13 +647,19 @@ function submit() {
                     v-for="leaf in categoryLeaves"
                     :key="leaf.category_id"
                     type="button"
-                    :disabled="leaf.available === false"
+                    :disabled="!categorySelectable(leaf)"
+                    :title="categoryApplicationReason(leaf) || categoryApplicationLabel(leaf)"
                     :class="{ active: String(leaf.category_id) === String(form.specified_category_id) }"
                     @click="chooseCategory(leaf)"
                   >
                     <span>
                       {{ leaf.name }}
-                      <small v-if="leaf.available === false">未生效</small>
+                      <small
+                        :class="{
+                          blocked: !categorySelectable(leaf),
+                          pending: leaf.application_state === 'pending',
+                        }"
+                      >{{ categoryApplicationLabel(leaf) }}</small>
                     </span>
                     <i v-if="String(leaf.category_id) === String(form.specified_category_id)">✓</i>
                   </button>
@@ -964,9 +991,15 @@ function submit() {
  }
  .category-column button small {
    margin-left: 5px;
-   color: #aa6970;
+  color: #4d7a62;
    font-size: 8px;
  }
+  .category-column button small.pending {
+    color: #9a7728;
+  }
+  .category-column button small.blocked {
+    color: #aa6970;
+  }
  .category-column button i {
    color: #2f80c8;
    font-size: 11px;

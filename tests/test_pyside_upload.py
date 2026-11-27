@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from weimi_manager.db import Database
 from weimi_manager.pyside.pages.upload import UploadRunner
 from weimi_manager.wechat_api import WechatApiError
@@ -175,6 +177,1139 @@ def test_old_template_false_still_auto_applies_category(
     assert "正在检查并申请目标类目" in progress_messages
     assert "正在提交类目开通申请" in progress_messages
     assert "类目已生效，正在自动重新上货" in progress_messages
+
+
+@pytest.mark.parametrize(
+    ("error_text", "application_label", "application_reason"),
+    [
+        (
+            "目标类目已冻结，商品不可创建",
+            "已冻结",
+            "平台已冻结该叶子类目",
+        ),
+        (
+            "目标类目已失效或不存在，商品不可创建",
+            "已失效",
+            "刷新后的官方类目树未找到该叶子",
+        ),
+        (
+            "目标类目已禁用，商品不可创建",
+            "已禁用",
+            "平台已禁用该叶子类目",
+        ),
+    ],
+)
+def test_upload_runner_refreshes_unavailable_store_category_once_and_blocks_later_writes(
+    tmp_path: Path,
+    monkeypatch,
+    error_text: str,
+    application_label: str,
+    application_reason: str,
+) -> None:
+    db = Database(
+        tmp_path / "upload-category-refresh-freeze.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Frozen category",
+        "wx-category-refresh-freeze",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    refresh_calls = []
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            raise WechatApiError(
+                error_text,
+                code=6609999,
+            )
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            refresh_calls.append((selected_store.id, refresh))
+            return {
+                "roots": [
+                    {
+                        "category_id": "1000",
+                        "children": [
+                            {
+                                "category_id": "3001",
+                                "application_state": "unavailable",
+                                "application_label": application_label,
+                                "application_reason": application_reason,
+                                "application_eligible": False,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class CategoryClient:
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": "effective",
+                    "label": "已生效",
+                    "reason": "",
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, _category_ids):
+            raise AssertionError(
+                "a frozen category must not be submitted for application"
+            )
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+
+    def make_item(suffix):
+        return {
+            "item_id": f"item-{suffix}",
+            "source_product_id": f"SOURCE-{suffix}",
+            "title": f"Frozen category {suffix}",
+            "price": 100,
+            "stock": 2,
+            "status": "pending",
+            "payload": {
+                "title": f"Frozen category {suffix}",
+                "head_imgs": [
+                    "https://example.invalid/1.jpg",
+                    "https://example.invalid/2.jpg",
+                    "https://example.invalid/3.jpg",
+                ],
+                "skus": [{"sale_price": 100, "stock_num": 2}],
+                "cats_v2": [
+                    {"cat_id": "1000"},
+                    {"cat_id": "3001"},
+                ],
+            },
+        }
+
+    task = {
+        "id": "task-category-refresh-freeze",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "frozen category",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            make_item("first"),
+            make_item("second"),
+        ],
+    }
+
+    errors = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    ).run([task])
+
+    assert product_calls == ["product"]
+    assert refresh_calls == [(store_id, True)]
+    assert task["items"][0]["status"] == "failed"
+    assert task["items"][1]["status"] == "failed"
+    assert application_reason in task["items"][0]["message"]
+    assert application_reason in task["items"][1]["message"]
+    assert len(errors) == 2
+
+
+def test_upload_runner_memoizes_failed_store_category_refresh(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = Database(
+        tmp_path / "upload-category-refresh-failure.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Category refresh failure",
+        "wx-category-refresh-failure",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    refresh_calls = []
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            raise WechatApiError("无该类目权限", code=6600145)
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            refresh_calls.append((selected_store.id, refresh))
+            raise RuntimeError("类目网络读取失败")
+
+    class CategoryClient:
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": "effective",
+                    "label": "已生效",
+                    "reason": "",
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+
+    def make_item(suffix):
+        return {
+            "item_id": f"item-{suffix}",
+            "source_product_id": f"SOURCE-{suffix}",
+            "title": f"Refresh failure {suffix}",
+            "price": 100,
+            "stock": 2,
+            "status": "pending",
+            "payload": {
+                "title": f"Refresh failure {suffix}",
+                "head_imgs": [
+                    "https://example.invalid/1.jpg",
+                    "https://example.invalid/2.jpg",
+                    "https://example.invalid/3.jpg",
+                ],
+                "skus": [{"sale_price": 100, "stock_num": 2}],
+                "cats_v2": [
+                    {"cat_id": "1000"},
+                    {"cat_id": "3001"},
+                ],
+            },
+        }
+
+    task = {
+        "id": "task-category-refresh-failure",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "category refresh failure",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            make_item("first"),
+            make_item("second"),
+        ],
+    }
+
+    UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    ).run([task])
+
+    assert product_calls == ["product"]
+    assert refresh_calls == [(store_id, True)]
+    assert task["items"][0]["status"] == "waiting_category"
+    assert task["items"][1]["status"] == "waiting_category"
+    assert "刷新类目失败" in task["items"][0]["message"]
+    assert "刷新类目失败" in task["items"][1]["message"]
+
+
+def test_upload_runner_applies_eligible_refreshed_category_and_retries_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = Database(
+        tmp_path / "upload-category-refresh-apply.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Category apply",
+        "wx-category-refresh-apply",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    refresh_calls = []
+    apply_calls = []
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            if len(product_calls) == 1:
+                raise WechatApiError("无该类目权限", code=6600145)
+            return {"product_id": "WX-CATEGORY-REFRESHED"}
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            refresh_calls.append((selected_store.id, refresh))
+            return {
+                "roots": [
+                    {
+                        "category_id": "1000",
+                        "children": [
+                            {
+                                "category_id": "3001",
+                                "application_state": "not_applied",
+                                "application_label": "未申请",
+                                "application_reason": "",
+                                "application_eligible": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class CategoryClient:
+        applied = False
+
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": (
+                        "effective" if self.applied else "not_applied"
+                    ),
+                    "label": "已生效" if self.applied else "未申请",
+                    "reason": "",
+                    "eligible": not self.applied,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, category_ids):
+            apply_calls.append(tuple(category_ids))
+            self.applied = True
+            return {"success": True}
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+    task = {
+        "id": "task-category-refresh-apply",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "category apply",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": "item-category-refresh-apply",
+                "source_product_id": "SOURCE-CATEGORY-REFRESH-APPLY",
+                "title": "Category apply product",
+                "price": 100,
+                "stock": 2,
+                "status": "pending",
+                "payload": {
+                    "title": "Category apply product",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "3001"},
+                    ],
+                },
+            }
+        ],
+    }
+
+    errors = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    ).run([task])
+
+    assert errors == []
+    assert product_calls == ["product", "product"]
+    assert refresh_calls == [(store_id, True)]
+    assert apply_calls == [("3001",)]
+    assert task["items"][0]["status"] == "success"
+    assert task["items"][0]["product_id"] == "WX-CATEGORY-REFRESHED"
+
+
+@pytest.mark.parametrize(
+    ("control_event", "expected_status"),
+    [
+        ("cancelled", "cancelled"),
+        ("paused", "paused"),
+    ],
+)
+@pytest.mark.parametrize(
+    "control_at",
+    [
+        "refresh",
+        "category_apply",
+    ],
+)
+def test_upload_runner_stops_category_actions_after_cancel_or_pause(
+    tmp_path: Path,
+    monkeypatch,
+    control_event: str,
+    expected_status: str,
+    control_at: str,
+) -> None:
+    db = Database(
+        tmp_path / f"upload-category-{control_event}-{control_at}.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Category stopped",
+        f"wx-category-{control_event}-{control_at}",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    refresh_calls = []
+    apply_calls = []
+    runner_holder = {}
+
+    def stop_runner() -> None:
+        getattr(runner_holder["runner"], control_event).set()
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            if len(product_calls) == 1:
+                raise WechatApiError("无该类目权限", code=6600145)
+            return {"product_id": "SHOULD-NOT-RETRY"}
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            refresh_calls.append((selected_store.id, refresh))
+            if control_at == "refresh":
+                stop_runner()
+            return {
+                "roots": [
+                    {
+                        "category_id": "1000",
+                        "children": [
+                            {
+                                "category_id": "3001",
+                                "application_state": "not_applied",
+                                "application_label": "未申请",
+                                "application_reason": "",
+                                "application_eligible": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class CategoryClient:
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": "effective",
+                    "label": "已生效",
+                    "reason": "",
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, category_ids):
+            apply_calls.append(tuple(category_ids))
+            if control_at == "category_apply":
+                stop_runner()
+            return {"success": True}
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+    task = {
+        "id": f"task-category-{control_event}-{control_at}",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "category stopped",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": f"item-category-{control_event}-{control_at}",
+                "source_product_id": "SOURCE-CATEGORY-STOPPED",
+                "title": "Category stopped product",
+                "price": 100,
+                "stock": 2,
+                "status": "pending",
+                "payload": {
+                    "title": "Category stopped product",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "3001"},
+                    ],
+                },
+            }
+        ],
+    }
+
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    )
+    runner_holder["runner"] = runner
+    runner.run([task])
+
+    assert product_calls == ["product"]
+    assert refresh_calls == [(store_id, True)]
+    if control_at == "refresh":
+        assert apply_calls == []
+    else:
+        assert apply_calls == [("3001",)]
+    assert task["items"][0]["status"] == expected_status
+
+
+@pytest.mark.parametrize(
+    "control_event",
+    [
+        "cancelled",
+        "paused",
+    ],
+)
+def test_upload_runner_preserves_unknown_write_after_cancel_or_pause(
+    tmp_path: Path,
+    control_event: str,
+) -> None:
+    db = Database(
+        tmp_path / f"upload-unknown-{control_event}.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Unknown write",
+        f"wx-unknown-{control_event}",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    runner_holder = {}
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            getattr(runner_holder["runner"], control_event).set()
+            raise TimeoutError("timed out")
+
+    task = {
+        "id": f"task-unknown-{control_event}",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "unknown write",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": f"item-unknown-{control_event}",
+                "source_product_id": "SOURCE-UNKNOWN-WRITE",
+                "title": "Unknown write product",
+                "price": 100,
+                "stock": 2,
+                "status": "pending",
+                "payload": {
+                    "title": "Unknown write product",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "3001"},
+                    ],
+                },
+            }
+        ],
+    }
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    )
+    runner_holder["runner"] = runner
+
+    runner.run([task])
+
+    assert product_calls == ["product"]
+    assert task["items"][0]["status"] == "verification_pending"
+    assert "结果未知" in task["items"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    "control_event",
+    [
+        "cancelled",
+        "paused",
+    ],
+)
+def test_upload_runner_preserves_unknown_category_apply_after_stop(
+    tmp_path: Path,
+    monkeypatch,
+    control_event: str,
+) -> None:
+    db = Database(
+        tmp_path / f"upload-unknown-apply-{control_event}.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Unknown category apply",
+        f"wx-unknown-apply-{control_event}",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    apply_calls = []
+    runner_holder = {}
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            if len(product_calls) == 1:
+                raise WechatApiError("无该类目权限", code=6600145)
+            return {"product_id": "SHOULD-NOT-RETRY"}
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            return {
+                "roots": [
+                    {
+                        "category_id": "1000",
+                        "children": [
+                            {
+                                "category_id": "3001",
+                                "application_state": "not_applied",
+                                "application_label": "未申请",
+                                "application_reason": "",
+                                "application_eligible": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class CategoryClient:
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": "pending",
+                    "label": "审核中",
+                    "reason": "",
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, category_ids):
+            apply_calls.append(tuple(category_ids))
+            getattr(runner_holder["runner"], control_event).set()
+            raise TimeoutError("category apply timed out")
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+    task = {
+        "id": f"task-unknown-apply-{control_event}",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "unknown category apply",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": f"item-unknown-apply-{control_event}",
+                "source_product_id": "SOURCE-UNKNOWN-CATEGORY-APPLY",
+                "title": "Unknown category apply",
+                "price": 100,
+                "stock": 2,
+                "status": "pending",
+                "payload": {
+                    "title": "Unknown category apply",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "3001"},
+                    ],
+                },
+            }
+        ],
+    }
+    runner = UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    )
+    runner_holder["runner"] = runner
+
+    runner.run([task])
+
+    item = task["items"][0]
+    assert product_calls == ["product"]
+    assert apply_calls == [("3001",)]
+    assert item["status"] == "waiting_category"
+    assert item["category_state"] == "unknown"
+    assert item["category_apply_submitted"] is True
+    assert item["category_apply_inflight"] is True
+    assert task["status"] == "needs_category"
+
+    persisted = json.loads(db.get_setting("upload_tasks", "[]"))
+    resumed_task = persisted[0]
+    UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        persisted,
+    ).run([resumed_task])
+
+    assert product_calls == ["product"]
+    assert apply_calls == [("3001",)]
+    assert resumed_task["items"][0]["status"] == "waiting_category"
+    assert resumed_task["items"][0]["category_state"] in {
+        "unknown",
+        "pending",
+    }
+
+
+def test_upload_runner_stops_before_category_apply_after_external_generation_change(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = Database(
+        tmp_path / "upload-external-generation.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "External generation",
+        "wx-external-generation",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    apply_calls = []
+    generation_alive = {"value": True}
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            if len(product_calls) == 1:
+                raise WechatApiError("无该类目权限", code=6600145)
+            return {"product_id": "SHOULD-NOT-RETRY"}
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            _store,
+            *,
+            refresh=False,
+        ):
+            generation_alive["value"] = False
+            return {
+                "roots": [
+                    {
+                        "category_id": "1000",
+                        "children": [
+                            {
+                                "category_id": "3001",
+                                "application_state": "not_applied",
+                                "application_label": "未申请",
+                                "application_reason": "",
+                                "application_eligible": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class CategoryClient:
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": "not_applied",
+                    "label": "未申请",
+                    "reason": "",
+                    "eligible": True,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, category_ids):
+            apply_calls.append(tuple(category_ids))
+            return {"success": True}
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+    task = {
+        "id": "task-external-generation",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "external generation",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            {
+                "item_id": "item-external-generation",
+                "source_product_id": "SOURCE-EXTERNAL-GENERATION",
+                "title": "External generation",
+                "price": 100,
+                "stock": 2,
+                "status": "pending",
+                "payload": {
+                    "title": "External generation",
+                    "head_imgs": [
+                        "https://example.invalid/1.jpg",
+                        "https://example.invalid/2.jpg",
+                        "https://example.invalid/3.jpg",
+                    ],
+                    "skus": [{"sale_price": 100, "stock_num": 2}],
+                    "cats_v2": [
+                        {"cat_id": "1000"},
+                        {"cat_id": "3001"},
+                    ],
+                },
+            }
+        ],
+    }
+
+    UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+        external_stop_requested=lambda: not generation_alive["value"],
+    ).run([task])
+
+    assert product_calls == ["product"]
+    assert apply_calls == []
+    assert task["items"][0]["status"] == "paused"
+
+
+@pytest.mark.parametrize(
+    "bad_snapshot",
+    [
+        {},
+        None,
+        {"roots": []},
+        {"roots": "invalid"},
+        {"roots": [{"category_id": "1000"}]},
+    ],
+)
+def test_upload_runner_fails_closed_after_invalid_category_refresh_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+    bad_snapshot,
+) -> None:
+    db = Database(
+        tmp_path / "upload-invalid-category-snapshot.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Invalid category snapshot",
+        "wx-invalid-category-snapshot",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    refresh_calls = []
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            raise WechatApiError("无该类目权限", code=6600145)
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            refresh_calls.append((selected_store.id, refresh))
+            return bad_snapshot
+
+    class CategoryClient:
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": "not_applied",
+                    "label": "未申请",
+                    "reason": "",
+                    "eligible": True,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, _category_ids):
+            raise AssertionError(
+                "invalid refresh snapshot must not be applied"
+            )
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+
+    def make_item(suffix):
+        return {
+            "item_id": f"item-{suffix}",
+            "source_product_id": f"SOURCE-{suffix}",
+            "title": f"Invalid snapshot {suffix}",
+            "price": 100,
+            "stock": 2,
+            "status": "pending",
+            "payload": {
+                "title": f"Invalid snapshot {suffix}",
+                "head_imgs": [
+                    "https://example.invalid/1.jpg",
+                    "https://example.invalid/2.jpg",
+                    "https://example.invalid/3.jpg",
+                ],
+                "skus": [{"sale_price": 100, "stock_num": 2}],
+                "cats_v2": [
+                    {"cat_id": "1000"},
+                    {"cat_id": "3001"},
+                ],
+            },
+        }
+
+    task = {
+        "id": "task-invalid-category-snapshot",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "invalid category snapshot",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            make_item("first"),
+            make_item("second"),
+        ],
+    }
+
+    UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    ).run([task])
+
+    assert product_calls == ["product"]
+    assert refresh_calls == [(store_id, True)]
+    assert task["items"][0]["status"] == "waiting_category"
+    assert task["items"][1]["status"] == "waiting_category"
+    assert task["items"][0]["category_state"] == "unknown"
+    assert task["items"][1]["category_state"] == "unknown"
+    assert task["status"] == "needs_category"
+
+
+def test_upload_runner_waits_later_products_after_shared_category_application(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db = Database(
+        tmp_path / "upload-category-refresh-pending.db",
+        protector=FakeProtector(),
+    )
+    store_id = db.add_store(
+        "Category pending",
+        "wx-category-refresh-pending",
+        "secret",
+    )
+    store = db.get_store(store_id)
+    product_calls = []
+    refresh_calls = []
+    apply_calls = []
+
+    class Service:
+        @classmethod
+        def product_write(cls, *_args, **_kwargs):
+            product_calls.append("product")
+            raise WechatApiError("无该类目权限", code=6600145)
+
+        @classmethod
+        def upload_category_options(
+            cls,
+            selected_store,
+            *,
+            refresh=False,
+        ):
+            refresh_calls.append((selected_store.id, refresh))
+            return {
+                "roots": [
+                    {
+                        "category_id": "1000",
+                        "children": [
+                            {
+                                "category_id": "3001",
+                                "application_state": "not_applied",
+                                "application_label": "未申请",
+                                "application_reason": "",
+                                "application_eligible": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    class CategoryClient:
+        submitted = False
+
+        def __init__(self, _db, _store):
+            pass
+
+        def category_application_checks(self, category_ids):
+            return {
+                str(category_id): {
+                    "state": (
+                        "pending" if self.submitted else "not_applied"
+                    ),
+                    "label": "审核中" if self.submitted else "未申请",
+                    "reason": "",
+                    "eligible": not self.submitted,
+                }
+                for category_id in category_ids
+            }
+
+        def batch_add_categories(self, category_ids):
+            apply_calls.append(tuple(category_ids))
+            self.submitted = True
+            return {"success": True}
+
+    monkeypatch.setattr(
+        "weimi_manager.pyside.pages.upload.ShopPrivateClient",
+        CategoryClient,
+    )
+
+    def make_item(suffix):
+        return {
+            "item_id": f"item-{suffix}",
+            "source_product_id": f"SOURCE-{suffix}",
+            "title": f"Category pending {suffix}",
+            "price": 100,
+            "stock": 2,
+            "status": "pending",
+            "payload": {
+                "title": f"Category pending {suffix}",
+                "head_imgs": [
+                    "https://example.invalid/1.jpg",
+                    "https://example.invalid/2.jpg",
+                    "https://example.invalid/3.jpg",
+                ],
+                "skus": [{"sale_price": 100, "stock_num": 2}],
+                "cats_v2": [
+                    {"cat_id": "1000"},
+                    {"cat_id": "3001"},
+                ],
+            },
+        }
+
+    task = {
+        "id": "task-category-refresh-pending",
+        "store_id": store_id,
+        "store_name": store.name,
+        "status": "pending",
+        "template": {
+            "name": "category pending",
+            "duplicate_filter_mode": "off",
+            "listing_mode": "immediate",
+        },
+        "items": [
+            make_item("first"),
+            make_item("second"),
+        ],
+    }
+
+    UploadRunner(
+        SimpleNamespace(db=db, service=Service()),
+        [task],
+    ).run([task])
+
+    assert product_calls == ["product"]
+    assert refresh_calls == [(store_id, True)]
+    assert apply_calls == [("3001",)]
+    assert task["items"][0]["status"] == "waiting_category"
+    assert task["items"][1]["status"] == "waiting_category"
+    assert task["items"][1]["category_state"] == "pending"
 
 
 def test_upload_runner_retries_waiting_category_items_after_resume(

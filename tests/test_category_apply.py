@@ -279,8 +279,8 @@ class CategoryApplyTests(unittest.TestCase):
             checks["104"]["state"],
             "qualification_required",
         )
-        self.assertEqual(checks["105"]["state"], "not_applied")
-        self.assertTrue(checks["105"]["eligible"])
+        self.assertEqual(checks["105"]["state"], "deposit_required")
+        self.assertFalse(checks["105"]["eligible"])
         self.assertEqual(checks["105"]["required_deposit"], 0)
         self.assertEqual(checks["105"]["amount_to_pay"], 100)
         self.assertEqual(checks["105"]["deposit_balance"], 50)
@@ -288,7 +288,7 @@ class CategoryApplyTests(unittest.TestCase):
         self.assertEqual(checks["106"]["state"], "not_applied")
         self.assertTrue(checks["106"]["eligible"])
 
-    def test_unapplied_category_uses_required_deposit_not_wallet_shortfall(
+    def test_unapplied_category_with_deposit_shortfall_is_blocked(
         self,
     ) -> None:
         client = object.__new__(ShopPrivateClient)
@@ -327,8 +327,8 @@ class CategoryApplyTests(unittest.TestCase):
         client._post = post
         check = client.category_application_checks(["301"])["301"]
 
-        self.assertEqual(check["state"], "not_applied")
-        self.assertTrue(check["eligible"])
+        self.assertEqual(check["state"], "deposit_required")
+        self.assertFalse(check["eligible"])
         self.assertEqual(check["required_deposit"], 100000)
         self.assertEqual(check["amount_to_pay"], 100000)
         self.assertEqual(check["deposit_balance"], 0)
@@ -449,6 +449,58 @@ class CategoryApplyTests(unittest.TestCase):
         )
         self.assertEqual(checks["204"]["state"], "deposit_required")
         self.assertEqual(checks["205"]["state"], "unavailable")
+
+    def test_category_application_checks_batch_large_category_trees(
+        self,
+    ) -> None:
+        category_ids = [str(1000 + index) for index in range(401)]
+        client = object.__new__(ShopPrivateClient)
+        client._get = lambda _path: {
+            "code": 0,
+            "productCats": [
+                {
+                    "value": category_id,
+                    "label": f"类目{category_id}",
+                    "leaf": True,
+                    "state": 0,
+                }
+                for category_id in category_ids
+            ],
+        }
+        deposit_batches = []
+        qualification_batches = []
+
+        def post(path, body):
+            if path.endswith("getCategoryRelationList"):
+                return {"code": 0, "categoryRelationList": []}
+            if path.endswith("getCategoryDeposit"):
+                rows = body["categoryList"]
+                deposit_batches.append(len(rows))
+                return {
+                    "code": 0,
+                    "categoryDepositList": [
+                        {
+                            "category": {
+                                "categoryId": row["categoryId"]
+                            },
+                            "requiredDeposit": "0",
+                            "amountToPay": "0",
+                            "depositBalance": "0",
+                        }
+                        for row in rows
+                    ],
+                }
+            if path.endswith("checkNeedQualificationByCategoryIds"):
+                qualification_batches.append(len(body["categoryIds"]))
+                return {"code": 0, "data": {}}
+            raise AssertionError(path)
+
+        client._post = post
+        checks = client.category_application_checks(category_ids)
+
+        self.assertEqual(deposit_batches, [200, 200, 1])
+        self.assertEqual(qualification_batches, [200, 200, 1])
+        self.assertTrue(all(check["eligible"] for check in checks.values()))
 
 
 if __name__ == "__main__":

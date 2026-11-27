@@ -202,6 +202,7 @@ class _CategoryService:
     def __init__(self) -> None:
         self.calls = 0
         self.unavailable_stores: set[int] = set()
+        self.application_states: dict[int, dict] = {}
 
     def client_for(self, _store: Store):
         return _FakeCategoryClient()
@@ -215,6 +216,23 @@ class _CategoryService:
         self.calls += 1
         root_id, parent_id, leaf_id = "1", "2", "3"
         root_name, parent_name, leaf_name = "服饰", "女装", "连衣裙"
+        application = self.application_states.get(
+            store.id,
+            {
+                "state": "effective",
+                "label": "已生效",
+                "reason": "",
+                "eligible": False,
+            },
+        )
+        if store.id in self.unavailable_stores:
+            application = {
+                "state": "unavailable",
+                "label": "不可申请",
+                "reason": "平台禁止申请该类目",
+                "eligible": False,
+            }
+        state = str(application.get("state") or "unknown")
         return {
             "version": "tree-v1",
             "cache_key": f"{store.id}:tree-v1",
@@ -242,7 +260,24 @@ class _CategoryService:
                                     ),
                                     "id_path": [root_id, parent_id, leaf_id],
                                     "leaf": True,
-                                    "available": store.id not in self.unavailable_stores,
+                                    "available": state == "effective",
+                                    "selectable": (
+                                        state in {"effective", "pending"}
+                                        or (
+                                            state == "not_applied"
+                                            and bool(application.get("eligible"))
+                                        )
+                                    ),
+                                    "application_state": state,
+                                    "application_label": str(
+                                        application.get("label") or ""
+                                    ),
+                                    "application_reason": str(
+                                        application.get("reason") or ""
+                                    ),
+                                    "application_eligible": bool(
+                                        application.get("eligible")
+                                    ),
                                     "children": [],
                                 }
                             ],
@@ -263,13 +298,16 @@ class _CategoryService:
         client=None,
     ) -> dict:
         options = self.upload_category_options(store, refresh=False)
+        leaf = options["roots"][0]["children"][0]["children"][0]
         if (
-            store.id in self.unavailable_stores
+            leaf.get("selectable") is not True
             or category_id != "3"
             or [str(value) for value in category_ids] != ["1", "2", "3"]
         ):
             raise ValueError(
-                f"{store.name} 指定类目已失效、被冻结或不存在，请修改模板"
+                f"{store.name} 指定类目不可申请或状态未知："
+                f"{leaf.get('application_label') or '状态未知'}；"
+                f"{leaf.get('application_reason') or '请重新读取'}"
             )
         return {
             "category_id": "3",
@@ -277,6 +315,9 @@ class _CategoryService:
             "path": "服饰 / 女装 / 连衣裙",
             "version": options["version"],
             "cache_key": options["cache_key"],
+            "application_state": leaf["application_state"],
+            "application_label": leaf["application_label"],
+            "application_reason": leaf["application_reason"],
         }
 
 
@@ -449,7 +490,7 @@ def test_service_category_cache_is_store_and_version_scoped(
     assert reused["stale"] is False
 
 
-def test_stale_category_cache_returns_immediately_and_refreshes_in_background(
+def test_stale_category_cache_returns_without_network_until_manual_refresh(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "webui.db")
@@ -468,17 +509,235 @@ def test_stale_category_cache_returns_immediately_and_refreshes_in_background(
     fresh_service = SyncService(database)
     returned = fresh_service.upload_category_options(store, client)
     assert returned["stale"] is True
-    assert returned["refresh_pending"] is True
+    assert returned["refresh_pending"] is False
+    assert client.category_calls == before_calls
+    assert json.loads(database.get_setting(key))["saved_at"] == (
+        cached["saved_at"]
+    )
 
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        refreshed = json.loads(database.get_setting(key))
-        if refreshed.get("saved_at") > cached["saved_at"]:
-            break
-        time.sleep(0.02)
-    else:
-        raise AssertionError("background category refresh did not finish")
+    refreshed = fresh_service.upload_category_options(
+        store,
+        client,
+        refresh=True,
+    )
+    assert refreshed["stale"] is False
     assert client.category_calls > before_calls
+
+
+def test_unapplied_eligible_category_is_selectable_and_validates(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("待申请店铺", "wx-apply", "secret")
+    store = database.get_store(store_id)
+    assert store
+    client = _ServiceCategoryClient()
+    client.category_application_checks = lambda category_ids: {
+        "3": {
+            "state": "effective",
+            "label": "已生效",
+            "reason": "",
+            "eligible": False,
+        },
+        "9": {
+            "state": "not_applied",
+            "label": "未申请",
+            "reason": "上货启动后自动申请",
+            "eligible": True,
+        },
+    }
+    service = SyncService(database)
+
+    options = service.upload_category_options(store, client)
+    leaves = service._category_leaf_index(options)
+
+    assert leaves["3"]["available"] is True
+    assert leaves["3"]["selectable"] is True
+    assert leaves["3"]["application_state"] == "effective"
+    assert leaves["9"]["available"] is False
+    assert leaves["9"]["selectable"] is True
+    assert leaves["9"]["application_state"] == "not_applied"
+
+    validated = service.validate_category_selection(
+        store,
+        ["7", "8", "9"],
+        "9",
+        client,
+    )
+    assert validated["category_id"] == "9"
+    assert validated["category_ids"] == ["7", "8", "9"]
+    assert validated["application_state"] == "not_applied"
+
+
+def test_blocked_category_application_states_are_not_selectable(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("类目状态店铺", "wx-states", "secret")
+    store = database.get_store(store_id)
+    assert store
+    client = _ServiceCategoryClient()
+    raw = client.fetch_all_categories()
+    state_categories = {
+        "20": ("缺资质叶子", "qualification_required", "缺少品牌授权资质"),
+        "21": ("保证金不足叶子", "deposit_required", "需补缴保证金 100 元"),
+        "22": ("被拒叶子", "rejected", "平台审核未通过"),
+        "23": ("禁止申请叶子", "unavailable", "平台暂停该类目新增"),
+        "24": ("审核中叶子", "pending", "等待平台审核"),
+        "25": ("未知叶子", "unknown", "申请资格接口不可用"),
+    }
+    for category_id, (name, _state, _reason) in state_categories.items():
+        pop_id = f"8{category_id}"
+        root_id = f"7{category_id}"
+        raw["cats_v2"].append(
+            {
+                "cat_and_qua": [
+                    {
+                        "cat": {
+                            "cat_id": category_id,
+                            "name": name,
+                            "f_cat_id": pop_id,
+                            "level": 3,
+                            "leaf": True,
+                        }
+                    },
+                    {
+                        "cat": {
+                            "cat_id": pop_id,
+                            "name": f"二级{category_id}",
+                            "f_cat_id": root_id,
+                            "level": 2,
+                            "leaf": False,
+                        }
+                    },
+                    {
+                        "cat": {
+                            "cat_id": root_id,
+                            "name": f"一级{category_id}",
+                            "f_cat_id": "0",
+                            "level": 1,
+                            "leaf": False,
+                        }
+                    },
+                ]
+            }
+        )
+    client.fetch_all_categories = lambda: raw
+    client.category_application_checks = lambda category_ids: {
+        "3": {
+            "state": "effective",
+            "label": "已生效",
+            "reason": "",
+            "eligible": False,
+        },
+        **{
+            category_id: {
+                "state": state,
+                "label": {
+                    "qualification_required": "缺资质",
+                    "deposit_required": "保证金不足",
+                    "rejected": "平台已拒绝",
+                    "unavailable": "不可申请",
+                    "pending": "审核中",
+                    "unknown": "状态未知",
+                }[state],
+                "reason": reason,
+                "eligible": False,
+            }
+            for category_id, (_name, state, reason) in state_categories.items()
+        },
+    }
+    service = SyncService(database)
+
+    options = service.upload_category_options(store, client)
+    leaves = service._category_leaf_index(options)
+
+    assert leaves["24"]["selectable"] is True
+    assert leaves["24"]["available"] is False
+    assert leaves["24"]["application_state"] == "pending"
+    for category_id in ("20", "21", "22", "23", "25"):
+        assert leaves[category_id]["selectable"] is False
+        assert leaves[category_id]["application_reason"]
+
+    pending = service.validate_category_selection(
+        store,
+        ["724", "824", "24"],
+        "24",
+        client,
+    )
+    assert pending["application_state"] == "pending"
+
+    for category_id in ("20", "21", "22", "23", "25"):
+        leaf = leaves[category_id]
+        with pytest.raises(
+            ValueError,
+            match=re.escape(leaf["application_label"]),
+        ):
+            service.validate_category_selection(
+                store,
+                leaf["id_path"],
+                category_id,
+                client,
+            )
+
+
+def test_effective_relation_wins_over_unknown_application_check(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("权限回退店", "wx-relation", "secret")
+    store = database.get_store(store_id)
+    assert store
+    client = _ServiceCategoryClient()
+    client.category_application_checks = lambda category_ids: {
+        category_id: {
+            "state": "unknown",
+            "label": "状态未知",
+            "reason": "商家后台登录失效",
+            "eligible": False,
+        }
+        for category_id in category_ids
+    }
+
+    service = SyncService(database)
+    options = service.upload_category_options(store, client)
+    leaves = service._category_leaf_index(options)
+
+    assert leaves["3"]["selectable"] is True
+    assert leaves["3"]["application_state"] == "effective"
+    assert leaves["9"]["selectable"] is False
+    assert leaves["9"]["application_state"] == "unknown"
+
+
+def test_legacy_effective_cache_remains_selectable_without_network(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("旧缓存店", "wx-legacy-cache", "secret")
+    store = database.get_store(store_id)
+    assert store
+    service = SyncService(database)
+    service.upload_category_options(store, _ServiceCategoryClient())
+    key = f"upload_category_cache_{store_id}"
+    cached = json.loads(database.get_setting(key))
+    for root in cached["roots"]:
+        for parent in root["children"]:
+            for leaf in parent["children"]:
+                leaf.pop("selectable", None)
+                leaf.pop("application_state", None)
+                leaf.pop("application_label", None)
+                leaf.pop("application_reason", None)
+    database.set_setting(key, json.dumps(cached, ensure_ascii=False))
+
+    returned = SyncService(database).upload_category_options(
+        store,
+        _FailingCategoryClient(),
+    )
+    leaves = service._category_leaf_index(returned)
+
+    assert leaves["3"]["selectable"] is True
+    assert leaves["3"]["application_state"] == "effective"
+    assert leaves["9"]["selectable"] is False
 
 
 def test_manual_category_refresh_failure_returns_old_cache(
@@ -599,6 +858,124 @@ def test_template_category_snapshot_round_trip(tmp_path: Path) -> None:
     assert template["specified_category_version"] == "tree-v1"
     assert template["specified_category_store_id"] == str(store_id)
     assert reopened["default_template"] is None
+
+
+def test_template_and_task_creation_accept_eligible_unapplied_category(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("待申请模板店", "wx-template-apply", "secret")
+    service = _CategoryService()
+    service.application_states[store_id] = {
+        "state": "not_applied",
+        "label": "未申请",
+        "reason": "上货启动后自动申请",
+        "eligible": True,
+    }
+    controller = NextUiController(database, product_service=service)
+
+    saved = controller.dispatch(
+        "upload.templates.save",
+        {
+            "template": {
+                "name": "待申请类目模板",
+                "price_multiplier": 1,
+                "stock": 0,
+                "listing_mode": "immediate",
+                "duplicate_filter_mode": "off",
+                "delivery_type": "现货",
+                "delivery_time": "48小时内发货",
+                "image_mode": "默认方式",
+                "head_action": "删除违规图片",
+                "detail_action": "删除违规图片",
+                "category_mode": "specified",
+                "specified_category_id": "3",
+                "specified_category_ids": ["1", "2", "3"],
+                "specified_category_path": "服饰 / 女装 / 连衣裙",
+                "specified_category_version": "tree-v1",
+                "specified_category_store_id": str(store_id),
+            }
+        },
+    )["template"]
+    assert saved["specified_category_id"] == "3"
+
+    database.set_setting(
+        "upload_batch",
+        json.dumps(
+            [
+                {
+                    "batch_id": "batch-apply",
+                    "source_product_id": "SOURCE-APPLY",
+                    "title": "待申请类目商品",
+                    "price": 1000,
+                    "payload": {"title": "待申请类目商品"},
+                }
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    created = controller.dispatch(
+        "upload.tasks.create",
+        {
+            "batch_ids": ["batch-apply"],
+            "store_ids": [store_id],
+            "template_id": saved["id"],
+        },
+    )
+
+    assert created["created"] == 1
+    assert created["blocked_stores"] == []
+    task = created["tasks"][0]
+    assert task["template"]["specified_category_id"] == "3"
+    assert task["template"]["specified_category_path"] == (
+        "服饰 / 女装 / 连衣裙"
+    )
+
+
+def test_template_save_blocks_blocked_category_application_states(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    store_id = database.add_store("阻断类目店", "wx-blocked", "secret")
+    service = _CategoryService()
+    controller = NextUiController(database, product_service=service)
+    template = {
+        "name": "阻断类目模板",
+        "price_multiplier": 1,
+        "stock": 0,
+        "listing_mode": "immediate",
+        "duplicate_filter_mode": "off",
+        "delivery_type": "现货",
+        "delivery_time": "48小时内发货",
+        "image_mode": "默认方式",
+        "head_action": "删除违规图片",
+        "detail_action": "删除违规图片",
+        "category_mode": "specified",
+        "specified_category_id": "3",
+        "specified_category_ids": ["1", "2", "3"],
+        "specified_category_path": "服饰 / 女装 / 连衣裙",
+        "specified_category_version": "tree-v1",
+        "specified_category_store_id": str(store_id),
+    }
+    states = [
+        ("qualification_required", "缺资质", "缺少品牌授权资质"),
+        ("deposit_required", "保证金不足", "需补缴保证金"),
+        ("rejected", "平台已拒绝", "审核未通过"),
+        ("unavailable", "不可申请", "平台暂停新增"),
+    ]
+
+    for state, label, reason in states:
+        service.application_states[store_id] = {
+            "state": state,
+            "label": label,
+            "reason": reason,
+            "eligible": False,
+        }
+        with pytest.raises(ValueError, match=re.escape(label)):
+            controller.dispatch(
+                "upload.templates.save",
+                {"template": template},
+            )
 
 
 def test_unspecified_template_preserves_source_or_auto_category() -> None:

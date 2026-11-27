@@ -82,6 +82,47 @@
   双向冲突在进入 service 前拒绝。定向 pytest `32 passed`，`py_compile`
   通过；按要求本轮未运行全量测试和 build。
 - 真实平台批量删除、彻底删除、撤回审核和刷新取消尚未验证；未发布、未部署。
+### TASK-20261127-024 WebUI 类目错误按需刷新独立修复
+
+状态：`VERIFY`；第二次独立审查集中返工 `2/3`，之后只等待最终复审。
+
+- 基线：`f96a6f0` / `v1.9.01`；独立分支
+  `hotfix/upload-category-refresh-1.9.01.1`。
+- 实际 WebUI `UploadRunner` 已接入按店类目强刷回调。平台返回类目权限、
+  冻结、失效或不存在错误时，同一执行批次内每个店铺只刷新一次；刷新结果被
+  后续同店商品复用，冻结、不可申请、资质不足、保证金不足、未知状态和刷新
+  失败不会继续写入后续商品。
+- 未申请但平台允许申请的叶子可保存到模板并创建任务；上货收到类目错误后
+  沿用申请、等待和有界恢复。审核中叶子可选择但在上货时等待，已生效叶子
+  继续直接上货，旧缓存中的已生效叶子保持兼容。已知保证金不足直接判为
+  不可申请，不自动提交；大类目申请资格按 200 个一批读取，避免整树单次
+  请求。
+- 普通类目读取只返回已有缓存，不因过期自动联网；手动重新读取仍同步强刷，
+  失败时保留旧缓存并显示错误。
+- 失败回归直接驱动真实 `UploadRunner`，覆盖冻结/失效同店共享一次刷新及
+  后续商品写入前阻断、刷新失败复用单一结果、可申请未申请类目申请后重试。
+- 第一次复审阻断修复：类目错误与历史失败识别均补充“禁用”；类目刷新返回、
+  类目申请前后和自动重试前检查取消/暂停，停止后不再申请或重写；远端写入
+  超时在取消/暂停下仍保持 `verification_pending`。
+- 定向证据：pytest `139 passed, 9 subtests passed`；Vitest
+  `5 files / 27 tests passed`；production build 通过，`112 modules`；
+  WebUI 上传/类目控制器定向 `8 passed`；Python 修改文件和定向测试
+  `py_compile` 通过。
+- 返工 1/3 证据：pytest `145 passed, 2 skipped, 9 subtests passed`；Vitest
+  `5 files / 27 tests passed`；Python 修改文件和定向测试 `py_compile`
+  通过。按 CTO 边界本轮未 build。
+- 返工 2/3：类目申请发出后结果未知时优先持久化
+  `waiting_category / category_state=unknown / category_apply_submitted=true`，
+  即使同时取消或暂停也不会被覆盖；恢复只复查，不自动重提。明确平台拒绝
+  仍为失败。WebUI controller 将启动 generation 的
+  `_job_update_allowed(generation)` 接入 Runner 外部停止检查；空、非对象、
+  缺少合法 roots 或无法解析目标类目的刷新快照统一 fail-closed。
+- 返工 2/3 证据：真实 `UploadRunner` 定向 pytest `30 passed`；
+  `upload_page.py`、`pages/upload.py`、`controller.py` 与
+  `tests/test_pyside_upload.py` 的 `py_compile` 通过。按 CTO 边界未运行
+  全量、Vitest、build、发布或部署。
+- 未验证边界：未用真实店铺触发平台类目冻结/失效错误，未执行真实类目申请、
+  审核等待或恢复，也未验证真实资质/保证金不足响应；未部署或启动候选界面。
 
 - 统筹总工负责任务拆分、文件锁、跨模块共享逻辑、回归、版本、候选包和发布签收。
 - 模块会话只在被明确派单后读取相关代码；不得提交 Git、打包、发布或覆盖本机。

@@ -68,6 +68,7 @@ describe("original upload template layout contract", () => {
       "二级类目",
       "三级叶子",
       "重新读取",
+      "正在读取官方类目和申请状态",
     ]) {
       expect(dialog).toContain(label);
     }
@@ -84,8 +85,14 @@ describe("original upload template layout contract", () => {
     expect(dialog).toContain("category_mode");
     expect(dialog).toContain('class="input category-trigger"');
     expect(storeDialog).toContain("brand_mode");
-    expect(dialog).toContain("leaf.available === false");
-    expect(dialog).toContain("未生效");
+    expect(dialog).toContain("categorySelectable");
+    expect(dialog).toContain("categoryApplicationLabel");
+    expect(dialog).toContain("categoryApplicationReason");
+    expect(dialog).toContain("categoryLoading");
+    expect(dialog).toContain("读取中…");
+    expect(dialog).toContain("categoryOptions.warning");
+    expect(dialog).not.toContain("leaf.available === false");
+    expect(dialog).not.toContain("未生效");
     expect(dialog).toContain('@click="selectCategoryRoot(root)"');
     expect(dialog).toContain('@click="selectCategoryParent(parent)"');
     expect(dialog).toContain('@click="chooseCategory(leaf)"');

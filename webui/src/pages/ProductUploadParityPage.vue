@@ -739,13 +739,55 @@ async function loadStoreCategories(storeIds, refresh = false) {
 
 async function dialogStoreCategories(storeId, refresh = false) {
   if (!storeId) return;
+  const key = String(storeId);
+  const current = storeOptions.value[key]?.category_options || {};
+  if (current.loading) return;
+  storeOptions.value = mergeUploadStoreOptions(
+    storeOptions.value,
+    {
+      [key]: {
+        category_options: {
+          ...current,
+          loading: true,
+          error: "",
+          refresh_error: "",
+        },
+      },
+    },
+  );
   try {
     await loadStoreCategories([storeId], refresh);
   } catch (cause) {
-    showNote(
-      `官方类目读取失败：${errorText(cause)}`,
-      "danger",
+    const message = `官方类目读取失败：${errorText(cause)}`;
+    storeOptions.value = mergeUploadStoreOptions(
+      storeOptions.value,
+      {
+        [key]: {
+          category_options: {
+            ...(storeOptions.value[key]?.category_options || {}),
+            loading: false,
+            error: message,
+            refresh_error: message,
+          },
+        },
+      },
     );
+    showNote(message, "danger");
+  } finally {
+    const options = storeOptions.value[key]?.category_options;
+    if (options?.loading) {
+      storeOptions.value = mergeUploadStoreOptions(
+        storeOptions.value,
+        {
+          [key]: {
+            category_options: {
+              ...options,
+              loading: false,
+            },
+          },
+        },
+      );
+    }
   }
 }
 
