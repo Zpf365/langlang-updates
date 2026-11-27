@@ -126,10 +126,9 @@ def test_release_package_enforces_external_hash_and_internal_metadata() -> None:
             "autoRefresh-test.js",
         ):
             (assets / name).write_text("", encoding="utf-8")
-        pyside = program / "_internal" / "PySide6"
-        pyside.mkdir()
-        (pyside / "Qt6WebEngineCore.dll").write_bytes(b"qt")
-        (pyside / "Qt6WebEngineWidgets.dll").write_bytes(b"qt")
+        internal = program / "_internal"
+        (internal / "Qt6WebEngineCore.dll").write_bytes(b"qt")
+        (internal / "Qt6WebEngineWidgets.dll").write_bytes(b"qt")
         bundle = build_bundle_manifest(
             download_url="https://example.invalid/app.zip",
             published_at="2026-11-23T00:00:00+00:00",

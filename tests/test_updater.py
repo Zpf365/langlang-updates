@@ -77,11 +77,11 @@ def write_update_package(
                     b"asset",
                 )
         archive.writestr(
-            "LangLang/_internal/PySide6/Qt6WebEngineCore.dll",
+            "LangLang/_internal/Qt6WebEngineCore.dll",
             b"qt",
         )
         archive.writestr(
-            "LangLang/_internal/PySide6/Qt6WebEngineWidgets.dll",
+            "LangLang/_internal/Qt6WebEngineWidgets.dll",
             b"qt",
         )
 

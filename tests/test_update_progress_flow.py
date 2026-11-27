@@ -48,7 +48,7 @@ def test_stage_update_reports_real_download_verify_and_extract_progress(
             "Qt6WebEngineWidgets.dll",
         ):
             archive.writestr(
-                f"LangLang/_internal/PySide6/{name}",
+                f"LangLang/_internal/{name}",
                 b"qt",
             )
     info = UpdateInfo(

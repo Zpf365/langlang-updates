@@ -55,8 +55,8 @@ DEFAULT_REQUIRED_UPDATE_FILES = (
     "_internal/webui/dist/assets/OrdersParityPage-*.js",
     "_internal/webui/dist/assets/ProductsPage-*.js",
     "_internal/webui/dist/assets/autoRefresh-*.js",
-    "_internal/PySide6/Qt6WebEngineCore.dll",
-    "_internal/PySide6/Qt6WebEngineWidgets.dll",
+    "_internal/Qt6WebEngineCore.dll",
+    "_internal/Qt6WebEngineWidgets.dll",
 )
 
 
