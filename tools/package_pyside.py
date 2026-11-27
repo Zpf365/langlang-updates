@@ -55,6 +55,41 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def summary_from_notes(notes: str) -> list[dict[str, object]]:
+    sections: list[dict[str, object]] = []
+    title = ""
+    items: list[str] = []
+
+    def flush() -> None:
+        if title and items:
+            sections.append({"title": title, "items": list(items)})
+
+    for raw_line in notes.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            flush()
+            title = line[3:].strip()
+            items = []
+        elif title and line.startswith("- "):
+            items.append(line[2:].strip())
+    flush()
+    return sections
+
+
+def write_program_manifests(
+    program: Path,
+    manifest: dict[str, object],
+) -> None:
+    payload = json.dumps(manifest, ensure_ascii=False, indent=2)
+    for relative in (
+        Path("update_manifest.json"),
+        Path("_internal/update_manifest.json"),
+    ):
+        path = program / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(payload, encoding="utf-8")
+
+
 def make_program_zip(
     program: Path,
     target: Path,
@@ -282,6 +317,7 @@ def main() -> int:
     notes = (ROOT / f"RELEASE_NOTES_{__version__}.md").read_text(
         encoding="utf-8"
     ).strip()
+    summary = summary_from_notes(notes)
     bundle_manifest = {
         "version": __version__,
         "download_url": "",
@@ -291,7 +327,9 @@ def main() -> int:
         "mandatory": False,
         "published_at": published_at,
         "notes": notes,
+        "summary": summary,
     }
+    write_program_manifests(program, bundle_manifest)
     make_program_zip(
         program,
         package,
@@ -315,6 +353,7 @@ def main() -> int:
         "mandatory": False,
         "published_at": published_at,
         "notes": notes,
+        "summary": summary,
         "required_files": list(DEFAULT_REQUIRED_UPDATE_FILES),
     }
     (output / "update_manifest.json").write_text(
