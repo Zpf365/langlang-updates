@@ -19,7 +19,11 @@ import requests
 
 from . import __version__
 from .hot_update_store import UpdateInstallLock
-from .update_health import update_health_path, update_root_for_install
+from .update_health import (
+    begin_update_attempt,
+    update_health_path,
+    update_root_for_install,
+)
 from .update_notes import (
     build_update_summary,
     normalize_update_summary,
@@ -760,7 +764,8 @@ param(
     [string]$ExpectedVersion = "",
     [int]$WaitSeconds = 300,
     [string]$HealthPath = "",
-    [int]$HealthSeconds = 120
+    [int]$HealthSeconds = 120,
+    [string]$AttemptId = ""
 )
 $ErrorActionPreference = "Stop"
 function Write-UpdateLog([string]$Message) {
@@ -774,6 +779,7 @@ $targetExe = Join-Path $Target "LangLang.exe"
 $updatesRoot = Split-Path -Parent $LogPath
 Set-Location -LiteralPath $updatesRoot
 $lockStream = $null
+$newProcess = $null
 function Get-TargetProcessIds {
     @(
         Get-Process -Name "LangLang" -ErrorAction SilentlyContinue |
@@ -985,7 +991,10 @@ try {
                 try {
                     $health = Get-Content -LiteralPath $HealthPath -Raw -Encoding UTF8 |
                         ConvertFrom-Json
-                    if ([string]$health.version -eq $ExpectedVersion) {
+                    if (
+                        ([string]$health.version -eq $ExpectedVersion) -and
+                        ([string]$health.attempt_id -eq $AttemptId)
+                    ) {
                         $healthy = $true
                         break
                     }
@@ -1010,6 +1019,18 @@ try {
     }
 } catch {
     Write-UpdateLog ("Update failed: " + $_.Exception.Message)
+    if ($newProcess -and !$newProcess.HasExited) {
+        try {
+            Stop-Process -Id $newProcess.Id -Force -ErrorAction Stop
+            Wait-Process -Id $newProcess.Id -Timeout 30 -ErrorAction SilentlyContinue
+            Write-UpdateLog "Stopped unhealthy new process before rollback"
+        } catch {
+            Write-UpdateLog (
+                "Could not stop unhealthy new process before rollback: " +
+                $_.Exception.Message
+            )
+        }
+    }
     if ($backup -and (Test-Path -LiteralPath $backup)) {
         Copy-TreeWithRetry $backup $Target "restore previous version in-place"
         Write-UpdateLog "Previous version restored"
@@ -1044,6 +1065,7 @@ try {
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     )
     with UpdateInstallLock(updates_root):
+        attempt = begin_update_attempt(target, staged.version)
         subprocess.Popen(
             [
                 "powershell.exe",
@@ -1065,6 +1087,8 @@ try {
                 staged.version,
                 "-HealthPath",
                 str(update_health_path(target)),
+                "-AttemptId",
+                attempt.attempt_id,
                 "-WaitSeconds",
                 "300",
             ],

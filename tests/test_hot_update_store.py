@@ -8,6 +8,7 @@ import zipfile
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -240,6 +241,43 @@ def test_install_recovers_orphan_patch_directory_without_state(
     assert installed == orphan
     assert (installed / "index.html").read_text(encoding="utf-8") == ("<html>recovered</html>")
     assert not (installed / "stale.txt").exists()
+
+
+def test_failed_state_write_never_deletes_sentinel_or_cwd(
+    tmp_path: Path,
+) -> None:
+    private_key, public_keys = _keypair()
+    store = _store(tmp_path, public_keys)
+    files = {"index.html": b"<html>state failure</html>"}
+    archive_path = tmp_path / "state-failure.zip"
+    digest = _archive(archive_path, files)
+    channel = parse_signed_channel(
+        _signed_channel(
+            private_key,
+            sequence=1,
+            files=files,
+            archive_sha256=digest,
+        ),
+        public_keys,
+        current_version="1.9.01.1",
+        backend_contract=1,
+    )
+
+    with (
+        mock.patch.object(
+            store,
+            "_write_state",
+            side_effect=OSError("disk full"),
+        ),
+        mock.patch("weimi_manager.hot_update_store.shutil.rmtree") as remove_tree,
+    ):
+        with pytest.raises(OSError, match="disk full"):
+            store.install_patch(channel.patches[0], archive_path)
+
+    for call in remove_tree.call_args_list:
+        target = Path(call.args[0]).resolve()
+        assert target != Path.cwd().resolve()
+        assert target != store.root
 
 
 def test_rules_patch_uses_business_validator_and_keeps_previous_on_failure(

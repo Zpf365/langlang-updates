@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
 import msvcrt
 import os
-import base64
 import subprocess
 import tempfile
 import unittest
@@ -19,13 +19,18 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from weimi_manager import updater as updater_module
 from weimi_manager.ui.app import MainWindow
+from weimi_manager.update_health import update_root_for_install
+from weimi_manager.update_protocol import (
+    UpdateProtocolError,
+    sign_manifest,
+)
 from weimi_manager.updater import (
     DEFAULT_UPDATE_SOURCE,
     StagedUpdate,
     UpdateInfo,
     _download_archive,
-    _github_manifest_via_latest_redirect,
     _get_with_retries,
+    _github_manifest_via_latest_redirect,
     _requests_session,
     _version_tuple,
     check_for_update,
@@ -33,11 +38,6 @@ from weimi_manager.updater import (
     is_development_preview_version,
     launch_update_installer,
 )
-from weimi_manager.update_protocol import (
-    UpdateProtocolError,
-    sign_manifest,
-)
-from weimi_manager.update_health import update_root_for_install
 
 
 def write_update_package(
@@ -175,9 +175,7 @@ class UpdaterTests(unittest.TestCase):
                 self.headers = {
                     "Content-Length": str(len(payload) - start),
                     "Content-Range": (
-                        f"bytes {start}-{len(payload) - 1}/{len(payload)}"
-                        if start
-                        else ""
+                        f"bytes {start}-{len(payload) - 1}/{len(payload)}" if start else ""
                     ),
                 }
                 self.status_code = 206 if start else 200
@@ -224,9 +222,12 @@ class UpdaterTests(unittest.TestCase):
             download_url="https://example.invalid/update.zip",
             sha256=hashlib.sha256(payload).hexdigest(),
         )
-        with tempfile.TemporaryDirectory() as tmp, mock.patch(
-            "weimi_manager.updater._get_with_retries",
-            side_effect=fake_get,
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch(
+                "weimi_manager.updater._get_with_retries",
+                side_effect=fake_get,
+            ),
         ):
             destination = Path(tmp) / "update.zip"
             _download_archive(info, destination, None)
@@ -337,9 +338,7 @@ class UpdaterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "update.zip"
             destination.with_suffix(".zip.part").write_bytes(payload)
-            error = updater_module.requests.HTTPError(
-                response=SimpleNamespace(status_code=416)
-            )
+            error = updater_module.requests.HTTPError(response=SimpleNamespace(status_code=416))
             with mock.patch(
                 "weimi_manager.updater._get_with_retries",
                 side_effect=error,
@@ -374,9 +373,7 @@ class UpdaterTests(unittest.TestCase):
 
         class FakeWindow:
             def __init__(self) -> None:
-                self.paths = SimpleNamespace(
-                    project_dir=Path("D:/GPT/test-program/LangLang")
-                )
+                self.paths = SimpleNamespace(project_dir=Path("D:/GPT/test-program/LangLang"))
                 self.captured: dict[str, object] = {}
                 self.db = SimpleNamespace(
                     start_task_log=lambda **_kwargs: 1,
@@ -438,9 +435,7 @@ class UpdaterTests(unittest.TestCase):
                 "weimi_manager.ui.app.threading.Timer",
             ),
         ):
-            window.captured["on_done"](
-                SimpleNamespace(version="1.6.29")
-            )
+            window.captured["on_done"](SimpleNamespace(version="1.6.29"))
 
         self.assertEqual(events, ["confirm", "launch", "after"])
 
@@ -452,10 +447,7 @@ class UpdaterTests(unittest.TestCase):
         class Response:
             status_code = 302
             headers = {
-                "Location": (
-                    "https://github.com/Zpf365/langlang-updates/"
-                    "releases/tag/v1.8.82"
-                )
+                "Location": ("https://github.com/Zpf365/langlang-updates/releases/tag/v1.8.82")
             }
 
         class ManifestResponse:
@@ -488,9 +480,7 @@ class UpdaterTests(unittest.TestCase):
                 return_value=ManifestResponse(),
             ) as get_manifest,
         ):
-            manifest = _github_manifest_via_latest_redirect(
-                DEFAULT_UPDATE_SOURCE
-            )
+            manifest = _github_manifest_via_latest_redirect(DEFAULT_UPDATE_SOURCE)
 
         self.assertEqual(manifest["version"], "1.8.82")
         self.assertEqual(manifest["channel"], "stable")
@@ -612,9 +602,7 @@ class UpdaterTests(unittest.TestCase):
                     project,
                 )
             self.assertEqual(staged.version, "9.0.1")
-            self.assertTrue(
-                (staged.package_root / "LangLang.exe").is_file()
-            )
+            self.assertTrue((staged.package_root / "LangLang.exe").is_file())
             self.assertIn(
                 "LangLang-9.0.1.zip",
                 str(staged.archive_path),
@@ -698,11 +686,9 @@ class UpdaterTests(unittest.TestCase):
             ):
                 staged = download_and_stage_update(info, project)
             bundled = json.loads(
-                (
-                    staged.package_root
-                    / "_internal"
-                    / "update_manifest.json"
-                ).read_text(encoding="utf-8")
+                (staged.package_root / "_internal" / "update_manifest.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(bundled["sha256"], "f" * 64)
             self.assertNotEqual(bundled["sha256"], package_sha)
@@ -752,18 +738,19 @@ class UpdaterTests(unittest.TestCase):
                 captured["cwd"] = kwargs.get("cwd")
                 return object()
 
-            with mock.patch.object(
-                updater_module.subprocess,
-                "Popen",
-                fake_popen,
-            ), mock.patch.dict(
-                "os.environ",
-                {"LOCALAPPDATA": str(root / "local")},
+            with (
+                mock.patch.object(
+                    updater_module.subprocess,
+                    "Popen",
+                    fake_popen,
+                ),
+                mock.patch.dict(
+                    "os.environ",
+                    {"LOCALAPPDATA": str(root / "local")},
+                ),
             ):
                 log_path = launch_update_installer(staged, project)
-            script = (
-                log_path.parent / "install-update.ps1"
-            ).read_text(encoding="utf-8-sig")
+            script = (log_path.parent / "install-update.ps1").read_text(encoding="utf-8-sig")
             self.assertIn("Invoke-WithRetry", script)
             self.assertIn("Copy-TreeWithRetry", script)
             self.assertIn("in-place update", script)
@@ -773,15 +760,12 @@ class UpdaterTests(unittest.TestCase):
             self.assertIn("restore previous version", script)
             self.assertIn("健康标记", script)
             self.assertIn("-HealthPath", captured["command"])
+            self.assertIn("-AttemptId", captured["command"])
+            self.assertIn("health.attempt_id", script)
+            self.assertIn("Stop-Process -Id", script)
             self.assertIn("install.lock", script)
-            self.assertFalse(
-                captured["flags"]
-                & getattr(subprocess, "DETACHED_PROCESS", 0)
-            )
-            self.assertTrue(
-                captured["flags"]
-                & getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
+            self.assertFalse(captured["flags"] & getattr(subprocess, "DETACHED_PROCESS", 0))
+            self.assertTrue(captured["flags"] & getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.assertEqual(
                 Path(captured["cwd"]).resolve(),
                 update_root_for_install(
@@ -829,13 +813,16 @@ class UpdaterTests(unittest.TestCase):
                 staging_root=root / "stage",
                 package_root=package_root,
             )
-            with mock.patch.object(
-                updater_module.subprocess,
-                "Popen",
-                return_value=object(),
-            ), mock.patch.dict(
-                "os.environ",
-                {"LOCALAPPDATA": str(root / "local")},
+            with (
+                mock.patch.object(
+                    updater_module.subprocess,
+                    "Popen",
+                    return_value=object(),
+                ),
+                mock.patch.dict(
+                    "os.environ",
+                    {"LOCALAPPDATA": str(root / "local")},
+                ),
             ):
                 log_path = launch_update_installer(staged, project)
 
@@ -897,9 +884,7 @@ class UpdaterTests(unittest.TestCase):
 
             package_root = root / "stage" / "LangLang"
             package_root.mkdir(parents=True)
-            (package_root / "LangLang.exe").write_bytes(
-                b"new-invalid-executable"
-            )
+            (package_root / "LangLang.exe").write_bytes(b"new-invalid-executable")
             (package_root / "update_manifest.json").write_text(
                 json.dumps({"version": "9.9.10"}),
                 encoding="utf-8",
@@ -910,13 +895,16 @@ class UpdaterTests(unittest.TestCase):
                 staging_root=root / "stage",
                 package_root=package_root,
             )
-            with mock.patch.object(
-                updater_module.subprocess,
-                "Popen",
-                return_value=object(),
-            ), mock.patch.dict(
-                "os.environ",
-                {"LOCALAPPDATA": str(root / "local")},
+            with (
+                mock.patch.object(
+                    updater_module.subprocess,
+                    "Popen",
+                    return_value=object(),
+                ),
+                mock.patch.dict(
+                    "os.environ",
+                    {"LOCALAPPDATA": str(root / "local")},
+                ),
             ):
                 log_path = launch_update_installer(staged, project)
 

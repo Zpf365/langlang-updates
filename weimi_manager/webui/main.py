@@ -21,7 +21,7 @@ from ..runtime_logging import (
     log_event,
 )
 from ..single_instance import SingleInstanceGuard
-from ..update_health import write_update_health
+from ..update_health import mark_pending_update_healthy
 from .controller import NextUiController
 from .desktop import run_desktop
 
@@ -243,11 +243,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         if service is None:
             raise RuntimeError("发行版账号授权服务未配置。")
-        if getattr(sys, "frozen", False):
-            try:
-                write_update_health(base_paths.project_dir, __version__)
-            except OSError as exc:
-                log_event("update.health.write_failed", error=str(exc))
 
         def run_account_webui(auth_context) -> str:
             paths = base_paths.for_account(auth_context.account_id)
@@ -323,6 +318,14 @@ def main(argv: list[str] | None = None) -> int:
 
         while True:
             auth_window = AuthWindow(base_paths, service)
+            if getattr(sys, "frozen", False):
+                try:
+                    mark_pending_update_healthy(
+                        base_paths.project_dir,
+                        __version__,
+                    )
+                except OSError as exc:
+                    log_event("update.health.write_failed", error=str(exc))
             auth_window.mainloop()
             auth_context = auth_window.result
             if auth_context is None:

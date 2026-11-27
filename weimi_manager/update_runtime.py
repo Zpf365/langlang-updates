@@ -23,8 +23,13 @@ MAX_PATCH_BYTES = 200 * 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class RuntimeCycle:
-    installed_patch_ids: tuple[str, ...]
-    reload_requested: bool
+    staged_patch_ids: tuple[str, ...] = ()
+    activated_patch_ids: tuple[str, ...] = ()
+    reload_requested: bool = False
+
+    @property
+    def installed_patch_ids(self) -> tuple[str, ...]:
+        return self.activated_patch_ids
 
 
 def fetch_signed_channel(source: str) -> Mapping[str, Any]:
@@ -133,43 +138,127 @@ class HotUpdateRuntime:
         self.log_callback = log_callback
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._action_lock = threading.RLock()
+        self._pending_channel: Any = None
+        self._reload_pending = False
 
     def _log(self, event: str, value: str = "") -> None:
         if self.log_callback is not None:
             self.log_callback(event, value)
 
     def poll_once(self) -> RuntimeCycle:
-        payload = self.channel_loader()
-        channel = parse_signed_channel(
-            payload,
-            self.store.public_keys,
-            current_version=self.store.current_version,
-            backend_contract=self.store.backend_contract,
-        )
-        if channel.paused:
-            self.store.apply_channel_control(channel)
-            self._log("hotupdate.channel_paused")
-            return RuntimeCycle((), False)
+        with self._action_lock:
+            payload = self.channel_loader()
+            channel = parse_signed_channel(
+                payload,
+                self.store.public_keys,
+                current_version=self.store.current_version,
+                backend_contract=self.store.backend_contract,
+            )
+            self.store.validate_channel_control(channel)
+            staged: list[str] = []
+            if not channel.paused:
+                for patch in sorted(
+                    channel.patches,
+                    key=lambda item: item.sequence,
+                ):
+                    if patch.patch_id in channel.revoked_patch_ids:
+                        continue
+                    if self.store.last_sequence(patch.kind) >= patch.sequence:
+                        continue
+                    if (
+                        rollout_bucket(
+                            self.store.install_id,
+                            patch.patch_id,
+                        )
+                        >= patch.rollout
+                    ):
+                        self._log(
+                            "hotupdate.rollout_skipped",
+                            patch.patch_id,
+                        )
+                        continue
+                    archive = self.archive_loader(patch)
+                    self.store.stage_patch(patch, archive)
+                    staged.append(patch.patch_id)
+                    self._log("hotupdate.staged", patch.patch_id)
 
-        installed: list[str] = []
-        installed_webui = False
-        for patch in sorted(channel.patches, key=lambda item: item.sequence):
-            if patch.patch_id in channel.revoked_patch_ids:
-                continue
-            if self.store.last_sequence(patch.kind) >= patch.sequence:
-                continue
-            if rollout_bucket(self.store.install_id, patch.patch_id) >= patch.rollout:
-                self._log("hotupdate.rollout_skipped", patch.patch_id)
-                continue
-            archive = self.archive_loader(patch)
-            self.store.install_patch(patch, archive)
-            installed.append(patch.patch_id)
-            installed_webui = installed_webui or patch.kind == "webui"
-            self._log("hotupdate.installed", patch.patch_id)
+            self._pending_channel = channel
+            activated, reload_requested = self._process_pending_if_idle_locked()
+            return RuntimeCycle(
+                staged_patch_ids=tuple(staged),
+                activated_patch_ids=tuple(activated),
+                reload_requested=reload_requested,
+            )
 
+    def process_pending_if_idle(self) -> RuntimeCycle:
+        with self._action_lock:
+            activated, reload_requested = self._process_pending_if_idle_locked()
+            return RuntimeCycle(
+                activated_patch_ids=tuple(activated),
+                reload_requested=reload_requested,
+            )
+
+    def has_pending_work(self) -> bool:
+        with self._action_lock:
+            return self._pending_channel is not None or self._reload_pending
+
+    def _process_pending_if_idle_locked(
+        self,
+    ) -> tuple[list[str], bool]:
+        try:
+            busy = bool(self.busy_provider())
+        except Exception:
+            busy = True
+        if busy:
+            return [], False
+
+        channel: Any = self._pending_channel
+        if channel is None:
+            return self._activate_staged_if_requested({}, set())
+
+        self.store.validate_channel_control(channel)
+        before_webui = self.store.active_patch_id("webui")
         self.store.apply_channel_control(channel)
-        reload_requested = self.request_reload_if_idle() if installed_webui else False
-        return RuntimeCycle(tuple(installed), reload_requested)
+        if self.store.active_patch_id("webui") != before_webui:
+            self._reload_pending = True
+
+        requested = {
+            patch.kind: patch.patch_id
+            for patch in channel.patches
+            if patch.patch_id not in channel.revoked_patch_ids
+        }
+        self._pending_channel = None
+        return self._activate_staged_if_requested(
+            requested,
+            set(channel.revoked_patch_ids),
+        )
+
+    def _activate_staged_if_requested(
+        self,
+        requested: Mapping[str, str],
+        revoked_patch_ids: set[str],
+    ) -> tuple[list[str], bool]:
+        activated: list[str] = []
+        webui_activated = False
+        for kind in ("webui", "rules"):
+            pending_patch_id = self.store.pending_patch_id(kind)
+            if (
+                not pending_patch_id
+                or pending_patch_id in revoked_patch_ids
+                or requested.get(kind) != pending_patch_id
+            ):
+                continue
+            active_patch_id = self.store.activate_pending(kind)
+            if active_patch_id:
+                activated.append(active_patch_id)
+                webui_activated = webui_activated or kind == "webui"
+                self._log("hotupdate.activated", active_patch_id)
+
+        if webui_activated:
+            self._reload_pending = True
+        reload_requested = self.request_reload_if_idle() if self._reload_pending else False
+        return activated, reload_requested
 
     def request_reload_if_idle(self) -> bool:
         try:
@@ -180,6 +269,7 @@ class HotUpdateRuntime:
             self._log("hotupdate.reload_deferred")
             return False
         self.reload_handler()
+        self._reload_pending = False
         return True
 
     def mark_webui_ready(self, healthy: bool) -> bool:

@@ -8,7 +8,7 @@ from pathlib import Path
 from .. import __version__
 from ..hot_update_store import HotUpdateStore
 from ..runtime_logging import log_event
-from ..update_health import update_root_for_install
+from ..update_health import mark_pending_update_healthy, update_root_for_install
 from ..update_protocol import load_trust_config
 from ..update_rules import rule_validators
 from ..update_runtime import (
@@ -180,6 +180,16 @@ def run_desktop(
                         ready_probe["settled"] = True
                         if hot_runtime is not None:
                             hot_runtime.mark_webui_ready(True)
+                        try:
+                            mark_pending_update_healthy(
+                                controller.project_dir,
+                                __version__,
+                            )
+                        except OSError as exc:
+                            log_event(
+                                "update.health.write_failed",
+                                error=str(exc),
+                            )
                     return
                 QTimer.singleShot(120, probe)
 
@@ -233,6 +243,11 @@ def run_desktop(
     update_timer.setInterval(100)
 
     def apply_requested_reload() -> None:
+        if hot_runtime is not None and hot_runtime.has_pending_work():
+            try:
+                hot_runtime.process_pending_if_idle()
+            except Exception as exc:
+                log_event("hotupdate.activation_failed", error=str(exc))
         if not bool(reload_requested["value"]):
             return
         reload_requested["value"] = False

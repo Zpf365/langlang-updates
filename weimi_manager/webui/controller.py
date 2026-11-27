@@ -2107,7 +2107,9 @@ class NextUiController:
         The account handoff path remains independent from this gate so an
         update can never disable switch, logout, or session closing.
         """
-        return bool(self._active_account_tasks())
+        with self._account_session_lock:
+            closing = self._account_session_closing
+        return bool(self._active_account_tasks()) or closing
 
     def _bootstrap(self, _payload: dict[str, Any]) -> dict[str, Any]:
         role, permissions = self._current_member_permissions(

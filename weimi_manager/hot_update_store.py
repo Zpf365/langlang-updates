@@ -104,6 +104,7 @@ class HotUpdateStore:
         payload.setdefault("paused", False)
         payload.setdefault("max_sequence", {"webui": 0, "rules": 0})
         payload.setdefault("active", {})
+        payload.setdefault("pending", {})
         payload.setdefault("revoked_patch_ids", [])
         return payload
 
@@ -185,6 +186,14 @@ class HotUpdateStore:
     def active_patch_id(self, kind: str) -> str:
         return str(self._active_record(kind).get("patch_id") or "")
 
+    def pending_patch_id(self, kind: str) -> str:
+        state = self._state()
+        pending = state.get("pending")
+        if not isinstance(pending, dict):
+            return ""
+        record = pending.get(kind)
+        return str(record.get("patch_id") or "") if isinstance(record, dict) else ""
+
     def last_sequence(self, kind: str) -> int:
         state = self._state()
         max_sequence = state.get("max_sequence")
@@ -194,6 +203,13 @@ class HotUpdateStore:
             return int(max_sequence.get(kind) or 0)
         except (TypeError, ValueError):
             return 0
+
+    def validate_channel_control(self, channel: SignedChannel) -> bool:
+        state = self._state()
+        previous_sequence = int(state.get("channel_sequence") or 0)
+        if channel.sequence < previous_sequence:
+            raise UpdateProtocolError("更新频道 sequence 已回放")
+        return channel.sequence > previous_sequence
 
     def active_root(self, kind: str, fallback: Path) -> Path:
         active = self._active_record(kind)
@@ -250,7 +266,7 @@ class HotUpdateStore:
             self._write_state(state)
             return True
 
-    def install_patch(
+    def stage_patch(
         self,
         patch: PatchDescriptor,
         archive_path: Path,
@@ -262,7 +278,7 @@ class HotUpdateStore:
 
         staging_parent = self.root / patch.kind
         staging_parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(
+        staging: Path | None = Path(
             tempfile.mkdtemp(
                 prefix=f".staging-{patch.patch_id}-",
                 dir=staging_parent,
@@ -282,40 +298,86 @@ class HotUpdateStore:
                 if final_root.exists():
                     shutil.rmtree(final_root)
                 self._activate_directory(staging, final_root)
-                staging = Path()
+                staging = None
 
-                active = state.get("active")
-                if not isinstance(active, dict):
-                    active = {}
-                previous = self._previous_allowed(
-                    active.get(patch.kind),
-                    {
-                        str(value)
-                        for value in (
-                            state.get("revoked_patch_ids")
-                            if isinstance(state.get("revoked_patch_ids"), list)
-                            else []
-                        )
-                    },
-                )
                 rule_mapping = {binding.name: binding.path for binding in patch.rules}
-                active[patch.kind] = {
+                pending = state.get("pending")
+                if not isinstance(pending, dict):
+                    pending = {}
+                pending[patch.kind] = {
                     "patch_id": patch.patch_id,
                     "sequence": patch.sequence,
                     "root": str(final_root.relative_to(self.root)),
                     "healthy": False,
-                    "previous": previous,
                     "rules": rule_mapping,
                 }
                 max_sequence[patch.kind] = patch.sequence
-                state["active"] = active
+                state["pending"] = pending
                 state["max_sequence"] = max_sequence
                 self._write_state(state)
                 return final_root
         except Exception:
-            if staging and staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
+            self._remove_staging_safely(staging)
             raise
+
+    def activate_pending(self, kind: str) -> str:
+        with UpdateInstallLock(self.lock_root):
+            state = self._state()
+            pending = state.get("pending")
+            if not isinstance(pending, dict):
+                return ""
+            pending_record = pending.get(kind)
+            if not isinstance(pending_record, dict):
+                return ""
+            root = self._root_for_relative(str(pending_record.get("root") or ""))
+            if not root.is_dir():
+                pending.pop(kind, None)
+                state["pending"] = pending
+                self._write_state(state)
+                raise UpdateProtocolError("待激活补丁目录不存在")
+
+            active = state.get("active")
+            if not isinstance(active, dict):
+                active = {}
+            revoked_values = state.get("revoked_patch_ids")
+            previous = self._previous_allowed(
+                active.get(kind),
+                {
+                    str(value)
+                    for value in (revoked_values if isinstance(revoked_values, list) else [])
+                },
+            )
+            activated = dict(pending_record)
+            activated["previous"] = previous
+            active[kind] = activated
+            pending.pop(kind, None)
+            state["active"] = active
+            state["pending"] = pending
+            self._write_state(state)
+            return str(activated.get("patch_id") or "")
+
+    def install_patch(
+        self,
+        patch: PatchDescriptor,
+        archive_path: Path,
+    ) -> Path:
+        final_root = self.stage_patch(patch, archive_path)
+        activated = self.activate_pending(patch.kind)
+        if activated != patch.patch_id:
+            raise UpdateProtocolError("补丁暂存后激活失败")
+        return final_root
+
+    def _remove_staging_safely(self, staging: Path | None) -> None:
+        if staging is None:
+            return
+        candidate = Path(staging).resolve()
+        if (
+            candidate == self.root
+            or not candidate.is_relative_to(self.root)
+            or not candidate.name.startswith(".staging-")
+        ):
+            return
+        shutil.rmtree(candidate, ignore_errors=True)
 
     def _extract_and_verify(
         self,
