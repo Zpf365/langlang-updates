@@ -46,8 +46,8 @@ describe("store context menu contract", () => {
     expect(page).toContain("expandedStoreIds.value = expandedStoreIds.value.filter");
   });
 
-  it("does not expose sales or refund diagnostic tooltips", () => {
-    expect(page).not.toContain("salesPresentation(store, key).title");
+  it("shows metric provenance without exposing refund audit payloads", () => {
+    expect(page).toContain("salesPresentation(store, key).title");
     expect(page).not.toContain("退款单量来源");
     expect(page).not.toContain("订单状态200覆盖证据");
   });

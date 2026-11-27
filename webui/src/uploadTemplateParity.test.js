@@ -113,3 +113,12 @@ describe("original upload template layout contract", () => {
     }
   });
 });
+
+  it("keeps every new-template image removal rule non-destructive", () => {
+    expect(dialog).toContain("trim_head: 0");
+    expect(dialog).toContain("remove_head_index: 0");
+    expect(dialog).toContain("remove_detail_index: 0");
+    expect(dialog).toContain("trim_detail: 0");
+    expect(dialog).toContain("trim_detail_tail: 0");
+    expect(dialog).toContain("detail_keep_first: 0");
+  });

@@ -8,7 +8,6 @@ import weimi_manager.db as db_module
 from weimi_manager.db import Database
 from weimi_manager.webui.controller import NextUiController
 
-
 YESTERDAY = "2026-11-21T02:00:00+00:00"
 TODAY = "2026-11-22T02:00:00+00:00"
 NOW = datetime(
@@ -120,6 +119,18 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
                 "recommend_exposure_people": 16754,
                 "recommend_exposure_yesterday_people": 0,
                 "recommend_exposure_7d_people": 125600,
+                    "product_exposure_today": 16754,
+                    "product_exposure_yesterday": 0,
+                    "product_exposure_7d": 125600,
+                    "product_exposure_count_today": 21084,
+                    "product_exposure_count_yesterday": 0,
+                    "product_exposure_count_7d": 150000,
+                    "product_click_people_today": 321,
+                    "product_click_people_yesterday": 0,
+                    "product_click_people_7d": 2400,
+                    "product_click_count_today": 500,
+                    "product_click_count_yesterday": 0,
+                    "product_click_count_7d": 3800,
                 "_exposure_attempt_status": {
                     "today": "updated",
                     "yesterday": "updated",
@@ -136,6 +147,7 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
                     "seven_days": "updated",
                 },
                 "_exposure_source": "官方曝光接口",
+                    "_exposure_updated_at": "2026-11-22 17:50:00",
                 "gmv_today": 13458,
                 "orders_today": 8,
                 "buyers_today": 4,
@@ -158,6 +170,7 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
                 "in_sale": 321,
                 "_online_product_attempt_status": "updated",
                 "_online_product_source": "官方在售商品总数",
+                    "_online_product_updated_at": "2026-11-22 17:49:00",
             },
             ensure_ascii=False,
         ),
@@ -171,9 +184,9 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
     }
     row = listed[store_a]
     assert row["exposure_metrics"] == {
-        "today": 1234,
+        "today": 16754,
         "yesterday": 0,
-        "seven_days": 9876,
+        "seven_days": 125600,
     }
     assert row["exposure_counts"] == {
         "today": 21084,
@@ -186,7 +199,9 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
         "seven_days": 125600,
     }
     assert row["online_products"] == 321
+    assert row["online_products_meta"]["as_of_date"] == "2026-11-22"
     assert row["metrics"]["gmv_today"] == 13458
+    assert row["as_of_date"] == "2026-11-22"
     assert row["sales_meta"] == {
         "status": {
             "today": "updated",
@@ -203,12 +218,16 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
         "source": "微信小店实时成交统计",
         "updated_at": "2026-11-22 17:50:41",
         "stale": True,
+        "as_of_date": "2026-11-22",
+        "period_dates": {},
         "gift_exclusion": {},
         "refund_amounts": {
             "status": {},
             "sources": {},
             "updated_at": "",
             "error": "",
+            "as_of_date": "",
+            "period_dates": {},
         },
         "refund_order_counts": {},
         "refund_order_cache": {},
@@ -216,6 +235,7 @@ def test_new_products_today_is_observational_scoped_and_scan_aware(
     }
     assert row["new_products_today"] == 2
     assert row["new_products_today_meta"]["timezone"] == "Asia/Shanghai"
+    assert row["new_products_today_meta"]["as_of_date"] == "2026-11-22"
     assert listed[unscanned]["new_products_today"] is None
     assert listed[no_new]["new_products_today"] == 0
 

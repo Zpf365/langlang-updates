@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import time
 from unittest.mock import patch
 
@@ -47,9 +48,10 @@ def test_recommend_overview_uses_real_seven_day_range() -> None:
     client = object.__new__(ShopPrivateClient)
     captured: dict = {}
 
-    def post(path, payload):
+    def post(path, payload, **_kwargs):
         captured["path"] = path
         captured["payload"] = payload
+        captured["headers"] = _kwargs.get("headers")
         return {
             "data": {
                 "data": {
@@ -175,6 +177,74 @@ def test_period_overview_uses_offline_endpoint_and_completed_day_range() -> None
     assert (end.date() - start.date()).days == 6
     assert end.date() == date.today() - timedelta(days=1)
     assert result["pay_gmv"] == "123"
+
+
+def test_product_overview_uses_compass_product_conversion_endpoint() -> None:
+    client = object.__new__(ShopPrivateClient)
+    captured = {}
+
+    def post(path, payload, **_kwargs):
+        captured["path"] = path
+        captured["payload"] = payload
+        captured["headers"] = _kwargs.get("headers")
+        return {
+            "total": {
+                "product_view_uv": 15,
+                "product_click_uv": 3,
+                "product_click_cnt": 5,
+            }
+        }
+
+    client._post = post
+    client._product_compass_auth_headers = lambda: {
+        "x-use-new-account": "1",
+        "x-use-wx-ticket": "1",
+    }
+    result = client.product_overview(realtime=True)
+
+    assert captured["path"].endswith("/mmecnodelinercgi/cgi/liner/query")
+    assert captured["payload"]["id"] == "product-overview-shop-realtime"
+    assert captured["payload"]["biz"] == "compass"
+    assert captured["payload"]["sale_type"] == "0"
+    assert captured["headers"]["x-use-new-account"] == "1"
+    assert captured["headers"]["x-use-wx-ticket"] == "1"
+    assert result["product_view_uv"] == 15
+    assert result["product_click_uv"] == 3
+    assert result["product_click_cnt"] == 5
+
+
+def test_product_overview_bootstraps_compass_ticket_session() -> None:
+    client = object.__new__(ShopPrivateClient)
+    client._headers = {"Cookie": "biz_ticket=redacted"}
+    client._product_compass_headers = None
+    calls = []
+
+    class Session:
+        cookies = [
+            SimpleNamespace(
+                name="user_magic",
+                value="user-ticket",
+                domain="store.weixin.qq.com",
+                path="/",
+                secure=True,
+            )
+        ]
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return SimpleNamespace(status_code=200)
+
+    client.session = Session()
+    headers = client._product_compass_auth_headers()
+
+    assert calls[0][0].endswith(
+        "/thirdParty/shop/loginCompassByShop"
+    )
+    assert headers["x-use-new-account"] == "1"
+    assert headers["x-use-wx-ticket"] == "1"
+    assert "user_magic=user-ticket" in headers["Cookie"]
+    assert client._product_compass_auth_headers() is headers
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -896,23 +966,20 @@ class _MetricsPrivateClient:
             raise RuntimeError(self.deposit_error)
         return self.deposit_value
 
-    def recommend_overview(self, yesterday=False, *, days=None):
+    def product_overview(self, *, days=1, offset_days=0, realtime=False):
         if days == 7:
             return {
-                "exposure": 90,
-                "exposure_count": 900,
-                "exposure_people": 90,
+                "product_view_cnt": 900,
+                "product_view_uv": 90,
             }
-        if yesterday:
+        if offset_days == 1:
             return {
-                "exposure": 80,
-                "exposure_count": 800,
-                "exposure_people": 80,
+                "product_view_cnt": 800,
+                "product_view_uv": 80,
             }
         return {
-            "exposure": 100,
-            "exposure_count": 1000,
-            "exposure_people": 100,
+            "product_view_cnt": 1000,
+            "product_view_uv": 100,
         }
 
     def status_counts(self):
@@ -1138,23 +1205,26 @@ def test_refresh_metrics_keeps_exposure_count_and_people_independent(
     service = SyncService(database)
 
     class PartialExposureClient(_MetricsPrivateClient):
-        def recommend_overview(self, yesterday=False, *, days=None):
+        def product_overview(
+            self,
+            *,
+            days=1,
+            offset_days=0,
+            realtime=False,
+        ):
             if days == 7:
                 return {
-                    "exposure": None,
-                    "exposure_count": None,
-                    "exposure_people": None,
+                    "product_view_cnt": None,
+                    "product_view_uv": None,
                 }
-            if yesterday:
+            if offset_days == 1:
                 return {
-                    "exposure": 17,
-                    "exposure_count": None,
-                    "exposure_people": 17,
+                    "product_view_cnt": None,
+                    "product_view_uv": 17,
                 }
             return {
-                "exposure": 21,
-                "exposure_count": 21,
-                "exposure_people": None,
+                "product_view_cnt": 21,
+                "product_view_uv": None,
             }
 
     with (
@@ -1265,7 +1335,7 @@ def test_refresh_store_metrics_prefers_official_deal_statistics(
     assert period_calls == [(1, 1), (7, 1), (30, 1)]
 
 
-def test_official_sales_excludes_current_unclaimed_gifts_by_period(
+def test_official_sales_matches_platform_totals_when_gifts_are_present(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "official-sales-gifts.db")
@@ -1405,19 +1475,19 @@ def test_official_sales_excludes_current_unclaimed_gifts_by_period(
     ):
         metrics = service.refresh_store_metrics(store)
 
-    assert metrics["gmv_today"] == 949999
-    assert metrics["orders_today"] == 65
-    assert metrics["today_orders"] == 65
+    assert metrics["gmv_today"] == 999999
+    assert metrics["orders_today"] == 66
+    assert metrics["today_orders"] == 66
     assert metrics["buyers_today"] == 5
-    assert metrics["gmv_yesterday"] == 190000
-    assert metrics["orders_yesterday"] == 9
-    assert metrics["gmv_7d"] == 690000
-    assert metrics["orders_7d"] == 29
-    assert metrics["gmv_30d"] == 890000
-    assert metrics["orders_30d"] == 39
+    assert metrics["gmv_yesterday"] == 200000
+    assert metrics["orders_yesterday"] == 10
+    assert metrics["gmv_7d"] == 700000
+    assert metrics["orders_7d"] == 30
+    assert metrics["gmv_30d"] == 900000
+    assert metrics["orders_30d"] == 40
     exclusion = metrics["_gift_exclusion"]
     assert exclusion["today"]["deducted_amount"] == 50000
-    assert exclusion["today"]["applied_amount"] == 50000
+    assert exclusion["today"]["applied_amount"] == 0
     assert exclusion["today"]["deducted_orders"] == 1
     assert exclusion["today"]["pending_order_ids"] == ["GIFT-TODAY"]
     assert exclusion["today"]["unconfirmed_count"] == 1
@@ -1428,10 +1498,123 @@ def test_official_sales_excludes_current_unclaimed_gifts_by_period(
     ]
     assert exclusion["seven_days"]["deducted_amount"] == 10000
     assert exclusion["thirty_days"]["deducted_amount"] == 10000
-    assert "未领取礼物" in metrics["_sales_period_sources"]["today"]
-    assert "未领取礼物" in metrics["_sales_period_sources"]["yesterday"]
-    assert "未领取礼物" in metrics["_sales_period_sources"]["seven_days"]
-    assert "未领取礼物" in metrics["_sales_period_sources"]["thirty_days"]
+    assert "未领取礼物" not in metrics["_sales_period_sources"]["today"]
+    assert "未领取礼物" not in metrics["_sales_period_sources"]["yesterday"]
+    assert "未领取礼物" not in metrics["_sales_period_sources"]["seven_days"]
+    assert "未领取礼物" not in metrics["_sales_period_sources"]["thirty_days"]
+
+
+def test_store_exposure_uses_product_conversion_totals_not_recommendation(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "product-exposure.db")
+    store_id = database.add_store(
+        "商品数据店铺",
+        "wx-product-exposure",
+        "secret",
+    )
+    store = database.get_store(store_id)
+    assert store is not None
+    product_overview_calls = []
+
+    class ProductConversionClient(_MetricsPrivateClient):
+        def realtime_overview(self):
+            return {
+                "pay_gmv": 0,
+                "pay_order_cnt": 0,
+                "pay_uv": 0,
+                "product_view_cnt": 15,
+                "product_view_uv": 15,
+                "product_click_cnt": 5,
+                "product_click_uv": 3,
+            }
+
+        def period_overview(self, days=1, offset_days=1):
+            values = {
+                (1, 1): (42, 42),
+                (7, 1): (210, 180),
+                (30, 1): (900, 700),
+            }
+            count, people = values[(days, offset_days)]
+            return {
+                "pay_gmv": 0,
+                "pay_order_cnt": 0,
+                "pay_uv": 0,
+                "product_view_cnt": count,
+                "product_view_uv": people,
+                "product_click_cnt": 5,
+                "product_click_uv": 3,
+            }
+
+        def product_overview(
+            self,
+            *,
+            days=1,
+            offset_days=0,
+            realtime=False,
+        ):
+            product_overview_calls.append((realtime, days))
+            click_people = 3
+            click_count = 5
+            if days == 7:
+                return {
+                    "product_view_cnt": 210,
+                    "product_view_uv": 180,
+                    "product_click_uv": 20,
+                    "product_click_cnt": 35,
+                }
+            if offset_days == 1:
+                return {
+                    "product_view_cnt": 42,
+                    "product_view_uv": 42,
+                    "product_click_uv": 4,
+                    "product_click_cnt": 50,
+                }
+            return {
+                "product_view_cnt": 15,
+                "product_view_uv": 15,
+                "product_click_uv": click_people,
+                "product_click_cnt": click_count,
+            }
+
+    service = SyncService(database)
+    with (
+        patch.object(service, "validate_store_credential", return_value=None),
+        patch.object(service, "_ensure_today_orders_cached", return_value=False),
+        patch.object(service, "_analytics_days_for_metrics", return_value=[]),
+        patch.object(service, "fetch_product_audit_quota", return_value={}),
+        patch.object(service, "client_for", side_effect=ValueError("web-only")),
+        patch(
+            "weimi_manager.service.ShopPrivateClient",
+            return_value=ProductConversionClient(),
+        ),
+    ):
+        metrics = service.refresh_store_metrics(store)
+
+    assert metrics["recommend_exposure_count"] == 15
+    assert metrics["recommend_exposure_people"] == 15
+    assert metrics["recommend_exposure_yesterday_count"] == 42
+    assert metrics["recommend_exposure_yesterday_people"] == 42
+    assert metrics["recommend_exposure_7d_count"] == 210
+    assert metrics["recommend_exposure_7d_people"] == 180
+    assert metrics["product_exposure_today"] == 15
+    assert metrics["product_exposure_yesterday"] == 42
+    assert metrics["product_exposure_7d"] == 180
+    assert metrics["product_exposure_count_today"] == 15
+    assert metrics["product_exposure_count_yesterday"] == 42
+    assert metrics["product_exposure_count_7d"] == 210
+    assert metrics["product_click_people_today"] == 3
+    assert metrics["product_click_count_today"] == 5
+    assert metrics["product_click_people_yesterday"] == 4
+    assert metrics["product_click_count_yesterday"] == 50
+    assert metrics["product_click_people_7d"] == 20
+    assert metrics["product_click_count_7d"] == 35
+    assert "商品转化" in metrics["_exposure_source"]
+    assert product_overview_calls == [
+        (True, 1),
+        (False, 1),
+        (False, 7),
+    ]
 
 
 def test_official_sales_without_gifts_is_unchanged(
@@ -2081,7 +2264,7 @@ def test_order_status_200_is_not_used_as_refund_count(
     assert metrics["_refund_order_cache"]["conflict_periods"] == []
 
 
-def test_completed_aftersale_with_zero_official_refund_is_a_conflict(
+def test_completed_aftersale_corrects_zero_official_refund_amount(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "refund-zero-conflict.db")
@@ -2145,10 +2328,10 @@ def test_completed_aftersale_with_zero_official_refund_is_a_conflict(
     ):
         metrics = service.refresh_store_metrics(store)
 
-    assert metrics["refund_gmv_today"] == 0
-    assert metrics["refund_orders_today"] is None
-    assert metrics["_refund_order_cache"]["conflict_periods"] == ["today"]
-    assert "口径冲突" in metrics["_refund_order_cache"]["hint"]
+    assert metrics["refund_gmv_today"] == 100
+    assert metrics["refund_orders_today"] == 1
+    assert metrics["_refund_attempt_status"]["today"] == "updated"
+    assert metrics["_refund_order_cache"]["conflict_periods"] == []
 
 
 def test_official_refund_count_fields_take_precedence(

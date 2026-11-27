@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .. import __version__
 from ..auth_client import AuthError
-from ..db import Database, order_status_text
+from ..db import Database, SHANGHAI_TZ, order_status_text
 from ..models import (
     Store,
     is_unclaimed_gift_order,
@@ -316,8 +316,8 @@ UPLOAD_DEFAULT_TEMPLATE: dict[str, Any] = {
     "head_action": "删除违规图片",
     "detail_action": "删除违规图片",
     "attribute_rules": "",
-    "trim_detail": 2,
-    "trim_detail_tail": 2,
+    "trim_detail": 0,
+    "trim_detail_tail": 0,
     "detail_keep_first": 0,
     "strip_title_brackets": False,
     "cloud_violation": True,
@@ -624,6 +624,34 @@ class NextUiController:
                 "account_id": self._account_id(),
                 "generation": int(self._account_generation),
             }
+
+    def _require_job_owner(
+        self,
+        job: dict[str, Any],
+        label: str,
+    ) -> None:
+        with self._account_session_lock:
+            if self._account_session_closing:
+                raise PermissionError(
+                    f"{label}所属账户会话正在关闭，不能读取或操作"
+                )
+            current_account = self._account_id()
+            current_generation = int(self._account_generation)
+        job_account = str(job.get("account_id") or "")
+        if job_account != current_account:
+            raise PermissionError(
+                f"{label}不属于当前账户，已拒绝读取或操作"
+            )
+        try:
+            job_generation = int(job.get("generation"))
+        except (TypeError, ValueError) as exc:
+            raise PermissionError(
+                f"{label}缺少有效会话代际，已拒绝读取或操作"
+            ) from exc
+        if job_generation != current_generation:
+            raise PermissionError(
+                f"{label}会话代际不匹配，已拒绝读取或操作"
+            )
 
     def _authorize_platform_write(self, app_id: str, action: str) -> None:
         with self._account_session_lock:
@@ -3192,9 +3220,10 @@ class NextUiController:
         )
         credential_states = self.db.store_credential_state_map()
         store_rows = self.db.list_stores(search=search)
+        store_page_now = self._now_provider()
         new_product_map = self.db.product_new_today_map(
             {store.id for store in store_rows},
-            now=self._now_provider(),
+            now=store_page_now,
         )
         stores = []
         for store in store_rows:
@@ -3241,6 +3270,25 @@ class NextUiController:
             )
             if not isinstance(sales_sources, dict):
                 sales_sources = {}
+            sales_as_of_date = (
+                str(current_metrics.get("_sales_snapshot_date") or "")
+                or self._metric_date(
+                    current_metrics.get("_sales_updated_at")
+                )
+            )
+            sales_period_updated_at = current_metrics.get(
+                "_sales_period_updated_at"
+            )
+            if not isinstance(sales_period_updated_at, dict):
+                sales_period_updated_at = {}
+            refund_period_updated_at = current_metrics.get(
+                "_refund_period_updated_at"
+            )
+            if not isinstance(refund_period_updated_at, dict):
+                refund_period_updated_at = {}
+            refund_updated_at = str(
+                current_metrics.get("_refund_updated_at") or ""
+            )
             item["sales_meta"] = {
                 "status": current_metrics.get(
                     "_sales_attempt_status"
@@ -3257,6 +3305,18 @@ class NextUiController:
                 "stale": bool(
                     current_metrics.get("_sales_is_stale")
                 ),
+                "as_of_date": str(
+                    current_metrics.get("_sales_snapshot_date") or ""
+                ) or sales_as_of_date,
+                "period_dates": {
+                    period: (
+                        self._metric_date(period_updated_at)
+                        or sales_as_of_date
+                    )
+                    for period, period_updated_at in (
+                        sales_period_updated_at.items()
+                    )
+                },
                 "gift_exclusion": (
                     current_metrics.get("_gift_exclusion")
                     if isinstance(
@@ -3281,6 +3341,13 @@ class NextUiController:
                     "error": str(
                         current_metrics.get("_refund_error") or ""
                     ),
+                    "as_of_date": self._metric_date(refund_updated_at),
+                    "period_dates": {
+                        period: self._metric_date(period_updated_at)
+                        for period, period_updated_at in (
+                            refund_period_updated_at.items()
+                        )
+                    },
                 },
                 "refund_order_counts": (
                     current_metrics.get("_refund_order_counts")
@@ -3303,13 +3370,13 @@ class NextUiController:
                 ),
             }
             exposure_today = self._score_number(
-                current_metrics.get("recommend_exposure")
+                current_metrics.get("product_exposure_today")
             )
             exposure_yesterday = self._score_number(
-                current_metrics.get("recommend_exposure_yesterday")
+                current_metrics.get("product_exposure_yesterday")
             )
             exposure_seven_days = self._score_number(
-                current_metrics.get("recommend_exposure_7d")
+                current_metrics.get("product_exposure_7d")
             )
             item["exposure_metrics"] = {
                 "today": int(exposure_today) if exposure_today is not None else None,
@@ -3325,13 +3392,13 @@ class NextUiController:
                 ),
             }
             exposure_count_today = self._score_number(
-                current_metrics.get("recommend_exposure_count")
+                current_metrics.get("product_exposure_count_today")
             )
             exposure_count_yesterday = self._score_number(
-                current_metrics.get("recommend_exposure_yesterday_count")
+                current_metrics.get("product_exposure_count_yesterday")
             )
             exposure_count_seven_days = self._score_number(
-                current_metrics.get("recommend_exposure_7d_count")
+                current_metrics.get("product_exposure_count_7d")
             )
             item["exposure_counts"] = {
                 "today": (
@@ -3351,31 +3418,60 @@ class NextUiController:
                 ),
             }
             exposure_people_today = self._score_number(
-                current_metrics.get("recommend_exposure_people")
+                current_metrics.get("product_exposure_today")
             )
             exposure_people_yesterday = self._score_number(
-                current_metrics.get("recommend_exposure_yesterday_people")
+                current_metrics.get("product_exposure_yesterday")
             )
             exposure_people_seven_days = self._score_number(
-                current_metrics.get("recommend_exposure_7d_people")
+                current_metrics.get("product_exposure_7d")
             )
             item["exposure_people"] = {
                 "today": (
                     int(exposure_people_today)
                     if exposure_people_today is not None
-                    else item["exposure_metrics"]["today"]
+                    else None
                 ),
                 "yesterday": (
                     int(exposure_people_yesterday)
                     if exposure_people_yesterday is not None
-                    else item["exposure_metrics"]["yesterday"]
+                    else None
                 ),
                 "seven_days": (
                     int(exposure_people_seven_days)
                     if exposure_people_seven_days is not None
-                    else item["exposure_metrics"]["seven_days"]
+                    else None
                 ),
             }
+            item["product_exposure_people"] = dict(
+                item["exposure_people"]
+            )
+            item["product_exposure_counts"] = dict(
+                item["exposure_counts"]
+            )
+            item["exposure_click_people"] = {
+                "today": current_metrics.get("product_click_people_today"),
+                "yesterday": current_metrics.get(
+                    "product_click_people_yesterday"
+                ),
+                "seven_days": current_metrics.get("product_click_people_7d"),
+            }
+            item["exposure_click_counts"] = {
+                "today": current_metrics.get("product_click_count_today"),
+                "yesterday": current_metrics.get(
+                    "product_click_count_yesterday"
+                ),
+                "seven_days": current_metrics.get("product_click_count_7d"),
+            }
+            exposure_period_updated_at = current_metrics.get(
+                "_exposure_period_updated_at"
+            )
+            if not isinstance(exposure_period_updated_at, dict):
+                exposure_period_updated_at = {}
+            exposure_updated_at = str(
+                current_metrics.get("_exposure_updated_at") or ""
+            )
+            exposure_as_of_date = self._metric_date(exposure_updated_at)
             item["exposure_meta"] = {
                 "status": current_metrics.get("_exposure_attempt_status") or {},
                 "count_status": (
@@ -3384,11 +3480,19 @@ class NextUiController:
                 "people_status": (
                     current_metrics.get("_exposure_people_attempt_status") or {}
                 ),
-                "updated_at": str(
-                    current_metrics.get("_exposure_updated_at") or ""
-                ),
+                "updated_at": exposure_updated_at,
                 "error": str(current_metrics.get("_exposure_error") or ""),
                 "source": str(current_metrics.get("_exposure_source") or ""),
+                "as_of_date": exposure_as_of_date,
+                "period_dates": {
+                    period: (
+                        self._metric_date(period_updated_at)
+                        or exposure_as_of_date
+                    )
+                    for period, period_updated_at in (
+                        exposure_period_updated_at.items()
+                    )
+                },
             }
             online_source = str(
                 current_metrics.get("_online_product_source") or ""
@@ -3399,21 +3503,27 @@ class NextUiController:
                 if online_source and online_value is not None
                 else None
             )
+            online_updated_at = str(
+                current_metrics.get("_online_product_updated_at") or ""
+            )
+            online_as_of_date = self._metric_date(online_updated_at)
             item["online_products_meta"] = {
                 "status": str(
                     current_metrics.get("_online_product_attempt_status")
                     or "unavailable"
                 ),
-                "updated_at": str(
-                    current_metrics.get("_online_product_updated_at") or ""
-                ),
+                "updated_at": online_updated_at,
                 "error": str(
                     current_metrics.get("_online_product_error") or ""
                 ),
                 "source": online_source,
+                "as_of_date": online_as_of_date,
             }
             new_product = new_product_map.get(store.id, {})
             item["new_products_today"] = new_product.get("count")
+            new_products_as_of_date = self._metric_date(
+                new_product.get("last_scan_completed_at")
+            )
             item["new_products_today_meta"] = {
                 "scan_completed_today": bool(
                     new_product.get("scan_completed_today")
@@ -3423,6 +3533,37 @@ class NextUiController:
                 ),
                 "timezone": "Asia/Shanghai",
                 "definition": "今日首次观测上新",
+                "as_of_date": new_products_as_of_date,
+            }
+            fund_period_updated_at = current_metrics.get(
+                "_fund_period_updated_at"
+            )
+            if not isinstance(fund_period_updated_at, dict):
+                fund_period_updated_at = {}
+            fund_updated_at = str(
+                current_metrics.get("_fund_updated_at") or ""
+            )
+            fund_as_of_date = self._metric_date(fund_updated_at)
+            fund_status = current_metrics.get("_fund_attempt_status")
+            item["fund_meta"] = {
+                "status": (
+                    fund_status
+                    if isinstance(fund_status, dict)
+                    else {}
+                ),
+                "updated_at": fund_updated_at,
+                "error": str(current_metrics.get("_fund_error") or ""),
+                "source": str(current_metrics.get("_fund_source") or ""),
+                "as_of_date": fund_as_of_date,
+                "period_dates": {
+                    period: (
+                        self._metric_date(period_updated_at)
+                        or fund_as_of_date
+                    )
+                    for period, period_updated_at in (
+                        fund_period_updated_at.items()
+                    )
+                },
             }
             item["deposit_meta"] = {
                 "status": str(
@@ -3443,6 +3584,13 @@ class NextUiController:
                 (credential_states.get(store.id) or {}).get("state")
                 or "unknown"
             )
+            item["as_of_date"] = (
+                sales_as_of_date
+                or exposure_as_of_date
+                or online_as_of_date
+                or new_products_as_of_date
+                or fund_as_of_date
+            )
             stores.append(item)
         return {"stores": stores, "groups": groups}
 
@@ -3461,6 +3609,27 @@ class NextUiController:
         except (TypeError, ValueError):
             return None
         return round(number, 2)
+
+    @staticmethod
+    def _metric_date(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(
+                text[:-1] + "+00:00" if text.endswith("Z") else text
+            )
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(SHANGHAI_TZ)
+            return parsed.date().isoformat()
+        return (
+            text[:10]
+            if len(text) >= 10 and text[4] == "-" and text[7] == "-"
+            else ""
+        )
 
     def _local_now(self) -> datetime:
         now = self._now_provider()
@@ -11867,6 +12036,214 @@ class NextUiController:
             "credential_actions": credential_actions,
         }
 
+    def _start_store_refresh_monitor(
+        self,
+        job_id: str,
+        monitored_job_ids: tuple[str, ...],
+        store_ids: tuple[int, ...],
+        generation: int,
+    ) -> threading.Thread:
+        requested_ids = set(store_ids)
+        terminal_statuses = {
+            "completed",
+            "partial",
+            "failed",
+            "cancelled",
+        }
+        started_at = time.monotonic()
+
+        def update(**changes: Any) -> None:
+            with self._store_jobs_lock:
+                if not self._job_update_allowed(generation):
+                    return
+                job = self._store_jobs.get(job_id)
+                if job is not None:
+                    job.update(changes)
+
+        def worker() -> None:
+            update(status="running", message="正在联合监控后台刷新任务…")
+            while True:
+                if not self._job_update_allowed(generation):
+                    return
+                with self._store_jobs_lock:
+                    monitored = [
+                        dict(self._store_jobs.get(monitored_job_id) or {})
+                        for monitored_job_id in monitored_job_ids
+                    ]
+                missing_job_ids = [
+                    monitored_job_id
+                    for monitored_job_id, job in zip(
+                        monitored_job_ids,
+                        monitored,
+                    )
+                    if not job
+                ]
+                successful_store_ids = sorted({
+                    int(store_id)
+                    for job in monitored
+                    for store_id in job.get("successful_store_ids") or ()
+                    if int(store_id) in requested_ids
+                })
+                failed_store_ids = sorted({
+                    int(store_id)
+                    for job in monitored
+                    for store_id in job.get("failed_store_ids") or ()
+                    if int(store_id) in requested_ids
+                })
+                cancelled_store_ids = sorted({
+                    int(store_id)
+                    for job in monitored
+                    if str(job.get("status") or "") == "cancelled"
+                    for store_id in job.get("store_ids") or ()
+                    if (
+                        int(store_id) in requested_ids
+                        and int(store_id) not in successful_store_ids
+                        and int(store_id) not in failed_store_ids
+                    )
+                })
+                current = len(
+                    set(successful_store_ids)
+                    | set(failed_store_ids)
+                    | set(cancelled_store_ids)
+                )
+                errors = [
+                    str(error)
+                    for job in monitored
+                    for error in job.get("errors") or ()
+                ]
+                credential_totals = {
+                    key: sum(
+                        int(job.get(key) or 0)
+                        for job in monitored
+                    )
+                    for key in (
+                        "credential_succeeded",
+                        "credential_superseded",
+                        "credential_failed",
+                        "credential_deferred",
+                    )
+                }
+                credential_actions = [
+                    dict(action)
+                    for job in monitored
+                    for action in job.get("credential_actions") or ()
+                    if int(action.get("store_id") or 0) in requested_ids
+                ]
+                settled = all(
+                    str(job.get("status") or "") in terminal_statuses
+                    for job in monitored
+                    if job
+                ) and not missing_job_ids
+                update(
+                    current=current,
+                    total=len(store_ids),
+                    succeeded=len(successful_store_ids),
+                    failed=len(failed_store_ids),
+                    cancelled=len(cancelled_store_ids),
+                    successful_store_ids=successful_store_ids,
+                    failed_store_ids=failed_store_ids,
+                    cancelled_store_ids=cancelled_store_ids,
+                    credential_actions=credential_actions,
+                    **credential_totals,
+                    message=(
+                        f"联合刷新进行中（{current}/{len(store_ids)} 家）"
+                        if not settled
+                        else "正在汇总后台刷新结果…"
+                    ),
+                )
+                if settled:
+                    break
+                time.sleep(0.1)
+
+            statuses = [
+                str(job.get("status") or "failed")
+                for job in monitored
+            ]
+            if missing_job_ids:
+                statuses.extend("failed" for _ in missing_job_ids)
+                errors.extend(
+                    f"后台刷新任务不存在：{monitored_job_id}"
+                    for monitored_job_id in missing_job_ids
+                )
+            unaccounted_store_ids = sorted(
+                requested_ids
+                - set(successful_store_ids)
+                - set(failed_store_ids)
+                - set(cancelled_store_ids)
+            )
+            all_cancelled = bool(statuses) and all(
+                status == "cancelled"
+                for status in statuses
+            )
+            if unaccounted_store_ids and not all_cancelled:
+                failed_store_ids = sorted({
+                    *failed_store_ids,
+                    *unaccounted_store_ids,
+                })
+                errors.extend(
+                    f"店铺 {store_id} 未返回刷新结果"
+                    for store_id in unaccounted_store_ids
+                )
+            if (
+                statuses
+                and all(status == "completed" for status in statuses)
+                and not failed_store_ids
+            ):
+                status = "completed"
+            elif (
+                not successful_store_ids
+                and all_cancelled
+            ):
+                status = "cancelled"
+            elif (
+                not successful_store_ids
+                and (
+                    failed_store_ids
+                    or any(
+                        status in {"failed", "cancelled"}
+                        for status in statuses
+                    )
+                )
+            ):
+                status = "failed"
+            else:
+                status = "partial"
+            update(
+                status=status,
+                current=len(
+                    set(successful_store_ids)
+                    | set(failed_store_ids)
+                    | set(cancelled_store_ids)
+                ),
+                total=len(store_ids),
+                succeeded=len(successful_store_ids),
+                failed=len(failed_store_ids),
+                cancelled=len(cancelled_store_ids),
+                successful_store_ids=successful_store_ids,
+                failed_store_ids=failed_store_ids,
+                cancelled_store_ids=cancelled_store_ids,
+                errors=errors,
+                message=(
+                    f"联合刷新结束：成功 {len(successful_store_ids)} 家，"
+                    f"失败 {len(failed_store_ids)} 家；"
+                    f"后台任务 {len(monitored_job_ids)} 个"
+                ),
+                elapsed_seconds=round(
+                    time.monotonic() - started_at,
+                    3,
+                ),
+            )
+
+        monitor_thread = threading.Thread(
+            target=worker,
+            name=f"webui-store-monitor-{job_id[:8]}",
+            daemon=True,
+        )
+        with self._store_jobs_lock:
+            self._store_refresh_workers[job_id] = monitor_thread
+        monitor_thread.start()
+        return monitor_thread
+
     def _start_store_refresh(self, payload: dict[str, Any]) -> dict[str, Any]:
         service = self._require_product_service()
         requested_ids = {
@@ -11881,29 +12258,142 @@ class NextUiController:
         ]
         if not stores:
             raise ValueError("没有可刷新的店铺")
-        self._record_store_score_baseline({store.id for store in stores})
+        store_ids = tuple(sorted(store.id for store in stores))
         job_id = uuid.uuid4().hex
         generation = self._current_generation()
         owner = self._job_owner_fields()
+        account_id = str(owner.get("account_id") or "")
+        monitor_job_id = ""
+        monitored_job_ids: tuple[str, ...] = ()
         with self._store_jobs_lock:
-            self._store_jobs[job_id] = {
-                "job_id": job_id,
-                **owner,
-                "status": "starting",
-                "current": 0,
-                "total": len(stores),
-                "succeeded": 0,
-                "failed": 0,
-                "successful_store_ids": [],
-                "failed_store_ids": [],
-                "message": "正在准备刷新店铺…",
-                "errors": [],
-                "credential_succeeded": 0,
-                "credential_superseded": 0,
-                "credential_failed": 0,
-                "credential_deferred": 0,
-                "credential_actions": [],
+            covered_store_ids: set[int] = set()
+            overlapping_job_ids: list[str] = []
+            for existing in self._store_jobs.values():
+                existing_generation = existing.get("generation")
+                if (
+                    not self._job_is_active(existing)
+                    or existing_generation is None
+                    or int(existing_generation) != generation
+                    or str(existing.get("account_id") or "") != account_id
+                ):
+                    continue
+                existing_store_ids = {
+                    int(value)
+                    for value in existing.get("store_ids") or ()
+                }
+                if existing_store_ids & set(store_ids):
+                    overlapping_job_ids.append(
+                        str(existing["job_id"])
+                    )
+                covered_store_ids.update(existing_store_ids)
+                if set(store_ids).issubset(existing_store_ids):
+                    return {
+                        "job_id": existing["job_id"],
+                        "already_running": True,
+                        "total": int(existing.get("total") or len(stores)),
+                        "store_ids": list(existing_store_ids),
+                    }
+            stores = [
+                store for store in stores
+                if store.id not in covered_store_ids
+            ]
+            monitored_job_ids = tuple(
+                dict.fromkeys(overlapping_job_ids)
+            )
+            if not stores:
+                monitor_job_id = job_id
+                self._store_jobs[job_id] = {
+                    "job_id": job_id,
+                    **owner,
+                    "store_ids": store_ids,
+                    "worker_count": len(monitored_job_ids),
+                    "status": "starting",
+                    "current": 0,
+                    "total": len(store_ids),
+                    "succeeded": 0,
+                    "failed": 0,
+                    "successful_store_ids": [],
+                    "failed_store_ids": [],
+                    "message": "正在准备联合监控后台刷新任务…",
+                    "errors": [],
+                    "credential_succeeded": 0,
+                    "credential_superseded": 0,
+                    "credential_failed": 0,
+                    "credential_deferred": 0,
+                    "credential_actions": [],
+                    "aggregate": True,
+                    "monitored_job_ids": list(monitored_job_ids),
+                }
+            else:
+                if monitored_job_ids:
+                    monitor_job_id = uuid.uuid4().hex
+                    self._store_jobs[monitor_job_id] = {
+                        "job_id": monitor_job_id,
+                        **owner,
+                        "store_ids": store_ids,
+                        "worker_count": len(monitored_job_ids) + 1,
+                        "status": "starting",
+                        "current": 0,
+                        "total": len(store_ids),
+                        "succeeded": 0,
+                        "failed": 0,
+                        "successful_store_ids": [],
+                        "failed_store_ids": [],
+                        "message": "正在准备联合监控后台刷新任务…",
+                        "errors": [],
+                        "credential_succeeded": 0,
+                        "credential_superseded": 0,
+                        "credential_failed": 0,
+                        "credential_deferred": 0,
+                        "credential_actions": [],
+                        "aggregate": True,
+                        "monitored_job_ids": list(monitored_job_ids),
+                    }
+            if stores:
+                refresh_store_ids = tuple(
+                    sorted(store.id for store in stores)
+                )
+                workers = max(1, min(8, len(stores)))
+                self._store_jobs[job_id] = {
+                    "job_id": job_id,
+                    **owner,
+                    "store_ids": refresh_store_ids,
+                    "worker_count": workers,
+                    "status": "starting",
+                    "current": 0,
+                    "total": len(stores),
+                    "succeeded": 0,
+                    "failed": 0,
+                    "successful_store_ids": [],
+                    "failed_store_ids": [],
+                    "message": "正在准备刷新店铺…",
+                    "errors": [],
+                    "credential_succeeded": 0,
+                    "credential_superseded": 0,
+                    "credential_failed": 0,
+                    "credential_deferred": 0,
+                    "credential_actions": [],
+                }
+                if monitor_job_id and monitor_job_id != job_id:
+                    self._store_jobs[monitor_job_id][
+                        "monitored_job_ids"
+                    ].append(job_id)
+        if not stores:
+            self._start_store_refresh_monitor(
+                monitor_job_id,
+                monitored_job_ids,
+                store_ids,
+                generation,
+            )
+            return {
+                "job_id": monitor_job_id,
+                "already_running": True,
+                "total": len(store_ids),
+                "store_ids": list(store_ids),
+                "monitored_job_ids": list(monitored_job_ids),
             }
+        self._record_store_score_baseline({store.id for store in stores})
+        started_at = time.monotonic()
 
         def update(**changes: Any) -> None:
             with self._store_jobs_lock:
@@ -11925,7 +12415,6 @@ class NextUiController:
             credential_failed = 0
             credential_deferred = 0
             credential_actions: list[dict[str, Any]] = []
-            workers = max(1, min(6, len(stores)))
             with ThreadPoolExecutor(
                 max_workers=workers,
                 thread_name_prefix="webui-store-refresh-progress",
@@ -12031,6 +12520,7 @@ class NextUiController:
                     )
                 ),
                 errors=errors,
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
             )
 
         refresh_thread = threading.Thread(
@@ -12041,7 +12531,33 @@ class NextUiController:
         with self._store_jobs_lock:
             self._store_refresh_workers[job_id] = refresh_thread
         refresh_thread.start()
-        return {"job_id": job_id}
+        if monitor_job_id:
+            with self._store_jobs_lock:
+                monitor_children = tuple(
+                    self._store_jobs[monitor_job_id].get(
+                        "monitored_job_ids"
+                    )
+                    or ()
+                )
+            self._start_store_refresh_monitor(
+                monitor_job_id,
+                monitor_children,
+                store_ids,
+                generation,
+            )
+            return {
+                "job_id": monitor_job_id,
+                "already_running": True,
+                "total": len(store_ids),
+                "store_ids": list(store_ids),
+                "monitored_job_ids": list(monitor_children),
+            }
+        return {
+            "job_id": job_id,
+            "already_running": False,
+            "total": len(stores),
+            "store_ids": list(store_ids),
+        }
 
     def wait_for_store_refresh(
         self,
@@ -12061,7 +12577,12 @@ class NextUiController:
             job = self._store_jobs.get(job_id)
             if job is None:
                 raise ValueError("店铺刷新任务不存在")
-            return dict(job)
+            self._require_job_owner(job, "店铺刷新任务")
+            return {
+                key: value
+                for key, value in job.items()
+                if not key.startswith("_")
+            }
 
     def _wait_refresh_job(
         self,
@@ -16344,8 +16865,19 @@ class NextUiController:
                         for value in (mapped.get("desc_info") or {}).get("imgs") or []
                         if str(value).strip()
                     ]
-                    if not head_images:
+                    source_head_count = int(
+                        (
+                            mapped.get("_source_image_counts")
+                            or {}
+                        ).get("head")
+                        or 0
+                    )
+                    if not head_images and not source_head_count:
                         issues.append("老版映射后仍无商品主图")
+                    elif not head_images:
+                        warnings.append(
+                            "主图处理规则已移除全部来源主图，上传时将使用店铺默认主图回退"
+                        )
                     elif len(head_images) < 3:
                         warnings.append(
                             f"主图仅 {len(head_images)} 张，上传时将尝试使用店铺默认主图补足"

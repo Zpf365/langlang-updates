@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class UploadPreflightError(ValueError):
+    """A local preflight failure detected before the product was submitted."""
+
+
 @dataclass
 class ProductQueryResult:
     store_ids: list[int] = field(default_factory=list)

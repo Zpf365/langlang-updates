@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -23,6 +24,7 @@ from .models import (
     ShippingTemplate,
     Store,
     SyncResult,
+    UploadPreflightError,
     is_unclaimed_gift_order,
     order_counts_as_transaction,
     product_matches_tab,
@@ -69,6 +71,36 @@ AFTER_SALE_FULL_SYNC_DAYS = 30
 UPLOAD_CATEGORY_CACHE_SCHEMA = 1
 UPLOAD_CATEGORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 UPLOAD_CATEGORY_REFRESH_COOLDOWN_SECONDS = 60 * 60
+EXTERNAL_MARKETING_ATTRIBUTE_TOKENS = frozenset(
+    {
+        "是否外贸",
+        "是否为外贸",
+        "外贸",
+        "是否跨境出口",
+        "是否跨境出口专供货源",
+        "跨境出口",
+        "跨境出口专供货源",
+        "主要下游平台",
+        "下游平台",
+        "主要上下游平台",
+        "上下游平台",
+        "主要上下游品牌",
+        "上下游品牌",
+        "主要销售平台",
+        "销售平台",
+        "来源平台",
+        "主要销售地区",
+        "销售地区",
+        "主要销售区域",
+        "销售区域",
+        "主要销售市场",
+        "销售市场",
+        "销售国家",
+        "目标市场",
+        "目标地区",
+        "目标国家",
+    }
+)
 
 
 def _gift_exclusion_for_period(
@@ -270,6 +302,68 @@ def _refund_order_counts_for_periods(
         },
     }
     return counts, metadata
+
+
+def _refund_amounts_for_periods(
+    after_sale_rows: list[dict[str, Any]],
+    ranges: dict[str, tuple[int, int]],
+) -> dict[str, int | None]:
+    """Sum completed official refund amounts by completion date.
+
+    The account overview sometimes reports a zero refund amount for a day
+    while its completed after-sale feed contains real refunds. The store page
+    must prefer the dated official detail rather than present a false zero.
+    """
+    totals = {period: 0 for period in ranges}
+    completed_statuses = {
+        "MERCHANT_REFUND_SUCCESS",
+        "MERCHANT_RETURN_SUCCESS",
+    }
+    for row in after_sale_rows:
+        if not _after_sale_counts_as_refund_request(row):
+            continue
+        status_name = str(row.get("status") or "").strip().upper()
+        if status_name not in completed_statuses:
+            continue
+        try:
+            raw = json.loads(row.get("raw_json") or "{}")
+        except (TypeError, ValueError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        refund_raw = raw.get("refund_info")
+        refund_info = refund_raw if isinstance(refund_raw, dict) else {}
+        event_time = 0
+        for candidate in (
+            raw.get("complete_time"),
+            refund_info.get("refund_time"),
+            row.get("update_time"),
+        ):
+            try:
+                event_time = int(candidate or 0)
+            except (TypeError, ValueError):
+                event_time = 0
+            if event_time > 0:
+                break
+        if event_time <= 0:
+            continue
+        try:
+            amount = int(
+                row.get("refund_amount")
+                or refund_info.get("amount")
+                or 0
+            )
+        except (TypeError, ValueError):
+            amount = 0
+        if amount <= 0:
+            continue
+        for period, (start_ts, end_ts) in ranges.items():
+            if start_ts <= event_time < end_ts:
+                totals[period] += amount
+    return {
+        period: value if after_sale_rows else None
+        for period, value in totals.items()
+    }
 
 
 def _discount_price_cents(
@@ -2042,19 +2136,113 @@ class SyncService:
         }
         return f"{defaults.get(unit.lower(), '1')} {unit}".strip()
 
+    @staticmethod
+    def _attribute_key_token(value: Any) -> str:
+        normalized = unicodedata.normalize(
+            "NFKC",
+            str(value or ""),
+        ).casefold()
+        return re.sub(
+            r"[\s\-_—:：/\\|（）()\[\]【】.,，。·]+",
+            "",
+            normalized,
+        )
+
+    @classmethod
+    def _is_external_marketing_attribute(cls, key: Any) -> bool:
+        token = cls._attribute_key_token(key)
+        if not token:
+            return False
+        if token in EXTERNAL_MARKETING_ATTRIBUTE_TOKENS:
+            return True
+        if "外贸" in token or "跨境出口" in token:
+            return True
+        if (
+            ("下游" in token or "上下游" in token)
+            and ("平台" in token or "品牌" in token)
+        ):
+            return True
+        if "第三方" in token and "平台" in token:
+            return True
+        return any(
+            marker in token
+            for marker in (
+                "销售地区",
+                "销售区域",
+                "销售市场",
+                "销售国家",
+            )
+        )
+
+    @classmethod
+    def _filter_external_marketing_attributes(
+        cls,
+        attrs: list[dict[str, Any]],
+        *,
+        required_keys: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        required = required_keys or set()
+        return [
+            item
+            for item in attrs
+            if (
+                cls._attribute_key_token(item.get("attr_key"))
+                in required
+                or not cls._is_external_marketing_attribute(
+                    item.get("attr_key")
+                )
+            )
+        ]
+
+    @classmethod
+    def _sanitize_attributes_without_rule(
+        cls,
+        attrs: Any,
+        brand_id: str,
+    ) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        existing: dict[str, dict[str, Any]] = {}
+        brand_token = cls._attribute_key_token("品牌")
+        for item in attrs or []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("attr_key") or "").strip()
+            token = cls._attribute_key_token(key)
+            if not token:
+                continue
+            if brand_id and token == brand_token:
+                continue
+            if cls._is_external_marketing_attribute(key):
+                continue
+            current = existing.get(token)
+            if current is not None:
+                current["attr_value"] = item.get("attr_value")
+                continue
+            normalized = {
+                "attr_key": key,
+                "attr_value": item.get("attr_value"),
+            }
+            output.append(normalized)
+            existing[token] = normalized
+        return output
+
     def _apply_required_category_attributes(
         self,
         store: Store,
         client: WechatShopClient,
         payload: dict[str, Any],
     ) -> None:
-        category_id = self._category_leaf_id(payload)
-        if not category_id:
-            return
         brand_id = str(
             payload.get("brand_id") or "2100000000"
         ).strip()
         payload["brand_id"] = brand_id
+        category_id = self._category_leaf_id(payload)
+        if not category_id:
+            payload["attrs"] = self._sanitize_attributes_without_rule(
+                payload.get("attrs"),
+                brand_id,
+            )
+            return
         cache_key = (store.id, category_id, brand_id)
         rule = self._category_rule_cache.get(cache_key)
         if rule is None:
@@ -2064,38 +2252,52 @@ class SyncService:
                 None,
             )
             if not callable(fetch_rule):
+                payload["attrs"] = self._sanitize_attributes_without_rule(
+                    payload.get("attrs"),
+                    brand_id,
+                )
                 return
             try:
                 rule = fetch_rule(category_id, brand_id=brand_id)
             except Exception:
+                payload["attrs"] = self._sanitize_attributes_without_rule(
+                    payload.get("attrs"),
+                    brand_id,
+                )
                 return
             self._category_rule_cache[cache_key] = rule
         attrs = payload.get("attrs")
         attrs = list(attrs) if isinstance(attrs, list) else []
         normalized_attrs: list[dict[str, Any]] = []
         existing: dict[str, dict[str, Any]] = {}
+        brand_token = self._attribute_key_token("品牌")
         for item in attrs:
             if not isinstance(item, dict):
                 continue
             key = str(item.get("attr_key") or "").strip()
             if not key:
                 continue
+            key_token = self._attribute_key_token(key)
+            if not key_token:
+                continue
             # brand_id is the official brand field. Keeping a second "品牌"
             # attribute makes WeChat reject product/add with 6600044.
-            if key == "品牌" and brand_id:
+            if key_token == brand_token and brand_id:
                 continue
             normalized = {
                 "attr_key": key,
                 "attr_value": item.get("attr_value"),
             }
-            current = existing.get(key)
+            current = existing.get(key_token)
             if current is not None:
-                current.update(normalized)
+                current["attr_value"] = normalized["attr_value"]
                 continue
             normalized_attrs.append(normalized)
-            existing[key] = normalized
+            existing[key_token] = normalized
         attrs = normalized_attrs
         category_name = str((rule.get("info") or {}).get("name") or "")
+        allowed_attributes: dict[str, dict[str, Any]] = {}
+        required_attribute_keys: set[str] = set()
         for attribute in rule.get("product_attr_list") or []:
             if not isinstance(attribute, dict):
                 continue
@@ -2110,16 +2312,35 @@ class SyncService:
             )
             if not name:
                 continue
-            if name == "品牌" and brand_id:
+            name_token = self._attribute_key_token(name)
+            if not name_token:
                 continue
-            current = existing.get(name)
+            allowed_attributes[name_token] = attribute
+            if is_required:
+                required_attribute_keys.add(name_token)
+            if name_token == brand_token and brand_id:
+                continue
+            current = existing.get(name_token)
             if current is not None:
-                current["attr_value"] = self._normalize_attribute_value(
+                current["attr_key"] = name
+                normalized_value = self._normalize_attribute_value(
                     attribute,
                     current.get("attr_value"),
                     payload,
                     category_name,
                 )
+                if is_required and not normalized_value:
+                    normalized_value = self._required_attribute_value(
+                        attribute,
+                        payload,
+                        category_name,
+                    )
+                if is_required and not normalized_value:
+                    raise UploadPreflightError(
+                        f"{store.name} 指定类目必填属性无法自动补全："
+                        f"{name}"
+                    )
+                current["attr_value"] = normalized_value
                 continue
             if not is_required:
                 continue
@@ -2129,9 +2350,28 @@ class SyncService:
                 category_name,
             )
             if not value:
-                continue
-            attrs.append({"attr_key": name, "attr_value": value})
-            existing[name] = attrs[-1]
+                raise UploadPreflightError(
+                    f"{store.name} 指定类目必填属性无法自动补全："
+                    f"{name}"
+                )
+            normalized = {"attr_key": name, "attr_value": value}
+            attrs.append(normalized)
+            existing[name_token] = normalized
+        if allowed_attributes:
+            attrs = [
+                item
+                for item in attrs
+                if self._attribute_key_token(item.get("attr_key"))
+                in allowed_attributes
+            ]
+            existing = {
+                self._attribute_key_token(item.get("attr_key")): item
+                for item in attrs
+            }
+        attrs = self._filter_external_marketing_attributes(
+            attrs,
+            required_keys=required_attribute_keys,
+        )
         payload["attrs"] = attrs
 
     def _prepare_product_payload(
@@ -3309,9 +3549,9 @@ class SyncService:
             ),
             "warn": 0,
             "violation": 0,
-            "cash": 0,
-            "frozen": 0,
-            "settle": 0,
+            "cash": None,
+            "frozen": None,
+            "settle": None,
             "deposit": None,
             "dsr": None,
             "score_product": None,
@@ -3330,6 +3570,18 @@ class SyncService:
             "recommend_exposure_people": None,
             "recommend_exposure_yesterday_people": None,
             "recommend_exposure_7d_people": None,
+            "product_exposure_today": None,
+            "product_exposure_yesterday": None,
+            "product_exposure_7d": None,
+            "product_exposure_count_today": None,
+            "product_exposure_count_yesterday": None,
+            "product_exposure_count_7d": None,
+            "product_click_people_today": None,
+            "product_click_people_yesterday": None,
+            "product_click_people_7d": None,
+            "product_click_count_today": None,
+            "product_click_count_yesterday": None,
+            "product_click_count_7d": None,
             "search_exposure_yesterday": None,
             "today_success": 0,
             "stats_at": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -3357,7 +3609,6 @@ class SyncService:
         deposit_error = ""
         deposit_status = "failed"
         deposit_updated_at = ""
-        private_account_ok = False
         private_client: ShopPrivateClient | None = None
         exposure_attempt_status = {
             "today": "failed",
@@ -3374,6 +3625,8 @@ class SyncService:
             "yesterday": "failed",
             "seven_days": "failed",
         }
+        exposure_period_sources: dict[str, str] = {}
+        exposure_period_updated_at: dict[str, str] = {}
         exposure_updated_at = ""
         exposure_error = ""
         online_product_status = "failed"
@@ -3388,6 +3641,7 @@ class SyncService:
         }
         sales_period_sources: dict[str, str] = {}
         sales_updated_at = ""
+        sales_period_updated_at: dict[str, str] = {}
         sales_error = ""
         sales_is_stale = False
         refund_attempt_status = {
@@ -3400,7 +3654,17 @@ class SyncService:
         official_refund_order_counts: dict[str, int] = {}
         official_refund_order_sources: dict[str, str] = {}
         refund_updated_at = ""
+        refund_period_updated_at: dict[str, str] = {}
         refund_error = ""
+        fund_attempt_status = {
+            "cash": "failed",
+            "frozen": "failed",
+            "settle": "failed",
+        }
+        fund_period_updated_at: dict[str, str] = {}
+        fund_updated_at = ""
+        fund_source = ""
+        fund_error = ""
         sales_period_fields = {
             "today": (
                 ("gmv_today", "pay_gmv"),
@@ -3442,6 +3706,24 @@ class SyncService:
         )
         if not isinstance(previous_refund_sources, dict):
             previous_refund_sources = {}
+        previous_exposure_sources = existing_metrics.get(
+            "_exposure_period_sources"
+        )
+        if not isinstance(previous_exposure_sources, dict):
+            previous_exposure_sources = {}
+        previous_exposure_period_updated_at = existing_metrics.get(
+            "_exposure_period_updated_at"
+        )
+        if not isinstance(previous_exposure_period_updated_at, dict):
+            previous_exposure_period_updated_at = {}
+        previous_fund_updated_at = str(
+            existing_metrics.get("_fund_updated_at") or ""
+        )
+        previous_fund_period_updated_at = existing_metrics.get(
+            "_fund_period_updated_at"
+        )
+        if not isinstance(previous_fund_period_updated_at, dict):
+            previous_fund_period_updated_at = {}
         sales_cache_snapshot_date = str(
             existing_metrics.get("_sales_snapshot_date") or ""
         )
@@ -3456,6 +3738,101 @@ class SyncService:
                 return int(float(value))
             except (TypeError, ValueError):
                 return None
+
+        def metric_date(value: Any) -> str:
+            text = str(value or "").strip()
+            if (
+                len(text) >= 10
+                and text[4] == "-"
+                and text[7] == "-"
+            ):
+                return text[:10]
+            return ""
+
+        def apply_fund_values(
+            values: dict[str, Any],
+            source: str,
+        ) -> int:
+            nonlocal fund_updated_at
+            nonlocal fund_source
+            found = 0
+            for field in ("cash", "frozen", "settle"):
+                value = optional_sales_int(values.get(field))
+                if value is None:
+                    continue
+                metrics[field] = value
+                fund_attempt_status[field] = "updated"
+                fund_period_updated_at[field] = now.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                found += 1
+            if found:
+                fund_source = source
+                fund_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+            return found
+
+        def preserve_exposure_period(
+            period: str,
+            failure_message: str,
+        ) -> bool:
+            nonlocal exposure_error
+            source = str(previous_exposure_sources.get(period) or "")
+            metric_keys = {
+                "today": (
+                    "product_exposure_today",
+                    "product_exposure_count_today",
+                    "product_click_people_today",
+                    "product_click_count_today",
+                ),
+                "yesterday": (
+                    "product_exposure_yesterday",
+                    "product_exposure_count_yesterday",
+                    "product_click_people_yesterday",
+                    "product_click_count_yesterday",
+                ),
+                "seven_days": (
+                    "product_exposure_7d",
+                    "product_exposure_count_7d",
+                    "product_click_people_7d",
+                    "product_click_count_7d",
+                ),
+            }[period]
+            previous_values = {
+                key: optional_sales_int(existing_metrics.get(key))
+                for key in metric_keys
+            }
+            if not source or not any(
+                value is not None for value in previous_values.values()
+            ):
+                return False
+            for key, value in previous_values.items():
+                metrics[key] = value
+            exposure_attempt_status[period] = "stale"
+            exposure_count_attempt_status[period] = (
+                "stale"
+                if previous_values[metric_keys[1]] is not None
+                else "missing"
+            )
+            exposure_people_attempt_status[period] = (
+                "stale"
+                if previous_values[metric_keys[0]] is not None
+                else "missing"
+            )
+            exposure_period_sources[period] = source
+            prior_time = str(
+                previous_exposure_period_updated_at.get(period)
+                or existing_metrics.get("_exposure_updated_at")
+                or ""
+            )
+            if prior_time:
+                exposure_period_updated_at[period] = prior_time
+            if failure_message:
+                exposure_error = (
+                    f"{exposure_error}；{failure_message}"[:500]
+                    if exposure_error
+                    else failure_message[:500]
+                )
+            return True
 
         def apply_official_sales(
             period: str,
@@ -3473,17 +3850,6 @@ class SyncService:
             for metric_key, source_key in sales_period_fields[period]:
                 value = optional_sales_int(values.get(source_key))
                 if value is not None:
-                    gift = gift_exclusions[period]
-                    if source_key == "pay_gmv":
-                        available = int(gift["deducted_amount"])
-                        applied = min(max(0, value), available)
-                        value = max(0, value - available)
-                        gift["applied_amount"] = applied
-                    elif source_key == "pay_order_cnt":
-                        available = int(gift["deducted_orders"])
-                        applied = min(max(0, value), available)
-                        value = max(0, value - available)
-                        gift["applied_orders"] = applied
                     metrics[metric_key] = value
                     found += 1
                     continue
@@ -3510,6 +3876,7 @@ class SyncService:
             if found:
                 sales_period_sources[period] = source
                 sales_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+                sales_period_updated_at[period] = sales_updated_at
             elif (
                 previous_sales_sources.get(period)
                 and sales_cache_is_current_day
@@ -3517,6 +3884,15 @@ class SyncService:
                 sales_period_sources[period] = str(
                     previous_sales_sources[period]
                 )
+                previous_period_updated_at = existing_metrics.get(
+                    "_sales_period_updated_at"
+                )
+                if isinstance(previous_period_updated_at, dict):
+                    prior_time = str(
+                        previous_period_updated_at.get(period) or ""
+                    )
+                    if prior_time:
+                        sales_period_updated_at[period] = prior_time
             refund_metric_key, refund_source_key = refund_period_fields[
                 period
             ]
@@ -3530,7 +3906,11 @@ class SyncService:
                 refund_updated_at = now.strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
-            elif previous_refund_sources.get(period):
+                refund_period_updated_at[period] = refund_updated_at
+            elif (
+                previous_refund_sources.get(period)
+                and sales_cache_is_current_day
+            ):
                 previous_refund = optional_sales_int(
                     existing_metrics.get(refund_metric_key)
                 )
@@ -3540,6 +3920,19 @@ class SyncService:
                         previous_refund_sources[period]
                     )
                     refund_attempt_status[period] = "stale"
+                    previous_period_updated_at = existing_metrics.get(
+                        "_refund_period_updated_at"
+                    )
+                    if isinstance(previous_period_updated_at, dict):
+                        prior_time = str(
+                            previous_period_updated_at.get(period) or ""
+                        )
+                    else:
+                        prior_time = str(
+                            existing_metrics.get("_refund_updated_at") or ""
+                        )
+                    if prior_time:
+                        refund_period_updated_at[period] = prior_time
             else:
                 refund_attempt_status[period] = (
                     "failed" if error else "missing"
@@ -3627,12 +4020,9 @@ class SyncService:
                         period_values,
                         source,
                     )
-            for period, gift in gift_exclusions.items():
-                if (
-                    gift["applied_amount"] > 0
-                    or gift["applied_orders"] > 0
-                ) and sales_period_sources.get(period):
-                    sales_period_sources[period] += " - 未领取礼物"
+            for gift in gift_exclusions.values():
+                gift["applied_amount"] = 0
+                gift["applied_orders"] = 0
             today_click = int(float(realtime.get("product_click_uv") or 0))
             today_refund = int(float(realtime.get("pay_refund_gmv") or 0))
             metrics.update(
@@ -3658,8 +4048,26 @@ class SyncService:
                 score_attempt_status[key] = "updated"
                 score_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
             metrics.update(private.evaluation_overview())
-            metrics.update(private.account_balance())
-            private_account_ok = True
+            try:
+                balance_values = private.account_balance()
+            except Exception as exc:
+                fund_error = f"资金账户：{exc}"[:500]
+                errors.append(fund_error)
+                for field in fund_attempt_status:
+                    fund_attempt_status[field] = "failed"
+            else:
+                if not isinstance(balance_values, dict):
+                    balance_values = {}
+                found = apply_fund_values(
+                    balance_values,
+                    "微信小店资金账户 getGeneralAccountBalance",
+                )
+                if not found:
+                    fund_error = (
+                        "资金账户未返回可提现、冻结或待结算余额"
+                    )
+                    for field in fund_attempt_status:
+                        fund_attempt_status[field] = "missing"
             try:
                 deposit_value = private.deposit_balance()
             except Exception as exc:
@@ -3679,21 +4087,21 @@ class SyncService:
                     "recommend_exposure",
                     "recommend_exposure_count",
                     "recommend_exposure_people",
-                    lambda: private.recommend_overview(False),
+                    lambda: private.product_overview(realtime=True),
                 ),
                 (
                     "yesterday",
                     "recommend_exposure_yesterday",
                     "recommend_exposure_yesterday_count",
                     "recommend_exposure_yesterday_people",
-                    lambda: private.recommend_overview(True),
+                    lambda: private.product_overview(days=1, offset_days=1),
                 ),
                 (
                     "seven_days",
                     "recommend_exposure_7d",
                     "recommend_exposure_7d_count",
                     "recommend_exposure_7d_people",
-                    lambda: private.recommend_overview(days=7),
+                    lambda: private.product_overview(days=7, offset_days=1),
                 ),
             )
             for (
@@ -3707,13 +4115,61 @@ class SyncService:
                     overview = loader()
                 except Exception as exc:
                     errors.append(f"商品曝光（{exposure_key}）：{exc}")
-                    exposure_error = str(exc)
-                    exposure_count_attempt_status[exposure_key] = "failed"
-                    exposure_people_attempt_status[exposure_key] = "failed"
+                    if not preserve_exposure_period(
+                        exposure_key,
+                        f"商品曝光（{exposure_key}）：{exc}",
+                    ):
+                        exposure_error = str(exc)
+                        exposure_count_attempt_status[exposure_key] = "failed"
+                        exposure_people_attempt_status[exposure_key] = "failed"
                     continue
                 exposure = overview.get("exposure")
                 exposure_count = overview.get("exposure_count")
                 exposure_people = overview.get("exposure_people")
+                product_count = optional_sales_int(
+                    overview.get("product_view_cnt")
+                )
+                product_people = optional_sales_int(
+                    overview.get("product_view_uv")
+                )
+                product_exposure_key = {
+                    "today": "product_exposure_today",
+                    "yesterday": "product_exposure_yesterday",
+                    "seven_days": "product_exposure_7d",
+                }[exposure_key]
+                product_exposure_count_key = {
+                    "today": "product_exposure_count_today",
+                    "yesterday": "product_exposure_count_yesterday",
+                    "seven_days": "product_exposure_count_7d",
+                }[exposure_key]
+                metrics[product_exposure_key] = product_people
+                metrics[product_exposure_count_key] = product_count
+                click_people = optional_sales_int(
+                    overview.get("product_click_uv")
+                )
+                click_count = optional_sales_int(
+                    overview.get("product_click_cnt")
+                )
+                click_people_key = {
+                    "today": "product_click_people_today",
+                    "yesterday": "product_click_people_yesterday",
+                    "seven_days": "product_click_people_7d",
+                }[exposure_key]
+                click_count_key = {
+                    "today": "product_click_count_today",
+                    "yesterday": "product_click_count_yesterday",
+                    "seven_days": "product_click_count_7d",
+                }[exposure_key]
+                metrics[click_people_key] = click_people
+                metrics[click_count_key] = click_count
+                if product_count is not None or product_people is not None:
+                    exposure_count = product_count
+                    exposure_people = product_people
+                    exposure = (
+                        product_people
+                        if product_people is not None
+                        else product_count
+                    )
                 if (
                     exposure_count is None
                     and exposure_people is None
@@ -3751,8 +4207,18 @@ class SyncService:
                         else "partial"
                     )
                     exposure_updated_at = now.strftime("%Y-%m-%d %H:%M:%S")
+                    exposure_period_updated_at[exposure_key] = (
+                        exposure_updated_at
+                    )
+                    exposure_period_sources[exposure_key] = (
+                        "微信小店店铺数据·商品数据·商品转化"
+                    )
                 else:
-                    exposure_attempt_status[exposure_key] = "missing"
+                    if not preserve_exposure_period(
+                        exposure_key,
+                        f"商品曝光（{exposure_key}）：Compass 未返回商品曝光人数",
+                    ):
+                        exposure_attempt_status[exposure_key] = "missing"
             search = private.search_overview(30)
             metrics["search_exposure_yesterday"] = search["search_exposure_yesterday"]
             try:
@@ -3790,13 +4256,43 @@ class SyncService:
                     )
                 elif count_errors:
                     online_product_error = "；".join(count_errors)
-                if not private_account_ok:
+                if any(
+                    status != "updated"
+                    for status in fund_attempt_status.values()
+                ):
                     balance = client.fetch_fund_balance()
-                    metrics["cash"] = int(float(balance.get("available_amount") or 0))
-                    metrics["settle"] = int(float(balance.get("pending_amount") or 0))
+                    if not isinstance(balance, dict):
+                        balance = {}
+                    raw_data = balance.get("data")
+                    if isinstance(raw_data, dict):
+                        balance = raw_data
+                    found = apply_fund_values(
+                        {
+                            "cash": balance.get(
+                                "available_amount",
+                                balance.get("cash"),
+                            ),
+                            "frozen": balance.get(
+                                "frozen_amount",
+                                balance.get("frozen"),
+                            ),
+                            "settle": balance.get(
+                                "pending_amount",
+                                balance.get("settle"),
+                            ),
+                        },
+                        "微信开放平台资金余额接口",
+                    )
+                    if not found and not fund_error:
+                        fund_error = "资金余额接口未返回真实余额"
         except Exception as exc:
-            errors.append(f"资金余额：{exc}")
+            errors.append(f"商品与资金余额：{exc}")
             online_product_error = str(exc)
+            if not fund_error:
+                fund_error = f"资金余额：{exc}"[:500]
+            for field, status in fund_attempt_status.items():
+                if status != "updated":
+                    fund_attempt_status[field] = "failed"
         if online_product_status != "updated" and private_client is not None:
             try:
                 private_counts = private_client.status_counts()
@@ -3817,6 +4313,48 @@ class SyncService:
                     online_product_updated_at = now.strftime(
                         "%Y-%m-%d %H:%M:%S"
                     )
+        if online_product_status != "updated":
+            previous_online_source = str(
+                existing_metrics.get("_online_product_source") or ""
+            )
+            previous_online = optional_sales_int(
+                existing_metrics.get("in_sale")
+            )
+            if previous_online_source and previous_online is not None:
+                metrics["in_sale"] = previous_online
+                online_product_status = "stale"
+                online_product_source = previous_online_source
+                online_product_updated_at = str(
+                    existing_metrics.get("_online_product_updated_at") or ""
+                )
+            elif not online_product_error:
+                online_product_error = "在线商品数未返回真实值"
+        for field in ("cash", "frozen", "settle"):
+            if fund_attempt_status[field] == "updated":
+                continue
+            previous_fund = optional_sales_int(
+                existing_metrics.get(field)
+            )
+            previous_fund_source = str(
+                existing_metrics.get("_fund_source") or ""
+            )
+            if previous_fund is not None and previous_fund_source:
+                metrics[field] = previous_fund
+                fund_attempt_status[field] = "stale"
+                prior_time = str(
+                    previous_fund_period_updated_at.get(field)
+                    or previous_fund_updated_at
+                    or ""
+                )
+                if prior_time:
+                    fund_period_updated_at[field] = prior_time
+                fund_source = fund_source or previous_fund_source
+                fund_updated_at = fund_updated_at or prior_time
+        if not fund_error and any(
+            status != "updated"
+            for status in fund_attempt_status.values()
+        ):
+            fund_error = "资金账户部分余额未知，已保留最后可信值"
         if quota_error:
             errors.append(f"提审额度：{quota_error}")
         for key in score_fields:
@@ -3881,15 +4419,31 @@ class SyncService:
         metrics["_exposure_people_attempt_status"] = (
             exposure_people_attempt_status
         )
-        metrics["_exposure_updated_at"] = exposure_updated_at
+        metrics["_exposure_updated_at"] = (
+            exposure_updated_at
+            or str(existing_metrics.get("_exposure_updated_at") or "")
+        )
         metrics["_exposure_error"] = exposure_error[:500]
+        metrics["_exposure_period_sources"] = exposure_period_sources
+        metrics["_exposure_period_updated_at"] = (
+            exposure_period_updated_at
+        )
         metrics["_exposure_source"] = (
-            "微信小店 getShopRecommendProductsStat（today/yesterday/7d）"
+            "；".join(dict.fromkeys(exposure_period_sources.values()))
+            or str(existing_metrics.get("_exposure_source") or "")
         )
         metrics["_online_product_attempt_status"] = online_product_status
         metrics["_online_product_updated_at"] = online_product_updated_at
         metrics["_online_product_error"] = online_product_error[:500]
         metrics["_online_product_source"] = online_product_source
+        metrics["_fund_attempt_status"] = fund_attempt_status
+        metrics["_fund_period_updated_at"] = fund_period_updated_at
+        metrics["_fund_updated_at"] = (
+            fund_updated_at
+            or str(existing_metrics.get("_fund_updated_at") or "")
+        )
+        metrics["_fund_error"] = fund_error[:500]
+        metrics["_fund_source"] = fund_source
         metrics["_cache_store_id"] = int(store.id)
         metrics["_cache_store_app_id"] = str(store.app_id)
         metrics["_cache_schema_version"] = 2
@@ -3934,6 +4488,15 @@ class SyncService:
                 period,
                 str(previous_sales_sources[period]),
             )
+            previous_period_updated_at = existing_metrics.get(
+                "_sales_period_updated_at"
+            )
+            if isinstance(previous_period_updated_at, dict):
+                prior_time = str(
+                    previous_period_updated_at.get(period) or ""
+                )
+                if prior_time:
+                    sales_period_updated_at.setdefault(period, prior_time)
             sales_is_stale = True
         if metrics.get("buyers_30d") is not None:
             metrics["buyer_30d"] = int(metrics["buyers_30d"])
@@ -3946,6 +4509,7 @@ class SyncService:
         )
         metrics["_sales_attempt_status"] = sales_attempt_status
         metrics["_sales_period_sources"] = sales_period_sources
+        metrics["_sales_period_updated_at"] = sales_period_updated_at
         metrics["_sales_source"] = (
             "；".join(source_values)
             if source_values
@@ -3959,9 +4523,17 @@ class SyncService:
         metrics["_sales_is_stale"] = bool(
             sales_is_stale or not source_values
         )
-        metrics["_sales_snapshot_date"] = today.isoformat()
+        if sales_period_updated_at or sales_cache_is_current_day:
+            sales_snapshot_date = today.isoformat()
+        else:
+            sales_snapshot_date = (
+                sales_cache_snapshot_date
+                or metric_date(existing_metrics.get("_sales_updated_at"))
+            )
+        metrics["_sales_snapshot_date"] = sales_snapshot_date
         metrics["_refund_attempt_status"] = refund_attempt_status
         metrics["_refund_period_sources"] = refund_period_sources
+        metrics["_refund_period_updated_at"] = refund_period_updated_at
         metrics["_refund_updated_at"] = (
             refund_updated_at
             or str(existing_metrics.get("_refund_updated_at") or "")
@@ -3999,9 +4571,34 @@ class SyncService:
                 and after_sale_coverage_start_ts <= start_ts
                 and after_sale_coverage_end_ts >= required_end_ts
             )
+        refund_amounts_from_details = _refund_amounts_for_periods(
+            after_sale_rows,
+            period_ranges,
+        )
 
         for period in period_ranges:
             amount = metrics.get(refund_count_fields[period])
+            detail_amount = refund_amounts_from_details.get(period)
+            if (
+                refund_coverage_complete[period]
+                and detail_amount is not None
+                and int(detail_amount) > 0
+                and (
+                    amount is None
+                    or int(amount) == 0
+                )
+            ):
+                amount = int(detail_amount)
+                metrics[refund_count_fields[period]] = amount
+                refund_attempt_status[period] = "updated"
+                refund_period_sources[period] = (
+                    "微信小店官方售后完成明细"
+                )
+                refund_updated_at = (
+                    after_sale_updated_at
+                    or now.strftime("%Y-%m-%d %H:%M:%S")
+                )
+                refund_period_updated_at[period] = refund_updated_at
             official_count_available = (
                 period in official_refund_order_counts
             )

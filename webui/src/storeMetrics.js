@@ -20,13 +20,31 @@ function formatMoney(value) {
   return numeric(value) === null ? "—" : moneyFormatter.format(Number(value) / 100);
 }
 
-export function isRefundVisible(amount, orderCount) {
-  const amountValue = numeric(amount);
-  if (amountValue === null) return true;
-  return amountValue !== 0;
+export function shanghaiDateKey(timestamp = Date.now()) {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
 }
 
-export function salesPresentation(store, key) {
+function isStaleForToday(value, today) {
+  const date = String(value || "").trim();
+  return Boolean(date && date !== today);
+}
+
+export function isRefundVisible(amount, orderCount) {
+  const amountValue = numeric(amount);
+  const countValue = numeric(orderCount);
+  if (amountValue === 0) return false;
+  if (amountValue === null && countValue === 0) return false;
+  return true;
+}
+
+export function salesPresentation(store, key, { today = shanghaiDateKey() } = {}) {
   const metricKeys = {
     today: "gmv_today",
     yesterday: "gmv_yesterday",
@@ -49,6 +67,17 @@ export function salesPresentation(store, key) {
   const orderValue = numeric(store.metrics?.[orderKeys[key]]);
   const refundAmount = numeric(store.metrics?.[refundKeys[key]]);
   const meta = store.sales_meta || {};
+  const periodDate = String(
+    meta.period_dates?.[key] || meta.as_of_date || "",
+  );
+  const stale = isStaleForToday(periodDate, today);
+  const status = String(meta.status?.[key] || "");
+  const source = String(meta.sources?.[key] || meta.source || "");
+  const refundStatus = String(meta.refund_amounts?.status?.[key] || "");
+  const refundSource = String(
+    meta.refund_amounts?.sources?.[key] || "",
+  );
+  const error = String(meta.error || meta.refund_amounts?.error || "");
   const rawRefundOrderCount = numeric(
     meta.refund_order_counts?.[key],
   );
@@ -64,7 +93,7 @@ export function salesPresentation(store, key) {
       )
     )
   );
-  const refundOrderCount = refundConflict
+  const refundOrderCount = refundConflict || stale
     ? null
     : rawRefundOrderCount;
   const orderText = orderValue === null
@@ -73,36 +102,81 @@ export function salesPresentation(store, key) {
   const refundOrderText = refundOrderCount === null
     ? "—单"
     : `${formatCount(refundOrderCount)}单`;
-  const showRefund = isRefundVisible(refundAmount, refundOrderCount);
+  const displayedValue = stale ? null : value;
+  const displayedOrderValue = stale ? null : orderValue;
+  const displayedRefundAmount = stale ? null : refundAmount;
+  const showRefund = !stale && isRefundVisible(
+    displayedRefundAmount,
+    refundOrderCount,
+  );
+  const statusText = {
+    updated: "本次已更新",
+    partial: "本次仅更新部分真实值",
+    stale: "沿用最后可信值",
+    failed: "本次读取失败",
+    missing: "接口未返回真实值",
+  }[status] || "等待刷新";
+  const refundStatusText = {
+    updated: "退款本次已更新",
+    stale: "退款沿用最后可信值",
+    failed: "退款本次读取失败",
+    missing: "退款接口未返回真实值",
+  }[refundStatus] || "退款数据状态未知";
+  const needsDiagnostics = Boolean(
+    stale
+    || error
+    || (status && status !== "updated")
+    || (refundStatus && refundStatus !== "updated"),
+  );
+  const diagnosticParts = [
+    periodDate ? `数据日期 ${periodDate}` : "数据日期未知",
+    source ? `来源 ${source}` : "",
+    meta.updated_at ? `更新时间 ${meta.updated_at}` : "",
+    status ? statusText : "",
+    refundSource ? `退款来源 ${refundSource}` : "",
+    refundStatus ? refundStatusText : "",
+    error ? `错误 ${error}` : "",
+  ].filter(Boolean);
   return {
-    value,
-    orderValue,
-    refundAmount,
+    value: displayedValue,
+    orderValue: displayedOrderValue,
+    refundAmount: displayedRefundAmount,
     refundOrderCount,
     showRefund,
-    text: formatMoney(value),
-    salesText: `销 ${formatMoney(value)} · ${orderText}`,
-    refundText: `退 ${formatMoney(refundAmount)} · ${refundOrderText}`,
+    stale,
+    text: formatMoney(displayedValue),
+    salesText: `销 ${formatMoney(displayedValue)} · ${displayedOrderValue === null ? "—单" : orderText}`,
+    refundText: `退 ${formatMoney(displayedRefundAmount)} · ${refundOrderText}`,
+    title: needsDiagnostics ? diagnosticParts.join(" · ") : undefined,
   };
 }
 
-export function exposurePresentation(store, key) {
+export function exposurePresentation(store, key, { today = shanghaiDateKey() } = {}) {
   const labels = {
-    today: "今日曝光",
-    yesterday: "昨日曝光",
-    seven_days: "7日曝光",
+    today: "今日商品曝光",
+    yesterday: "昨日商品曝光",
+    seven_days: "7日商品曝光",
   };
-  const legacyPeople = numeric(
-    store.exposure_metrics?.[key]
-    ?? {
-      today: store.metrics?.recommend_exposure,
-      yesterday: store.metrics?.recommend_exposure_yesterday,
-      seven_days: store.metrics?.recommend_exposure_7d,
-    }[key],
-  );
-  const people = numeric(store.exposure_people?.[key] ?? legacyPeople);
-  const count = numeric(store.exposure_counts?.[key]);
   const meta = store.exposure_meta || {};
+  const dataDate = String(
+    meta.period_dates?.[key] || meta.as_of_date || "",
+  );
+  const stale = isStaleForToday(
+    dataDate,
+    today,
+  );
+  const people = stale
+    ? null
+    : numeric(store.product_exposure_people?.[key]);
+  const count = stale
+    ? null
+    : numeric(store.product_exposure_counts?.[key]);
+  const clickPeople = stale
+    ? null
+    : numeric(store.exposure_click_people?.[key]);
+  const clickCount = stale
+    ? null
+    : numeric(store.exposure_click_counts?.[key]);
   const status = String(meta.status?.[key] || "");
   const countStatus = String(meta.count_status?.[key] || "");
   const peopleStatus = String(meta.people_status?.[key] || "");
@@ -123,43 +197,85 @@ export function exposurePresentation(store, key) {
         : "沿用最后成功值"
   );
   return {
-    value: { count, people },
-    text: `${formatCount(count)} / ${formatCount(people)}`,
+    value: people,
+    text: formatCount(people),
+    stale,
     title:
-      `${labels[key]}次数 ${formatCount(count)} · ${labels[key]}人数 ${formatCount(people)}` +
-      ` · ${statusText} · 次数${sideStatus(count, countStatus)}` +
-      ` · 人数${sideStatus(people, peopleStatus)}` +
-      `${meta.updated_at ? ` · 更新 ${meta.updated_at}` : ""}` +
-      `${meta.source ? ` · ${meta.source}` : ""}`,
+      `${labels[key]}人数 ${formatCount(people)}` +
+      ` · 商品曝光次数 ${formatCount(count)}` +
+      ` · 商品点击人数 ${formatCount(clickPeople)}` +
+      ` · 商品点击次数 ${formatCount(clickCount)}` +
+      ` · ${statusText} · 曝光人数${sideStatus(people, peopleStatus)}` +
+      ` · 曝光次数${sideStatus(count, countStatus)}` +
+      `${dataDate ? ` · 数据日期 ${dataDate}` : " · 数据日期未知"}` +
+      `${meta.updated_at ? ` · 更新时间 ${meta.updated_at}` : ""}` +
+      `${meta.source ? ` · ${meta.source}` : ""}` +
+      `${meta.error ? ` · 错误 ${meta.error}` : ""}` +
+      `${stale ? " · 数据不是今天，等待刷新" : ""}`,
   };
 }
 
-export function onlineProductsPresentation(store) {
+export function onlineProductsPresentation(store, { today = shanghaiDateKey() } = {}) {
   const value = numeric(store.online_products);
   const meta = store.online_products_meta || {};
+  const dataDate = String(meta.as_of_date || store.as_of_date || "");
+  const stale = isStaleForToday(dataDate, today);
   return {
-    value,
-    text: value === null ? "—" : countFormatter.format(value),
-    title: value === null
+    value: stale ? null : value,
+    text: stale || value === null ? "—" : countFormatter.format(value),
+    title: stale
+      ? `在线商品数据日期 ${dataDate}，已跨日，等待刷新${meta.source ? ` · ${meta.source}` : ""}${meta.error ? ` · 错误 ${meta.error}` : ""}`
+      : value === null
       ? `官方在售商品总数不可用${meta.error ? ` · ${meta.error}` : ""}`
-      : `${meta.source || "官方在售商品总数"}${meta.updated_at ? ` · 更新 ${meta.updated_at}` : ""}`,
+      : `${meta.source || "官方在售商品总数"}${dataDate ? ` · 数据日期 ${dataDate}` : ""}${meta.updated_at ? ` · 更新时间 ${meta.updated_at}` : ""}${meta.error ? ` · 错误 ${meta.error}` : ""}`,
   };
 }
 
-export function newProductsTodayPresentation(store) {
+export function newProductsTodayPresentation(store, { today = shanghaiDateKey() } = {}) {
   const value = numeric(store.new_products_today);
   const meta = store.new_products_today_meta || {};
   const definition = "今日首次观测上新（Asia/Shanghai 自然日；不代表平台商品创建时间）";
-  if (value === null) {
+  const dataDate = String(meta.as_of_date || store.as_of_date || "");
+  if (!meta.scan_completed_today || value === null || isStaleForToday(dataDate, today)) {
+    const lastScan = String(meta.last_scan_completed_at || "").replace("T", " ").slice(0, 19);
     return {
       value: null,
       text: "—",
-      title: `${definition} · 今日尚未完成商品目录扫描`,
+      title: `${definition} · 今日尚未完成商品目录扫描${lastScan ? ` · 上次完成 ${lastScan}` : ""}`,
     };
   }
   return {
     value,
     text: countFormatter.format(value),
     title: `${definition} · 今日目录扫描已完成${value === 0 ? "，没有新增商品" : ""}`,
+  };
+}
+
+export function fundPresentation(store, key, { today = shanghaiDateKey() } = {}) {
+  const value = numeric(store.metrics?.[key]);
+  const meta = store.fund_meta || {};
+  const dataDate = String(
+    meta.period_dates?.[key] || meta.as_of_date || "",
+  );
+  const status = String(meta.status?.[key] || "");
+  const stale = isStaleForToday(dataDate, today);
+  const statusText = {
+    updated: "本次已更新",
+    stale: "沿用最后可信值",
+    failed: "本次读取失败",
+    missing: "接口未返回真实值",
+  }[status] || "等待刷新";
+  return {
+    value,
+    text: formatMoney(value),
+    stale,
+    title: [
+      dataDate ? `数据日期 ${dataDate}` : "数据日期未知",
+      statusText,
+      meta.source ? `来源 ${meta.source}` : "",
+      meta.updated_at ? `更新时间 ${meta.updated_at}` : "",
+      meta.error ? `错误 ${meta.error}` : "",
+      stale ? "余额不是今天的数据" : "",
+    ].filter(Boolean).join(" · "),
   };
 }

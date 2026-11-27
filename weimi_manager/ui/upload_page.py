@@ -19,7 +19,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import TYPE_CHECKING, Any, Callable
 
-from ..models import Store
+from ..models import Store, UploadPreflightError
 from ..shop_private import ShopPrivateClient
 from ..source_1688 import (
     Link1688Collector,
@@ -219,19 +219,6 @@ def _apply_template_image_rules(
     if rule_values["detail_keep_first"]:
         detail_images = detail_images[: rule_values["detail_keep_first"]]
     detail_images = list(dict.fromkeys(detail_images))
-
-    if not head_images and any(rule_values.values()):
-        raise ValueError("图片处理后主图为空，请调整主图处理规则")
-    if not detail_images and any(
-        rule_values[key]
-        for key in (
-            "remove_detail_index",
-            "trim_detail",
-            "trim_detail_tail",
-            "detail_keep_first",
-        )
-    ):
-        raise ValueError("图片处理后详情图为空，请调整详情图处理规则")
     prepared["head_imgs"] = head_images
     desc_info["imgs"] = detail_images
     prepared["desc_info"] = desc_info
@@ -518,6 +505,8 @@ def _filter_batch_rows(
 
 def _definitive_upload_failure_message(exc: Exception) -> str:
     """Return a user-facing message only when the remote definitely rejected."""
+    if isinstance(exc, UploadPreflightError):
+        return f"商品未创建：{exc}"
     if not isinstance(exc, WechatApiError):
         return ""
     # Transport failures have no structured remote error code. The request may
@@ -8110,8 +8099,16 @@ class UploadPage(ttk.Frame):
         payload.pop("detail_skip_first", None)
         payload.pop("detail_images_before_skip", None)
         payload.pop("detail_images_after_skip", None)
-        required = ("head_imgs", "skus")
-        missing = [key for key in required if not payload.get(key)]
+        source_image_counts = payload.get("_source_image_counts")
+        source_head_count = int(
+            (source_image_counts or {}).get("head") or 0
+        ) if isinstance(source_image_counts, dict) else 0
+        missing = [
+            key
+            for key in ("head_imgs", "skus")
+            if not payload.get(key)
+            and not (key == "head_imgs" and source_head_count > 0)
+        ]
         if not any(
             payload.get(key)
             for key in ("cats", "cats_v2", "category_path")

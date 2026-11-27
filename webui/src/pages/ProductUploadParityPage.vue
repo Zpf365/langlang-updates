@@ -7,6 +7,7 @@ import ModalDialog from "../components/ModalDialog.vue";
 import UploadTemplateDialog from "../components/UploadTemplateDialog.vue";
 import UploadStoreSelectionDialog from "../components/UploadStoreSelectionDialog.vue";
 import { mergeUploadStoreOptions } from "../uploadStoreOptions";
+import { applyUploadTemplateTitleRules } from "../uploadTitleRules";
 
 const route = useRoute();
 const router = useRouter();
@@ -237,19 +238,6 @@ function violationIssueText(match) {
   return `云违规标题过滤命中：${match?.reason || "出售假冒商品"}`;
 }
 
-function applyClientTemplateTitleRules(title, template = {}) {
-  let value = String(title || "").trim();
-  if (template.strip_title_brackets) {
-    value = value.replace(/^【[^】]*】\s*/, "");
-  }
-  for (const line of String(template.title_replace_rules || "").split(/\r?\n/)) {
-    if (!line.includes("=")) continue;
-    const [oldValue, newValue = ""] = line.split("=", 2);
-    if (oldValue.trim()) value = value.replaceAll(oldValue.trim(), newValue.trim());
-  }
-  return `${template.title_prefix || ""}${value}${template.title_suffix || ""}`.trim();
-}
-
 function blockSelectedViolationTitles(items = selectedBatchItems.value, context = "创建任务") {
   const matched = items.find((row) => (
     violationMatchForTitle(row.title || row.payload?.title)
@@ -273,7 +261,7 @@ function blockTaskViolationTitles(taskIds = runnableTaskIds.value, itemIds = sel
         selectedItems.size
         && !selectedItems.has(String(item.item_id))
       ) continue;
-      const finalTitle = applyClientTemplateTitleRules(
+      const finalTitle = applyUploadTemplateTitleRules(
         item.title || item.payload?.title,
         task.template || {},
       );

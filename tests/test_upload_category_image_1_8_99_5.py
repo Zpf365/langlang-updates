@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -819,7 +820,7 @@ def _image_payload() -> dict:
     }
 
 
-def test_template_image_processing_order_idempotency_and_empty_block() -> None:
+def test_template_image_processing_order_idempotency_and_empty_fallback() -> None:
     payload = _image_payload()
     template = {
         "remove_head_index": 2,
@@ -837,23 +838,23 @@ def test_template_image_processing_order_idempotency_and_empty_block() -> None:
     assert repeated["head_imgs"] == processed["head_imgs"]
     assert repeated["desc_info"]["imgs"] == processed["desc_info"]["imgs"]
 
-    with pytest.raises(ValueError, match="详情图为空"):
-        _apply_template_image_rules(
-            {
-                **_image_payload(),
-                "desc_info": {"imgs": ["only"], "desc": ""},
-            },
-            {"trim_detail": 1},
-        )
+    emptied_detail = _apply_template_image_rules(
+        {
+            **_image_payload(),
+            "desc_info": {"imgs": ["only"], "desc": ""},
+        },
+        {"trim_detail": 1},
+    )
+    assert emptied_detail["desc_info"]["imgs"] == []
 
-    with pytest.raises(ValueError, match="主图为空"):
-        _apply_template_image_rules(
-            {
-                **_image_payload(),
-                "head_imgs": ["only"],
-            },
-            {"remove_head_index": 1},
-        )
+    emptied_head = _apply_template_image_rules(
+        {
+            **_image_payload(),
+            "head_imgs": ["only"],
+        },
+        {"remove_head_index": 1},
+    )
+    assert emptied_head["head_imgs"] == []
 
     boundary = _apply_template_image_rules(
         _image_payload(),
@@ -1029,7 +1030,7 @@ def test_upload_payload_overrides_source_category_with_specified_path() -> None:
     assert processed["_specified_category_id"] == "3"
 
 
-def test_new_template_and_legacy_missing_fields_use_image_defaults(
+def test_new_template_and_legacy_missing_fields_use_non_destructive_image_defaults(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "webui.db")
@@ -1053,8 +1054,8 @@ def test_new_template_and_legacy_missing_fields_use_image_defaults(
     )["template"]
     assert saved["remove_head_index"] == 0
     assert saved["remove_detail_index"] == 0
-    assert saved["trim_detail"] == 2
-    assert saved["trim_detail_tail"] == 2
+    assert saved["trim_detail"] == 0
+    assert saved["trim_detail_tail"] == 0
     assert saved["detail_keep_first"] == 0
 
     edited = controller.dispatch(
@@ -1131,7 +1132,7 @@ def test_preflight_reports_the_final_images_after_default_trimming(
     )
     assert result["blocked"] == 0
     assert result["rows"][0]["mapping"]["head_image_count"] == 3
-    assert result["rows"][0]["mapping"]["detail_image_count"] == 4
+    assert result["rows"][0]["mapping"]["detail_image_count"] == 8
 
     store_id = database.add_store("预检店铺", "wx-image-preflight", "secret")
     created = controller.dispatch(
@@ -1150,7 +1151,16 @@ def test_preflight_reports_the_final_images_after_default_trimming(
     )
     snapshot = created["tasks"][0]["items"][0]["image_snapshot"]
     assert snapshot["head_imgs"] == ["h1", "h2", "h3"]
-    assert snapshot["detail_imgs"] == ["d3", "d4", "d5", "d6"]
+    assert snapshot["detail_imgs"] == [
+        "d1",
+        "d2",
+        "d3",
+        "d4",
+        "d5",
+        "d6",
+        "d7",
+        "d8",
+    ]
     page = object.__new__(UploadPage)
     page.db = database
     uploaded = page._upload_payload(
@@ -1159,3 +1169,106 @@ def test_preflight_reports_the_final_images_after_default_trimming(
     )
     assert uploaded["head_imgs"] == snapshot["head_imgs"]
     assert uploaded["desc_info"]["imgs"] == snapshot["detail_imgs"]
+def test_image_rules_pass_empty_lists_to_the_real_upload_fallback() -> None:
+    resolved = _apply_template_image_rules(
+        {
+            "head_imgs": ["h1", "h2", "h3"],
+            "desc_info": {"imgs": ["d1", "d2", "d3"]},
+        },
+        {
+            "remove_head_index": 2,
+            "trim_head": 2,
+            "remove_detail_index": 0,
+            "trim_detail": 2,
+            "trim_detail_tail": 2,
+            "detail_keep_first": 0,
+        },
+    )
+
+    assert resolved["head_imgs"] == []
+    assert resolved["desc_info"]["imgs"] == []
+    assert resolved["_source_image_counts"] == {"head": 3, "detail": 3}
+
+
+
+
+def test_explicit_image_trim_rules_do_not_block_task_creation(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "webui.db")
+    controller = NextUiController(database)
+    template = controller.dispatch(
+        "upload.templates.save",
+        {
+            "template": {
+                "name": "主动裁剪图片",
+                "price_multiplier": 1,
+                "stock": 0,
+                "listing_mode": "immediate",
+                "duplicate_filter_mode": "off",
+                "delivery_type": "现货",
+                "delivery_time": "48小时内发货",
+                "image_mode": "默认方式",
+                "head_action": "删除违规图片",
+                "detail_action": "删除违规图片",
+                "remove_head_index": 1,
+                "trim_detail": 2,
+                "trim_detail_tail": 2,
+            }
+        },
+    )["template"]
+    payload = _image_payload()
+    payload["head_imgs"] = ["only-head"]
+    payload["skus"][0]["sku_attrs"] = [
+        {"attr_key": "规格", "attr_value": "默认"}
+    ]
+    payload["desc_info"]["imgs"] = [
+        f"d{index}" for index in range(1, 4)
+    ]
+    database.set_setting(
+        "upload_batch",
+        json.dumps(
+            [
+                {
+                    "batch_id": "image-user-rules",
+                    "source_product_id": "IMAGE-USER-RULES",
+                    "title": "用户主动裁剪图片商品",
+                    "price": 1000,
+                    "stock": 1,
+                    "platform": "微信小店",
+                    "payload": payload,
+                }
+            ],
+            ensure_ascii=False,
+        ),
+    )
+
+    preflight = controller.dispatch(
+        "upload.batch.preflight",
+        {
+            "batch_ids": ["image-user-rules"],
+            "template_id": template["id"],
+        },
+    )
+    assert preflight["blocked"] == 0, preflight["rows"][0]["issues"]
+    assert preflight["rows"][0]["mapping"]["detail_image_count"] == 0
+
+    store_id = database.add_store("裁剪店铺", "wx-image-trim", "secret")
+    created = controller.dispatch(
+        "upload.tasks.create",
+        {
+            "batch_ids": ["image-user-rules"],
+            "store_ids": [store_id],
+            "template_id": template["id"],
+            "store_options": {
+                str(store_id): {
+                    "brand_mode": "none",
+                    "brand_id": "2100000000",
+                }
+            },
+        },
+    )
+    assert created["created"] == 1
+    snapshot = created["tasks"][0]["items"][0]["image_snapshot"]
+    assert snapshot["head_imgs"] == []
+    assert snapshot["detail_imgs"] == []

@@ -87,17 +87,6 @@ export function applyImageRules(payload, template = {}) {
     detailImages = detailImages.slice(0, rules.detail_keep_first);
   }
   detailImages = [...new Set(detailImages)];
-  if (!headImages.length && Object.values(rules).some(Boolean)) {
-    throw new Error("图片处理后主图为空，请调整主图处理规则");
-  }
-  if (!detailImages.length && [
-    rules.remove_detail_index,
-    rules.trim_detail,
-    rules.trim_detail_tail,
-    rules.detail_keep_first,
-  ].some(Boolean)) {
-    throw new Error("图片处理后详情图为空，请调整详情图处理规则");
-  }
   prepared.head_imgs = headImages;
   prepared.desc_info = { ...descInfo, imgs: detailImages };
   prepared._template_image_processing = signature;

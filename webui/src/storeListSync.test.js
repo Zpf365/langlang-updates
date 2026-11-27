@@ -1,11 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { startRepeatingSync } from "./storeListSync";
+import {
+  STORE_LIST_SYNC_INTERVAL_MS,
+  startRepeatingSync,
+} from "./storeListSync";
 
 afterEach(() => {
   vi.useRealTimers();
 });
 
 describe("store list live sync", () => {
+  it("defaults to a low-frequency refresh during long background work", () => {
+    expect(STORE_LIST_SYNC_INTERVAL_MS).toBe(3000);
+  });
+
   it("refreshes immediately and repeats until stopped", async () => {
     vi.useFakeTimers();
     const synchronize = vi.fn(async () => {});

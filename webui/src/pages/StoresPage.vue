@@ -1,11 +1,24 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import {
+  computed,
+  onActivated,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch,
+} from "vue";
 import { call, formatMoney } from "../api";
 import { useAutoRefresh } from "../autoRefresh";
 import { copyText } from "../clipboard";
 import Icon from "../components/Icon.vue";
 import ModalDialog from "../components/ModalDialog.vue";
-import { startRepeatingSync } from "../storeListSync";
+import {
+  getStoreInteractionState,
+  pollStoreRefreshJob,
+  runStoreDateRolloverReload,
+  startRepeatingSync,
+} from "../storeListSync";
 import {
   readRuntimeNoticeVisible,
   runtimeNoticeStorageKey as makeRuntimeNoticeStorageKey,
@@ -20,10 +33,12 @@ import {
 import { APP_ID_REVEAL_TIMEOUT_MS, maskAppId } from "../storeIdentity";
 import {
   exposurePresentation,
+  fundPresentation,
   isRefundVisible,
   newProductsTodayPresentation,
   onlineProductsPresentation,
   salesPresentation,
+  shanghaiDateKey,
 } from "../storeMetrics";
 import {
   readStoreViewMode,
@@ -151,6 +166,8 @@ const newGroupName = ref("");
 const groupBusy = ref(false);
 let liveStoreSyncStop = null;
 let liveStoreSyncUsers = 0;
+let loadedDateKey = "";
+let dateRolloverTimer = null;
 const form = reactive({
   name: "",
   app_id: "",
@@ -205,6 +222,10 @@ const allFilteredSelected = computed(() => (
   filteredStores.value.length > 0
   && filteredStores.value.every((store) => selectedStoreIds.value.includes(store.id))
 ));
+const storeInteractions = computed(() => getStoreInteractionState({
+  hasSelection: selectedStoreIds.value.length > 0,
+  storeActionBusy: storeActionBusy.value,
+}));
 const refreshPercent = computed(() => {
   if (!refreshProgress.total) return refreshProgress.visible ? 8 : 0;
   return Math.max(0, Math.min(100, refreshProgress.current / refreshProgress.total * 100));
@@ -299,8 +320,20 @@ const summary = computed(() => {
       presentations.map((item) => item[period].refundOrderCount),
     );
   }
+  result.cash = completeSum(
+    filteredStores.value.map((store) => numericMetric(store.metrics?.cash)),
+  );
+  result.settle = completeSum(
+    filteredStores.value.map((store) => numericMetric(store.metrics?.settle)),
+  );
   return result;
 });
+
+function numericMetric(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
 
 function summaryMoney(value) {
   return value === null || value === undefined
@@ -534,7 +567,20 @@ function metricNumber(store, primary, fallback) {
 
 function moneyMetric(store, primary, fallback) {
   const value = metricNumber(store, primary, fallback);
-  return value === null ? "—" : formatMoney(value);
+  if (value === null) return "—";
+  if (primary === "cash" || primary === "settle") {
+    return fundPresentation(store, primary).text;
+  }
+  return formatMoney(value);
+}
+
+function moneyMetricTitle(store, primary, fallback) {
+  if (primary === "cash" || primary === "settle") {
+    return fundPresentation(store, primary).title;
+  }
+  return metricNumber(store, primary, fallback) === null
+    ? "数据不可用"
+    : "";
 }
 
 function resetForm(store = null) {
@@ -941,6 +987,7 @@ async function load() {
   try {
     const data = await call("stores.list", { search: "" });
     applyStoreData(data);
+    loadedDateKey = shanghaiDateKey();
   } catch (cause) {
     message.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
@@ -948,11 +995,24 @@ async function load() {
   }
 }
 
+async function reloadAfterDateRollover() {
+  await runStoreDateRolloverReload({
+    loadedDateKey,
+    currentDateKey: shanghaiDateKey(),
+    loading: loading.value,
+    automatic: autoRefresh.enabled.value,
+    load,
+    refresh: refreshAll,
+    onLoaded: (dateKey) => {
+      loadedDateKey = dateKey;
+    },
+  });
+}
+
 async function refreshAll({ automatic = false } = {}) {
   loading.value = true;
   if (!automatic) message.value = "";
   try {
-    beginLiveStoreSync();
     const storeIds = [...selectedStoreIds.value];
     Object.assign(refreshProgress, {
       visible: !automatic,
@@ -970,14 +1030,19 @@ async function refreshAll({ automatic = false } = {}) {
     const started = await call("stores.refresh.start", {
       store_ids: storeIds.length ? storeIds : undefined,
     });
-    let result = null;
-    while (true) {
-      result = await call("stores.refresh.status", { job_id: started.job_id });
-      Object.assign(refreshProgress, result, { visible: true });
-      if (["completed", "partial"].includes(result.status)) break;
-      if (result.status === "failed") throw new Error(result.message || "店铺刷新失败");
-      await new Promise((resolve) => setTimeout(resolve, 180));
+    if (started.already_running) {
+      message.value = "已有相同店铺范围的后台刷新，正在复用该任务";
     }
+    const result = await pollStoreRefreshJob({
+      jobId: started.job_id,
+      getStatus: (jobId) => call(
+        "stores.refresh.status",
+        { job_id: jobId },
+      ),
+      onStatus: (status) => {
+        Object.assign(refreshProgress, status, { visible: true });
+      },
+    });
     await load();
     const credentialSummary =
       `凭据恢复 ${result.credential_succeeded || 0}，` +
@@ -997,7 +1062,6 @@ async function refreshAll({ automatic = false } = {}) {
     refreshProgress.message = errorMessage;
     return { ok: false, message: errorMessage };
   } finally {
-    endLiveStoreSync();
     loading.value = false;
     if (!automatic) {
       refreshProgress.visible = true;
@@ -1236,12 +1300,18 @@ onMounted(async () => {
   document.addEventListener("keydown", handleContextKey);
   await load();
   if (stores.value.length) await refreshAll();
+  dateRolloverTimer = window.setInterval(reloadAfterDateRollover, 60000);
 });
+onActivated(reloadAfterDateRollover);
 onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", handleContextPointer, true);
   document.removeEventListener("keydown", handleContextKey);
   liveStoreSyncUsers = 0;
   endLiveStoreSync();
+  if (dateRolloverTimer !== null) {
+    window.clearInterval(dateRolloverTimer);
+    dateRolloverTimer = null;
+  }
   for (const timer of secretTimers.values()) clearTimeout(timer);
   secretTimers.clear();
   for (const timer of appIdTimers.values()) clearTimeout(timer);
@@ -1294,8 +1364,8 @@ onBeforeUnmount(() => {
           :aria-label="`批量操作，已选 ${selectedStoreIds.length} 家店铺`"
           @click="openBatchContextMenu"
         >批量操作{{ selectedStoreIds.length ? ` (${selectedStoreIds.length})` : "" }}</button>
-        <button class="btn muted" type="button" :disabled="!selectedStoreIds.length || storeActionBusy" @click="runStoreAction('stores.login')">{{ storeActionBusy ? "处理中..." : "登录" }}</button>
-        <button class="btn muted" type="button" :disabled="!selectedStoreIds.length || storeActionBusy" @click="runStoreAction('stores.open-backend')">打开后台</button>
+        <button class="btn muted" type="button" :disabled="storeInteractions.selectionActionDisabled" @click="runStoreAction('stores.login')">{{ storeActionBusy ? "处理中..." : "登录" }}</button>
+        <button class="btn muted" type="button" :disabled="storeInteractions.selectionActionDisabled" @click="runStoreAction('stores.open-backend')">打开后台</button>
         <button class="btn amber" type="button" @click="runStoreAction('stores.clear-cache')">清理缓存</button>
       </div>
     </header>
@@ -1305,18 +1375,21 @@ onBeforeUnmount(() => {
       <button
         class="chip"
         :class="{ active: activeFilter === 'all' }"
+        :disabled="!storeInteractions.filtersEnabled"
         type="button"
         @click="activeFilter = 'all'"
       >全部状态 {{ stores.length }}</button>
       <button
         class="chip"
         :class="{ active: activeFilter === 'logged' }"
+        :disabled="!storeInteractions.filtersEnabled"
         type="button"
         @click="activeFilter = 'logged'"
       >已登录店铺 {{ loggedCount }}</button>
       <button
         class="chip"
         :class="{ active: activeFilter === 'unlogged' }"
+        :disabled="!storeInteractions.filtersEnabled"
         type="button"
         @click="activeFilter = 'unlogged'"
       >未登录店铺 {{ unloggedCount }}</button>
@@ -1348,6 +1421,7 @@ onBeforeUnmount(() => {
       <button
         class="group-chip"
         :class="{ active: groupFilter === '全部店铺' }"
+        :disabled="!storeInteractions.groupsEnabled"
         type="button"
         @click="setGroupFilter('全部店铺')"
       >全部店铺 {{ groupStoreCount("全部店铺") }}</button>
@@ -1356,6 +1430,7 @@ onBeforeUnmount(() => {
         :key="group"
         class="group-chip"
         :class="{ active: groupFilter === group }"
+        :disabled="!storeInteractions.groupsEnabled"
         type="button"
         @click="setGroupFilter(group)"
       >{{ group }} {{ groupStoreCount(group) }}</button>
@@ -1436,6 +1511,7 @@ onBeforeUnmount(() => {
                   <input
                     type="checkbox"
                     :checked="selectedStoreIds.includes(store.id)"
+                    :disabled="!storeInteractions.selectionEnabled"
                     @click.stop
                     @change="toggleStoreSelection(store.id)"
                   />
@@ -1459,7 +1535,7 @@ onBeforeUnmount(() => {
                     class="sales-lines"
                     :class="{ 'sales-lines-single': !salesPresentation(store, key).showRefund }"
                   >
-                    <span class="sale-line">{{ salesPresentation(store, key).salesText }}</span>
+                    <span class="sale-line" :title="salesPresentation(store, key).title">{{ salesPresentation(store, key).salesText }}</span>
                     <span
                       v-if="salesPresentation(store, key).showRefund"
                       class="refund-line"
@@ -1508,7 +1584,7 @@ onBeforeUnmount(() => {
                 <td :colspan="STORE_OVERVIEW_COLUMN_COUNT">
                   <div class="store-detail-grid">
                     <section>
-                      <h4>商品曝光（次数 / 人数）</h4>
+                      <h4>商品曝光人数</h4>
                       <div v-for="key in ['today', 'yesterday', 'seven_days']" :key="key" class="detail-line">
                         <span>{{ { today: '今日', yesterday: '昨日', seven_days: '7日' }[key] }}</span>
                         <strong :title="exposurePresentation(store, key).title">{{ exposurePresentation(store, key).text }}</strong>
@@ -1516,8 +1592,8 @@ onBeforeUnmount(() => {
                     </section>
                     <section>
                       <h4>资金与保证金</h4>
-                      <div class="detail-line"><span>可提现</span><strong>{{ moneyMetric(store, "cash") }}</strong></div>
-                      <div class="detail-line"><span>待结算</span><strong>{{ moneyMetric(store, "settle") }}</strong></div>
+                      <div class="detail-line"><span>可提现</span><strong :title="moneyMetricTitle(store, 'cash')">{{ moneyMetric(store, "cash") }}</strong></div>
+                      <div class="detail-line"><span>待结算</span><strong :title="moneyMetricTitle(store, 'settle')">{{ moneyMetric(store, "settle") }}</strong></div>
                       <div class="detail-line">
                         <span>保证金</span>
                         <strong :title="depositPresentation(store).detail">{{ depositPresentation(store).valueText }}</strong>
@@ -1608,7 +1684,7 @@ onBeforeUnmount(() => {
               </th>
               <th class="sticky-index sticky-column" rowspan="2">序号</th>
               <th class="sticky-name sticky-column" rowspan="2">店铺名称</th>
-              <th colspan="3" class="exposure-group-head">商品曝光（次数/人数）</th>
+              <th colspan="3" class="exposure-group-head">商品曝光人数</th>
               <th rowspan="2">在线商品数</th>
               <th rowspan="2">今日上新</th>
               <th colspan="4" class="sales-group-head">销售 / 退款（金额 / 单量）</th>
@@ -1645,6 +1721,7 @@ onBeforeUnmount(() => {
                 <input
                   type="checkbox"
                   :checked="selectedStoreIds.includes(store.id)"
+                  :disabled="!storeInteractions.selectionEnabled"
                   @change="toggleStoreSelection(store.id)"
                 />
               </td>
@@ -1666,15 +1743,15 @@ onBeforeUnmount(() => {
                   class="sales-lines"
                   :class="{ 'sales-lines-single': !salesPresentation(store, key).showRefund }"
                 >
-                  <span class="sale-line">{{ salesPresentation(store, key).salesText }}</span>
+                  <span class="sale-line" :title="salesPresentation(store, key).title">{{ salesPresentation(store, key).salesText }}</span>
                   <span
                     v-if="salesPresentation(store, key).showRefund"
                     class="refund-line"
                   >{{ salesPresentation(store, key).refundText }}</span>
                 </div>
               </td>
-              <td class="money">{{ moneyMetric(store, "cash") }}</td>
-              <td class="money">{{ moneyMetric(store, "settle") }}</td>
+              <td class="money" :title="moneyMetricTitle(store, 'cash')">{{ moneyMetric(store, "cash") }}</td>
+              <td class="money" :title="moneyMetricTitle(store, 'settle')">{{ moneyMetric(store, "settle") }}</td>
               <td v-for="key in STORE_SCORE_FIELDS" :key="key" class="score-cell">
                 <span :title="scorePresentation(store, key).valueTitle">{{ scorePresentation(store, key).valueText }}</span>
                 <small
@@ -1757,8 +1834,8 @@ onBeforeUnmount(() => {
         <strong>{{ summaryMoney(summary.month) }} · {{ summaryCount(summary.month_orders) }}</strong>
         <small v-if="isRefundVisible(summary.refund_month, summary.refund_month_orders)">退款 {{ summaryMoney(summary.refund_month) }} · {{ summaryCount(summary.refund_month_orders) }}</small>
       </div>
-      <div class="summary-cell"><span>可提现余额</span><strong>请打开资金账户刷新</strong></div>
-      <div class="summary-cell"><span>待结算余额</span><strong>请打开资金账户刷新</strong></div>
+      <div class="summary-cell"><span>可提现余额</span><strong>{{ summaryMoney(summary.cash) }}</strong></div>
+      <div class="summary-cell"><span>待结算余额</span><strong>{{ summaryMoney(summary.settle) }}</strong></div>
     </footer>
 
     <div

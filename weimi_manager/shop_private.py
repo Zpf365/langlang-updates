@@ -106,6 +106,13 @@ SEARCH_STATS_PATH = (
     "/shop-faas/mmchannelstradebase/cgi/shop/"
     "getShopSearchProductsStat"
 )
+PRODUCT_OVERVIEW_PATH = (
+    "/shop-faas/mmecnodelinercgi/cgi/liner/query"
+)
+PRODUCT_COMPASS_LOGIN_PATH = (
+    "/shop-faas/mmecnodecompasscommon/thirdParty/shop/"
+    "loginCompassByShop"
+)
 ACCOUNT_BALANCE_PATH = (
     "/shop-faas/mmchannelstradefunds/cgi/generalAccount/"
     "getGeneralAccountBalance?token=&lang=zh_CN"
@@ -488,12 +495,14 @@ class ShopPrivateClient:
         self._sleep = sleeper
         self._last_request = 0.0
         self._min_interval = 0.18
+        self._product_compass_headers: dict[str, str] | None = None
 
     def _post(
         self,
         path: str,
         body: dict[str, Any],
         timeout: int = 25,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         delay = self._min_interval - (time.monotonic() - self._last_request)
         if delay > 0:
@@ -502,7 +511,7 @@ class ShopPrivateClient:
             response = self.session.post(
                 BASE_URL + path,
                 params={"token": "", "lang": "zh_CN"},
-                headers=self._headers,
+                headers={**self._headers, **(headers or {})},
                 json=body,
                 timeout=timeout,
             )
@@ -552,6 +561,52 @@ class ShopPrivateClient:
             )
             raise ShopPrivateError(str(message))
         return result
+
+    def _product_compass_auth_headers(self) -> dict[str, str]:
+        if self._product_compass_headers is not None:
+            return self._product_compass_headers
+        response = self.session.get(
+            BASE_URL + PRODUCT_COMPASS_LOGIN_PATH,
+            headers={
+                **self._headers,
+                "accept": "text/html,application/xhtml+xml",
+                "referer": f"{BASE_URL}/shop/statistics/product",
+            },
+            timeout=25,
+            allow_redirects=True,
+        )
+        if response.status_code in {401, 403, 429}:
+            raise ShopPrivateError(
+                f"商品数据登录已失效（HTTP {response.status_code}），请重新扫码"
+            )
+        if response.status_code >= 400:
+            raise ShopPrivateError(
+                f"商品数据登录失败（HTTP {response.status_code}）"
+            )
+        session_cookies = normalize_cookies(
+            [
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain,
+                    "path": cookie.path,
+                    "secure": cookie.secure,
+                }
+                for cookie in self.session.cookies
+            ]
+        )
+        cookie_names = {cookie["name"] for cookie in session_cookies}
+        if "user_magic" not in cookie_names:
+            raise ShopPrivateError(
+                "商品数据登录失败：商家后台未返回 user_magic"
+            )
+        self._product_compass_headers = {
+            "Cookie": cookie_header(session_cookies),
+            "x-use-new-account": "1",
+            "x-use-wx-ticket": "1",
+            "referer": f"{BASE_URL}/compass/embed/channels-shop-product?source=4",
+        }
+        return self._product_compass_headers
 
     def _get(
         self,
@@ -1726,13 +1781,13 @@ class ShopPrivateClient:
             "quality_refund_ratio": value(quality),
         }
 
-    def account_balance(self) -> dict[str, int]:
+    def account_balance(self) -> dict[str, int | None]:
         result = self._get(ACCOUNT_BALANCE_PATH)
         data = self._data(result)
         return {
-            "cash": _as_int(data.get("availableAmount")),
-            "frozen": _as_int(data.get("tempFrozenAmount")),
-            "settle": _as_int(data.get("pendingAmount")),
+            "cash": _optional_int(data.get("availableAmount")),
+            "frozen": _optional_int(data.get("tempFrozenAmount")),
+            "settle": _optional_int(data.get("pendingAmount")),
         }
 
     def deposit_balance(self) -> int | None:
@@ -2246,6 +2301,55 @@ class ShopPrivateClient:
             "orders": _optional_int(total.get("pay_order_cnt")),
             "gmv": _optional_int(total.get("pay_gmv")),
         }
+
+    def product_overview(
+        self,
+        *,
+        days: int = 1,
+        offset_days: int = 0,
+        realtime: bool = False,
+    ) -> dict[str, Any]:
+        """Read the Compass product-conversion overview.
+
+        This is distinct from ``getShopRecommendProductsStat``: Compass uses
+        ``product-overview-shop-*`` and exposes product exposure, click and
+        transaction metrics from the merchant's product-data page.
+        """
+        today = date.today()
+        if realtime:
+            first = today
+            last = today
+            end = datetime.now()
+            date_range = 1
+            date_format = 1
+            overview_id = "product-overview-shop-realtime"
+        else:
+            span = max(1, int(days))
+            last = today - timedelta(days=max(1, int(offset_days)))
+            first = last - timedelta(days=span - 1)
+            end = datetime.combine(last, datetime_time.max)
+            date_range = span
+            date_format = 2
+            overview_id = "product-overview-shop-offline"
+        start = datetime.combine(first, datetime_time.min)
+        result = self._post(
+            PRODUCT_OVERVIEW_PATH,
+            {
+                "time_query": {
+                    "dateFormat": date_format,
+                    "dateType": 0,
+                    "dateRange": date_range,
+                    "startMs": int(start.timestamp() * 1000),
+                    "endMs": int(end.timestamp() * 1000),
+                },
+                "id": overview_id,
+                "biz": "compass",
+                "sale_type": "0",
+            },
+            headers=self._product_compass_auth_headers(),
+        )
+        total = result.get("total")
+        return dict(total) if isinstance(total, dict) else {}
 
     def search_overview(self, days: int = 30) -> dict[str, int]:
         span = max(1, min(int(days), 90))

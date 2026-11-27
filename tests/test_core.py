@@ -1712,6 +1712,7 @@ class CoreTests(unittest.TestCase):
                 {"attr_key": "品牌", "attr_value": "旧品牌"},
                 {"attr_key": "鞋面材质", "attr_value": "PU"},
                 {"attr_key": "品牌", "attr_value": "新品牌"},
+                {"attr_key": "品 牌", "attr_value": "空格品牌"},
             ],
         }
         SyncService(self.db)._apply_required_category_attributes(
@@ -1721,6 +1722,7 @@ class CoreTests(unittest.TestCase):
         )
         keys = [item["attr_key"] for item in payload["attrs"]]
         self.assertNotIn("品牌", keys)
+        self.assertNotIn("品 牌", keys)
         self.assertEqual(keys.count("鞋面材质"), 1)
         self.assertEqual(payload["brand_id"], "2100000000")
 

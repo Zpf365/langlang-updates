@@ -8,10 +8,12 @@ import {
 import { APP_ID_REVEAL_TIMEOUT_MS, maskAppId } from "./storeIdentity";
 import {
   exposurePresentation,
+  fundPresentation,
   isRefundVisible,
   newProductsTodayPresentation,
   onlineProductsPresentation,
   salesPresentation,
+  shanghaiDateKey,
 } from "./storeMetrics";
 
 const source = readFileSync(
@@ -28,6 +30,9 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("depositPresentation(store)");
     expect(source).toContain("const STORE_TABLE_COLUMN_COUNT = 23;");
     expect(source).toContain("const STORE_OVERVIEW_COLUMN_COUNT = 12;");
+    expect(source).toContain("result.cash = completeSum(");
+    expect(source).toContain("result.settle = completeSum(");
+    expect(source).not.toContain("请打开资金账户刷新");
     expect(source).toContain(':colspan="STORE_TABLE_COLUMN_COUNT"');
     expect(source.match(/<col style="width: \d+px" \/>/g)).toHaveLength(33);
     expect(source).toContain('<col :style="{ width: `${appIdColumnWidth}px` }" />');
@@ -50,7 +55,7 @@ describe("store management score and deposit presentation", () => {
   });
 
   it("renders grouped exposure, online products and today new observation", () => {
-    expect(source).toContain('<th colspan="3" class="exposure-group-head">商品曝光（次数/人数）</th>');
+    expect(source).toContain('<th colspan="3" class="exposure-group-head">商品曝光人数</th>');
     expect(source).toContain("<th class=\"count-cell\">今日</th>");
     expect(source).toContain("<th class=\"count-cell\">昨日</th>");
     expect(source).toContain("<th class=\"count-cell\">7日</th>");
@@ -64,6 +69,18 @@ describe("store management score and deposit presentation", () => {
         exposure_metrics: { today: 16754, yesterday: 0, seven_days: 125600 },
         exposure_counts: { today: 21084, yesterday: 0, seven_days: 150000 },
         exposure_people: { today: 16754, yesterday: 0, seven_days: 125600 },
+        product_exposure_counts: {
+          today: 21084,
+          yesterday: 0,
+          seven_days: 150000,
+        },
+        product_exposure_people: {
+          today: 16754,
+          yesterday: 0,
+          seven_days: 125600,
+        },
+        exposure_click_people: { today: 321, yesterday: 0, seven_days: 2400 },
+        exposure_click_counts: { today: 500, yesterday: 0, seven_days: 3800 },
         exposure_meta: {
           status: { today: "updated" },
           count_status: { today: "updated" },
@@ -83,35 +100,111 @@ describe("store management score and deposit presentation", () => {
       new_products_today_meta: { scan_completed_today: true },
     });
     const unseen = newProductsTodayPresentation({ new_products_today: null });
+    const stalePreviousDay = newProductsTodayPresentation({
+      new_products_today: 30,
+      new_products_today_meta: {
+        scan_completed_today: false,
+        last_scan_completed_at: "2026-11-26T23:58:00+08:00",
+      },
+    });
 
-    expect(exposure.text).toBe("21,084 / 16,754");
-    expect(exposure.title).toContain("今日曝光次数 21,084");
-    expect(exposure.title).toContain("今日曝光人数 16,754");
+    expect(exposure.text).toBe("16,754");
+    expect(exposure.title).toContain("今日商品曝光人数 16,754");
+    expect(exposure.title).toContain("商品曝光次数 21,084");
+    expect(exposure.title).toContain("商品点击人数 321");
+    expect(exposure.title).toContain("商品点击次数 500");
     expect(exposure.title).toContain("官方曝光区间接口");
     expect(online.text).toBe("5,678");
     expect(newToday.text).toBe("0");
     expect(newToday.title).toContain("不代表平台商品创建时间");
     expect(unseen.text).toBe("—");
+    expect(stalePreviousDay.text).toBe("—");
+    expect(stalePreviousDay.title).toContain("今日尚未完成商品目录扫描");
   });
 
   it("does not turn missing exposure or online counts into zero", () => {
-    expect(exposurePresentation({}, "today").text).toBe("— / —");
+    expect(exposurePresentation({}, "today").text).toBe("—");
     expect(exposurePresentation({
-      exposure_counts: { today: 21 },
-      exposure_people: { today: null },
-    }, "today").text).toBe("21 / —");
+      product_exposure_counts: { today: 21 },
+      product_exposure_people: { today: null },
+    }, "today").text).toBe("—");
     expect(exposurePresentation({
-      exposure_counts: { today: null },
-      exposure_people: { today: 17 },
-    }, "today").text).toBe("— / 17");
+      product_exposure_counts: { today: null },
+      product_exposure_people: { today: 17 },
+    }, "today").text).toBe("17");
     expect(exposurePresentation({
-      exposure_counts: { today: 0 },
-      exposure_people: { today: 0 },
-    }, "today").text).toBe("0 / 0");
+      product_exposure_counts: { today: 0 },
+      product_exposure_people: { today: 0 },
+    }, "today").text).toBe("0");
     expect(onlineProductsPresentation({
       online_products: null,
       online_products_meta: { source: "" },
     }).text).toBe("—");
+  });
+
+  it("never publishes recommendation traffic as product exposure", () => {
+    const legacyOnly = exposurePresentation({
+      exposure_people: { today: 999 },
+      exposure_metrics: { today: 888 },
+      recommend_exposure_people: 777,
+      exposure_meta: {
+        status: { today: "updated" },
+        as_of_date: "2026-11-27",
+      },
+    }, "today", { today: "2026-11-27" });
+    const compass = exposurePresentation({
+      product_exposure_people: { today: 17 },
+      product_exposure_counts: { today: 21 },
+      exposure_people: { today: 999 },
+      exposure_meta: {
+        status: { today: "updated" },
+        as_of_date: "2026-11-27",
+      },
+    }, "today", { today: "2026-11-27" });
+
+    expect(legacyOnly.text).toBe("—");
+    expect(compass.text).toBe("17");
+    expect(compass.title).toContain("商品曝光次数 21");
+  });
+
+  it("hides cached store values after the Shanghai business date changes", () => {
+    expect(shanghaiDateKey("2026-11-26T16:00:00Z")).toBe("2026-11-27");
+    const stale = {
+      as_of_date: "2026-11-26",
+      metrics: {
+        gmv_today: 100,
+        today_orders: 1,
+        refund_gmv_today: 0,
+      },
+      sales_meta: {
+        as_of_date: "2026-11-26",
+        refund_order_counts: { today: 0 },
+      },
+      exposure_people: { today: 30, yesterday: 40, seven_days: 50 },
+      exposure_meta: { as_of_date: "2026-11-26" },
+      new_products_today: 30,
+      new_products_today_meta: {
+        scan_completed_today: true,
+        as_of_date: "2026-11-26",
+      },
+    };
+    const sales = salesPresentation(stale, "today", {
+      today: "2026-11-27",
+    });
+    const exposure = exposurePresentation(stale, "today", {
+      today: "2026-11-27",
+    });
+    const newProducts = newProductsTodayPresentation(stale, {
+      today: "2026-11-27",
+    });
+
+    expect(sales.stale).toBe(true);
+    expect(sales.salesText).toBe("销 — · —单");
+    expect(sales.showRefund).toBe(false);
+    expect(exposure.stale).toBe(true);
+    expect(exposure.text).toBe("—");
+    expect(newProducts.text).toBe("—");
+    expect(newProducts.title).toContain("今日尚未完成商品目录扫描");
   });
 
   it("places credentials after deposit and freezes the three identity columns", () => {
@@ -143,7 +236,7 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("销售 / 退款（金额 / 单量）");
     expect(source).toContain(':aria-expanded="isStoreExpanded(store.id)"');
     expect(source).toContain('class="store-detail-grid"');
-    expect(source).toContain("商品曝光（次数 / 人数）");
+    expect(source).toContain("商品曝光人数");
     expect(source).toContain("资金与保证金");
     expect(source).toContain("体验分");
     expect(source).toContain("result[`${summaryKey}_orders`]");
@@ -260,12 +353,12 @@ describe("store management score and deposit presentation", () => {
     expect(countOnly.refundText).toBe("退 ¥0.00 · —单");
     expect(countOnly.refundOrderCount).toBeNull();
     expect(countOnly.title).toBeUndefined();
-    expect(unknownAmount.showRefund).toBe(true);
+    expect(unknownAmount.showRefund).toBe(false);
     expect(unknownAmount.refundText).toBe("退 — · 0单");
     expect(unknownCount.showRefund).toBe(false);
     expect(unknownCount.refundText).toBe("退 ¥0.00 · —单");
     expect(isRefundVisible(0, 0)).toBe(false);
-    expect(isRefundVisible(null, 0)).toBe(true);
+    expect(isRefundVisible(null, 0)).toBe(false);
     expect(isRefundVisible(0, null)).toBe(false);
     expect(isRefundVisible(undefined, undefined)).toBe(true);
   });
@@ -455,8 +548,67 @@ describe("store management score and deposit presentation", () => {
     expect(missingRefundCount.refundText).toBe("退 ¥0.00 · —单");
     expect(missingRefundCount.title).toBeUndefined();
     expect(stale.text).toBe("¥0.00");
-    expect(stale.title).toBeUndefined();
+    expect(stale.title).toContain("更新时间 2026-11-22 17:30:00");
+    expect(stale.title).toContain("本次读取失败");
+    expect(stale.title).toContain("错误 timeout");
     expect(missing.text).toBe("—");
+  });
+
+  it("keeps unknown fund balances unknown and exposes stale fund provenance", () => {
+    const unknown = fundPresentation({
+      metrics: { cash: null, settle: null },
+      fund_meta: {
+        status: { cash: "missing", settle: "missing" },
+        source: "资金接口",
+        as_of_date: "",
+        error: "接口未返回余额",
+      },
+    }, "cash", { today: "2026-11-27" });
+    const stale = fundPresentation({
+      metrics: { cash: 12300, settle: 0 },
+      fund_meta: {
+        status: { cash: "stale", settle: "updated" },
+        source: "资金账户旧缓存",
+        as_of_date: "2026-11-26",
+        updated_at: "2026-11-26 08:10:00",
+        error: "刷新超时",
+      },
+    }, "cash", { today: "2026-11-27" });
+    const realZero = fundPresentation({
+      metrics: { settle: 0 },
+      fund_meta: {
+        status: { settle: "updated" },
+        source: "资金账户",
+        as_of_date: "2026-11-27",
+      },
+    }, "settle", { today: "2026-11-27" });
+
+    expect(unknown.text).toBe("—");
+    expect(unknown.title).toContain("接口未返回余额");
+    expect(stale.text).toBe("¥123.00");
+    expect(stale.stale).toBe(true);
+    expect(stale.title).toContain("数据日期 2026-11-26");
+    expect(stale.title).toContain("沿用最后可信值");
+    expect(stale.title).toContain("错误 刷新超时");
+    expect(realZero.text).toBe("¥0.00");
+    expect(realZero.stale).toBe(false);
+  });
+
+  it("uses each exposure period date instead of the page date", () => {
+    const exposure = exposurePresentation({
+      exposure_people: { today: 30 },
+      exposure_meta: {
+        as_of_date: "2026-11-27",
+        period_dates: { today: "2026-11-25" },
+        status: { today: "stale" },
+        source: "商品数据缓存",
+        error: "Compass 超时",
+      },
+    }, "today", { today: "2026-11-27" });
+
+    expect(exposure.text).toBe("—");
+    expect(exposure.title).toContain("数据日期 2026-11-25");
+    expect(exposure.title).toContain("Compass 超时");
   });
 
   it("renders value, amplitude, tooltip and missing status for each score", () => {

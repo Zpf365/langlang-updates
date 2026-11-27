@@ -133,8 +133,8 @@ function hydrate() {
     trim_head: 0,
     remove_head_index: 0,
     remove_detail_index: 0,
-    trim_detail: 2,
-    trim_detail_tail: 2,
+    trim_detail: 0,
+    trim_detail_tail: 0,
     detail_keep_first: 0,
     cloud_violation: true,
     cloud_violation_types: "",
@@ -481,7 +481,7 @@ function submit() {
 
         <section class="template-section">
           <h3>标题替换</h3>
-          <p class="template-help">每行一条：旧标题片段=新标题片段；新标题片段留空表示删除。</p>
+          <p class="template-help">每行一条：旧标题片段=新标题片段；同一标题中出现的所有旧文字都会替换，多条规则按从上到下顺序执行；新标题片段留空表示删除。</p>
           <textarea v-model="form.title_replace_rules" class="input template-textarea" />
         </section>
 
@@ -738,7 +738,7 @@ function submit() {
             </label>
           </div>
           <p class="template-help">
-            顺序执行后才能得到最终图片列表。主图至少保留 1 张；详情图处理后为空时任务会明确阻断。
+            顺序执行后才能得到最终图片列表。图片被规则移除为空时，会优先使用店铺已有的真实主图或详情图回退；无法回退时只标记对应商品。
           </p>
         </section>
 

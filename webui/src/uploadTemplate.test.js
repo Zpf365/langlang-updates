@@ -16,8 +16,8 @@ function baseForm(overrides = {}) {
     deposit_limit: 300,
     low_price_multiplier: 2,
     trim_head: 0,
-    trim_detail: 2,
-    trim_detail_tail: 2,
+    trim_detail: 0,
+    trim_detail_tail: 0,
     detail_keep_first: 0,
     remove_head_index: 0,
     remove_detail_index: 0,
@@ -47,6 +47,12 @@ describe("upload template editor calculations", () => {
     expect(payload.legacy_field).toBe("must-survive");
     expect(payload.category_business_type).toBe("individual");
     expect(payload.custom_future_field).toBe("must-survive");
+    expect(payload.trim_head).toBe(0);
+    expect(payload.remove_head_index).toBe(0);
+    expect(payload.remove_detail_index).toBe(0);
+    expect(payload.trim_detail).toBe(0);
+    expect(payload.trim_detail_tail).toBe(0);
+    expect(payload.detail_keep_first).toBe(0);
   });
 
   it("accepts the original four-part ladder syntax and rejects malformed rules", () => {
@@ -120,6 +126,28 @@ describe("upload template editor calculations", () => {
     expect(payload.trim_detail).toBe(2);
     expect(payload.trim_detail_tail).toBe(2);
     expect(payload.detail_keep_first).toBe(0);
+  });
+
+  it("passes empty processed images to the real upload fallback instead of blocking", () => {
+    const emptied = applyImageRules(
+      {
+        head_imgs: ["h1", "h2", "h3"],
+        desc_info: { imgs: ["d1", "d2", "d3"] },
+      },
+      {
+        remove_head_index: 2,
+        trim_head: 2,
+        remove_detail_index: 0,
+        trim_detail: 2,
+        trim_detail_tail: 2,
+        detail_keep_first: 0,
+      },
+    );
+
+    expect(emptied.head_imgs).toEqual([]);
+    expect(emptied.desc_info.imgs).toEqual([]);
+    expect(emptied._source_image_counts).toEqual({ head: 3, detail: 3 });
+    expect(emptied._template_image_processing).toContain('"trim_detail_tail":2');
   });
 
   it("keeps an optional three-level category snapshot with the template", () => {
