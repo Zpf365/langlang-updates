@@ -184,6 +184,12 @@ class ShopPrivateError(RuntimeError):
     pass
 
 
+class ShopPrivateWriteUncertainError(ShopPrivateError):
+    """A write request was sent but its business result is unknown."""
+
+    verification_pending = True
+
+
 def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
@@ -503,6 +509,8 @@ class ShopPrivateClient:
         body: dict[str, Any],
         timeout: int = 25,
         headers: dict[str, str] | None = None,
+        *,
+        write_attempt: bool = False,
     ) -> dict[str, Any]:
         delay = self._min_interval - (time.monotonic() - self._last_request)
         if delay > 0:
@@ -516,7 +524,12 @@ class ShopPrivateClient:
                 timeout=timeout,
             )
         except requests.RequestException as exc:
-            raise ShopPrivateError(f"商家后台网络异常：{exc}") from exc
+            message = f"商家后台网络异常：{exc}"
+            if write_attempt:
+                raise ShopPrivateWriteUncertainError(
+                    "写入请求已发出但连接结果未知，待核实：" + message
+                ) from exc
+            raise ShopPrivateError(message) from exc
         finally:
             self._last_request = time.monotonic()
         if response.status_code in {401, 403, 429}:
@@ -533,8 +546,16 @@ class ShopPrivateClient:
         try:
             result = response.json()
         except ValueError as exc:
+            if write_attempt:
+                raise ShopPrivateWriteUncertainError(
+                    "写入请求已返回无法解析的响应，待核实"
+                ) from exc
             raise ShopPrivateError("商家后台返回了非 JSON 页面") from exc
         if not isinstance(result, dict):
+            if write_attempt:
+                raise ShopPrivateWriteUncertainError(
+                    "写入请求响应格式异常，结果待核实"
+                )
             raise ShopPrivateError("商家后台返回格式异常")
         code = result.get("code")
         if code not in (None, 0, "0") or result.get("errcode") not in (None, 0, "0"):
@@ -1621,6 +1642,7 @@ class ShopPrivateClient:
                     "ids": [str(value) for value in product_ids],
                     "uploadSource": 6,
                 },
+                write_attempt=True,
             )
         )
         if result.get("success") is not True and not (

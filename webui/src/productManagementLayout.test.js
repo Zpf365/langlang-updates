@@ -28,12 +28,14 @@ describe("product management layout and recycle delete UI", () => {
 
   it("uses explicit recycle trash semantics without replacing quick local refresh", () => {
     expect(source).toContain('Number(product.status) === 6 ? "彻底删除" : "删除"');
-    expect(source).toContain("allSelectedInRecycle.value");
+    expect(source).toContain("allSelectedInRecycle");
     expect(source).toContain('"批量彻底删除"');
-    expect(source).toContain("彻底删除操作不可恢复");
-    expect(source).toContain("平台仍存在时不会显示成功");
-    expect(source).toContain('call("products.delete"');
-    expect(source).toContain("store_id: row.store_id");
+    expect(source).toContain("彻底删除不可恢复");
+    expect(source).toContain("平台回收站仍存在时不会显示成功");
+    expect(source).toContain('"批量移入回收站"');
+    expect(source).toContain('runSelectedBatch("delete"');
+    expect(source).toContain("productSelectionKey");
+    expect(source).toContain("会先按店铺和平台批量上限分块移入回收站");
     expect(source).toContain("await loadProducts()");
     expect(source).toContain("await loadOperationLogs()");
   });

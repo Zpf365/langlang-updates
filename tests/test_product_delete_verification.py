@@ -39,6 +39,9 @@ class _PrivateClient:
     instances = []
     recycle_ids: dict[int, list[str]] = {}
     batch_error: Exception | None = None
+    scan_error: Exception | None = None
+    remove_on_real: bool = False
+    remove_on_real_store_ids: set[int] = set()
 
     def __init__(self, _database, store):
         self.store = store
@@ -49,11 +52,21 @@ class _PrivateClient:
         self.calls.append(("batch", tuple(product_ids), way))
         if self.__class__.batch_error is not None:
             raise self.__class__.batch_error
+        if way == "real" and (
+            self.__class__.remove_on_real
+            or self.store.id in self.__class__.remove_on_real_store_ids
+        ):
+            current = self.__class__.recycle_ids.setdefault(self.store.id, [])
+            for product_id in product_ids:
+                if product_id in current:
+                    current.remove(product_id)
         return {"success": True}
 
     def scan_products(self, tab_key, **_kwargs):
         self.calls.append(("scan", tab_key))
         assert tab_key == "recycle"
+        if self.__class__.scan_error is not None:
+            raise self.__class__.scan_error
         return [
             SimpleNamespace(product_id=product_id)
             for product_id in self.__class__.recycle_ids.get(
@@ -61,6 +74,16 @@ class _PrivateClient:
                 [],
             )
         ]
+
+
+@pytest.fixture(autouse=True)
+def _reset_private_client():
+    _PrivateClient.instances = []
+    _PrivateClient.recycle_ids = {}
+    _PrivateClient.batch_error = None
+    _PrivateClient.scan_error = None
+    _PrivateClient.remove_on_real = False
+    _PrivateClient.remove_on_real_store_ids = set()
 
 
 class _OfficialClient:
@@ -94,8 +117,10 @@ def test_recycle_product_with_app_secret_uses_private_real_delete(
     store_id = database.add_store("回收站店铺", "wx-real-delete", "secret")
     _seed_product(database, store_id, "recycle-1", 6)
     _PrivateClient.instances = []
-    _PrivateClient.recycle_ids = {store_id: []}
+    _PrivateClient.recycle_ids = {store_id: ["recycle-1"]}
     _PrivateClient.batch_error = None
+    _PrivateClient.scan_error = None
+    _PrivateClient.remove_on_real = True
     monkeypatch.setattr(
         "weimi_manager.service.ShopPrivateClient",
         _PrivateClient,
@@ -112,12 +137,87 @@ def test_recycle_product_with_app_secret_uses_private_real_delete(
     assert official.delete_calls == []
     assert result["delete_mode"] == "real"
     assert result["remote_verified"] is True
-    assert _PrivateClient.instances[0].calls[0] == (
+    calls = [
+        call
+        for instance in _PrivateClient.instances
+        for call in instance.calls
+    ]
+    assert calls[0] == (
+        "scan",
+        "recycle",
+    )
+    assert calls[1] == (
         "batch",
         ("recycle-1",),
         "real",
     )
+    assert calls[2] == (
+        "scan",
+        "recycle",
+    )
     assert database.get_product(store_id, "recycle-1") is None
+
+
+def test_cached_recycle_product_empty_platform_pre_read_does_not_call_real(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = Database(tmp_path / "delete-pre-read-empty.db")
+    store_id = database.add_store("空回收站店铺", "wx-empty-recycle", "secret")
+    _seed_product(database, store_id, "cached-missing", 6)
+    _PrivateClient.instances = []
+    _PrivateClient.recycle_ids = {store_id: []}
+    _PrivateClient.batch_error = None
+    _PrivateClient.scan_error = None
+    _PrivateClient.remove_on_real = False
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        _PrivateClient,
+    )
+
+    with pytest.raises(
+        ProductDeleteUncertainError,
+        match="待核实|未找到",
+    ):
+        _service(database).product_write(
+            database.get_store(store_id),
+            "delete",
+            product_id="cached-missing",
+        )
+
+    assert _PrivateClient.instances[0].calls == [("scan", "recycle")]
+    assert database.get_product(store_id, "cached-missing") is not None
+
+
+def test_cached_recycle_product_pre_read_failure_does_not_call_real(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = Database(tmp_path / "delete-pre-read-failure.db")
+    store_id = database.add_store("回读失败店铺", "wx-pre-read-failure", "secret")
+    _seed_product(database, store_id, "cached-failure", 6)
+    _PrivateClient.instances = []
+    _PrivateClient.recycle_ids = {store_id: ["cached-failure"]}
+    _PrivateClient.batch_error = None
+    _PrivateClient.scan_error = RuntimeError("回收站读取失败")
+    _PrivateClient.remove_on_real = False
+    monkeypatch.setattr(
+        "weimi_manager.service.ShopPrivateClient",
+        _PrivateClient,
+    )
+
+    with pytest.raises(
+        ProductDeleteUncertainError,
+        match="待核实|读取失败",
+    ):
+        _service(database).product_write(
+            database.get_store(store_id),
+            "delete",
+            product_id="cached-failure",
+        )
+
+    assert _PrivateClient.instances[0].calls == [("scan", "recycle")]
+    assert database.get_product(store_id, "cached-failure") is not None
 
 
 def test_delete_success_with_product_still_in_recycle_is_failure(
@@ -240,8 +340,12 @@ def test_delete_uses_each_rows_store_scope(
     _seed_product(database, first_id, "shared-id", 6)
     _seed_product(database, second_id, "shared-id", 6)
     _PrivateClient.instances = []
-    _PrivateClient.recycle_ids = {first_id: [], second_id: ["shared-id"]}
+    _PrivateClient.recycle_ids = {
+        first_id: ["shared-id"],
+        second_id: ["shared-id"],
+    }
     _PrivateClient.batch_error = None
+    _PrivateClient.remove_on_real_store_ids = {first_id}
     monkeypatch.setattr(
         "weimi_manager.service.ShopPrivateClient",
         _PrivateClient,

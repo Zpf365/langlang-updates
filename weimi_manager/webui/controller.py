@@ -204,6 +204,8 @@ ORDER_SOFTWARE_NOTES_SETTING = "webui_order_software_notes"
 ORDER_FLAGS_SETTING = "webui_order_flags"
 ORDER_PURCHASE_INFO_SETTING = "order_purchase_info"
 TRANSIT_SHIPPING_RULES_SETTING = "transit_shipping_rules"
+PRODUCT_TASK_JOBS_SETTING = "webui_product_task_jobs"
+PRODUCT_TASK_JOB_LIMIT = 80
 ANALYTICS_PUBLISH_KEY_LIMIT = 2048
 ANALYTICS_PUBLISH_KEY_TTL_SECONDS = 24 * 3600
 STORE_SCORE_FIELDS = (
@@ -345,6 +347,7 @@ ACCOUNT_TASK_TERMINAL_STATUSES = {
     "completed",
     "partial",
     "failed",
+    "verification_pending",
     "cancelled",
 }
 ALL_STORES_KEY = "__all__"
@@ -506,6 +509,11 @@ class NextUiController:
         )
         self._product_jobs: dict[str, dict[str, Any]] = {}
         self._product_jobs_lock = threading.Lock()
+        self._product_batch_jobs: dict[str, dict[str, Any]] = {}
+        self._product_batch_jobs_lock = threading.Lock()
+        self._product_task_registry_lock = threading.RLock()
+        self._product_store_leases: dict[int, str] = {}
+        self._product_store_leases_lock = threading.RLock()
         self._product_backend_jobs: dict[str, dict[str, Any]] = {}
         self._product_backend_jobs_lock = threading.Lock()
         self._store_jobs: dict[str, dict[str, Any]] = {}
@@ -653,6 +661,185 @@ class NextUiController:
             raise PermissionError(
                 f"{label}会话代际不匹配，已拒绝读取或操作"
             )
+
+    def _require_persisted_product_task_owner(
+        self,
+        job: dict[str, Any],
+        label: str,
+    ) -> None:
+        with self._account_session_lock:
+            if self._account_session_closing:
+                raise PermissionError(
+                    f"{label}所属账户会话正在关闭，不能读取"
+                )
+            current_account = self._account_id()
+        if str(job.get("account_id") or "") != current_account:
+            raise PermissionError(f"{label}不属于当前账户，已拒绝读取")
+
+    def _claim_product_store_leases(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> list[int]:
+        normalized = sorted(
+            {
+                int(store_id)
+                for store_id in store_ids
+                if int(store_id) > 0
+            }
+        )
+        with self._product_store_leases_lock:
+            conflicts = [
+                store_id
+                for store_id in normalized
+                if store_id in self._product_store_leases
+            ]
+            if conflicts:
+                raise ValueError(
+                    "所选店铺商品正在执行另一任务，请等待或取消后再试："
+                    + ", ".join(map(str, conflicts))
+                )
+            for store_id in normalized:
+                self._product_store_leases[store_id] = owner
+        return normalized
+
+    def _release_product_store_leases(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> None:
+        with self._product_store_leases_lock:
+            for store_id in store_ids:
+                if self._product_store_leases.get(int(store_id)) == owner:
+                    self._product_store_leases.pop(int(store_id), None)
+
+    @contextmanager
+    def _product_store_lease(
+        self,
+        store_ids: list[int],
+        owner: str,
+    ) -> Iterator[list[int]]:
+        normalized = self._claim_product_store_leases(store_ids, owner)
+        try:
+            yield normalized
+        finally:
+            self._release_product_store_leases(normalized, owner)
+
+    @staticmethod
+    def _public_product_task(
+        job: dict[str, Any],
+        *,
+        include_products: bool = False,
+    ) -> dict[str, Any]:
+        public = {
+            key: copy.deepcopy(value)
+            for key, value in job.items()
+            if not str(key).startswith("_")
+            and (
+                include_products
+                or key != "products"
+            )
+        }
+        public.pop("runner", None)
+        return public
+
+    def _load_product_task_registry(self) -> dict[str, dict[str, Any]]:
+        try:
+            payload = json.loads(
+                self.db.get_setting(PRODUCT_TASK_JOBS_SETTING, "{}")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        raw_tasks = payload.get("tasks") if isinstance(payload, dict) else {}
+        if not isinstance(raw_tasks, dict):
+            return {}
+        return {
+            str(job_id): dict(job)
+            for job_id, job in raw_tasks.items()
+            if isinstance(job, dict)
+        }
+
+    def _persist_product_task(self, job: dict[str, Any]) -> None:
+        job_id = str(job.get("job_id") or "").strip()
+        if not job_id:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        stored = self._public_product_task(job)
+        stored["updated_at"] = now
+        stored.setdefault("created_at", now)
+        with self._product_task_registry_lock:
+            tasks = self._load_product_task_registry()
+            tasks[job_id] = stored
+            if len(tasks) > PRODUCT_TASK_JOB_LIMIT:
+                ordered = sorted(
+                    tasks.items(),
+                    key=lambda item: str(
+                        item[1].get("updated_at")
+                        or item[1].get("created_at")
+                        or ""
+                    ),
+                    reverse=True,
+                )
+                tasks = dict(ordered[:PRODUCT_TASK_JOB_LIMIT])
+            self.db.set_setting(
+                PRODUCT_TASK_JOBS_SETTING,
+                json.dumps(
+                    {"tasks": tasks},
+                    ensure_ascii=False,
+                ),
+            )
+
+    def _load_product_task(self, job_id: str) -> dict[str, Any] | None:
+        with self._product_task_registry_lock:
+            job = self._load_product_task_registry().get(job_id)
+        if job is None:
+            return None
+        if job.get("status") == "paused":
+            return job
+        if job.get("status") not in ACCOUNT_TASK_TERMINAL_STATUSES:
+            if job.get("kind") == "refresh":
+                job["message"] = (
+                    "上次商品刷新随程序退出中断；当前结果待核实，请重新刷新"
+                )
+                job["status"] = "verification_pending"
+                job["verification_pending"] = True
+            else:
+                job["message"] = (
+                    "上次商品批量操作随程序退出中断；未完成项已恢复为待核实"
+                )
+                items = list(job.get("items") or [])
+                for row in items:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("status") not in {
+                        "success",
+                        "failed",
+                        "cancelled",
+                        "pending",
+                    }:
+                        row["status"] = "pending"
+                        row["message"] = "程序中断，未获得平台执行结论"
+                job["items"] = items
+                counts = {
+                    status: sum(
+                        1
+                        for row in items
+                        if isinstance(row, dict)
+                        and row.get("status") == status
+                    )
+                    for status in ("success", "failed", "cancelled", "pending")
+                }
+                job["counts"] = counts
+                job["success"] = counts["success"]
+                job["failed"] = counts["failed"]
+                job["cancelled_count"] = counts["cancelled"]
+                job["pending"] = counts["pending"]
+                job["total"] = len(items)
+                job["current"] = len(items)
+                job["status"] = "verification_pending"
+                job["verification_pending"] = True
+            self._persist_product_task(job)
+        return job
 
     def _authorize_platform_write(self, app_id: str, action: str) -> None:
         with self._account_session_lock:
@@ -836,6 +1023,11 @@ class NextUiController:
             "products.refresh": self._refresh_products,
             "products.refresh.start": self._start_product_refresh,
             "products.refresh.status": self._product_refresh_status,
+            "products.refresh.cancel": self._cancel_product_refresh,
+            "products.batch.start": self._start_product_batch,
+            "products.batch.status": self._product_batch_status,
+            "products.batch.cancel": self._cancel_product_batch,
+            "products.tasks.list": self._list_product_tasks,
             "products.delete": self._delete_product,
             "products.cancel-audit": self._cancel_product_audit,
             "products.set-listing": self._set_products_listing,
@@ -2381,6 +2573,7 @@ class NextUiController:
         groups = (
             ("店铺刷新", self._store_jobs, self._store_jobs_lock),
             ("商品刷新", self._product_jobs, self._product_jobs_lock),
+            ("商品批量操作", self._product_batch_jobs, self._product_batch_jobs_lock),
             ("订单刷新", self._order_jobs, self._order_jobs_lock),
             ("上传任务", self._upload_jobs, self._upload_jobs_lock),
             ("自动化", self._automation_jobs, self._automation_jobs_lock),
@@ -2440,6 +2633,7 @@ class NextUiController:
         groups = (
             ("店铺刷新", self._store_jobs, self._store_jobs_lock),
             ("商品刷新", self._product_jobs, self._product_jobs_lock),
+            ("商品批量操作", self._product_batch_jobs, self._product_batch_jobs_lock),
             ("订单刷新", self._order_jobs, self._order_jobs_lock),
             ("上传任务", self._upload_jobs, self._upload_jobs_lock),
             ("自动化", self._automation_jobs, self._automation_jobs_lock),
@@ -2478,6 +2672,11 @@ class NextUiController:
                     paused = getattr(runner, "paused", None)
                     if paused is not None and hasattr(paused, "set"):
                         paused.set()
+                    cancel_event = job.get("_cancel_event")
+                    if isinstance(cancel_event, threading.Event):
+                        cancel_event.set()
+                    if job.get("kind") in {"refresh", "batch"}:
+                        self._persist_product_task(job)
         with self._upload_category_timer_lock:
             if (
                 self._upload_category_timer is not None
@@ -10447,7 +10646,11 @@ class NextUiController:
         service = self._require_product_service()
         store = self._require_store(self._store_id(payload))
         tab_key = str(payload.get("tab_key") or "sales")
-        result = service.refresh_product_tab(store, tab_key)
+        with self._product_store_lease(
+            [store.id],
+            f"manual-refresh:{store.id}",
+        ):
+            result = service.refresh_product_tab(store, tab_key)
         errors = list(getattr(result, "errors", []) or [])
         if not isinstance(result, dict):
             result_data = asdict(result)
@@ -10496,27 +10699,39 @@ class NextUiController:
         tab_keys = list(dict.fromkeys(tab_keys))
         generation = self._current_generation()
         owner = self._job_owner_fields()
+        cancel_event = threading.Event()
+        job_id = uuid.uuid4().hex
+        lease_id = f"refresh:{job_id}"
         with self._product_jobs_lock:
             for existing in self._product_jobs.values():
                 if (
                     existing.get("store_id") == store.id
-                    and existing.get("status") in {"starting", "running"}
+                    and self._job_is_active(existing)
                 ):
                     return {"job_id": existing["job_id"], "already_running": True}
-            job_id = uuid.uuid4().hex
-            self._product_jobs[job_id] = {
-                "job_id": job_id,
-                **owner,
-                "store_id": store.id,
-                "tab_key": tab_keys[0],
-                "tab_keys": tab_keys,
-                "status": "starting",
-                "current": 0,
-                "total": 0,
-                "message": "正在连接微信小店…",
-                "errors": [],
-                "products": [],
-            }
+            self._claim_product_store_leases([store.id], lease_id)
+            try:
+                self._product_jobs[job_id] = {
+                    "job_id": job_id,
+                    **owner,
+                    "kind": "refresh",
+                    "action": "refresh",
+                    "store_id": store.id,
+                    "tab_key": tab_keys[0],
+                    "tab_keys": tab_keys,
+                    "status": "starting",
+                    "current": 0,
+                    "total": 0,
+                    "message": "正在连接微信小店…",
+                    "errors": [],
+                    "products": [],
+                    "cancel_requested": False,
+                    "_cancel_event": cancel_event,
+                }
+                self._persist_product_task(self._product_jobs[job_id])
+            except Exception:
+                self._release_product_store_leases([store.id], lease_id)
+                raise
 
         def update(**changes: Any) -> None:
             with self._product_jobs_lock:
@@ -10524,7 +10739,18 @@ class NextUiController:
                     return
                 job = self._product_jobs.get(job_id)
                 if job is not None:
+                    if (
+                        job.get("status") == "cancelling"
+                        and changes.get("status") == "running"
+                    ):
+                        changes["status"] = "cancelling"
+                    if changes.get("status") in ACCOUNT_TASK_TERMINAL_STATUSES:
+                        changes.setdefault(
+                            "finished_at",
+                            datetime.now().isoformat(timespec="seconds"),
+                        )
                     job.update(changes)
+                    self._persist_product_task(job)
 
         def progress(message: str, current: int, total: int) -> None:
             update(
@@ -10534,7 +10760,7 @@ class NextUiController:
                 total=max(0, int(total)),
             )
 
-        def worker() -> None:
+        def worker_body() -> None:
             update(status="running", message="正在读取商品目录…")
             try:
                 errors: list[str] = []
@@ -10543,6 +10769,13 @@ class NextUiController:
                 total_tabs = len(tab_keys)
                 for index, tab_key in enumerate(tab_keys, start=1):
                     if not self._job_update_allowed(generation):
+                        return
+                    if cancel_event.is_set():
+                        update(
+                            status="cancelled",
+                            message="商品刷新已取消，未启动后续页签读取",
+                            cancel_requested=True,
+                        )
                         return
                     def tab_progress(
                         message: str,
@@ -10562,7 +10795,21 @@ class NextUiController:
                         store,
                         tab_key,
                         progress=tab_progress,
+                        cancel_event=cancel_event,
                     )
+                    if (
+                        bool(getattr(result, "cancelled", False))
+                        or cancel_event.is_set()
+                    ):
+                        update(
+                            status="cancelled",
+                            message="商品刷新已取消；当前页签请求结束后停止",
+                            current=index - 1,
+                            total=total_tabs,
+                            errors=errors,
+                            cancel_requested=True,
+                        )
+                        return
                     errors.extend(
                         str(value)
                         for value in (getattr(result, "errors", []) or [])
@@ -10584,6 +10831,13 @@ class NextUiController:
                 ]
                 if not self._job_update_allowed(generation):
                     return
+                if cancel_event.is_set():
+                    update(
+                        status="cancelled",
+                        message="商品刷新已取消，未启动经营指标读取",
+                        cancel_requested=True,
+                    )
+                    return
                 metric_methods: list[tuple[Any, dict[str, Any]]] = []
                 if self.db.get_web_cookies(store.id):
                     private_metrics = getattr(
@@ -10603,15 +10857,30 @@ class NextUiController:
                 metric_failures: list[str] = []
                 if metric_product_ids:
                     for metric_method, metric_kwargs in metric_methods:
+                        if cancel_event.is_set():
+                            update(
+                                status="cancelled",
+                                message="商品刷新已取消，未启动后续经营指标读取",
+                                cancel_requested=True,
+                            )
+                            return
                         try:
                             metric_result = metric_method(
                                 store,
                                 metric_product_ids,
+                                cancel_event=cancel_event,
                                 **metric_kwargs,
                             )
                         except Exception as exc:
                             metric_failures.append(str(exc))
                             continue
+                        if cancel_event.is_set():
+                            update(
+                                status="cancelled",
+                                message="商品刷新已取消，未启动后续经营指标读取",
+                                cancel_requested=True,
+                            )
+                            return
                         tab_messages.append(
                             str(
                                 getattr(metric_result, "message", "")
@@ -10637,6 +10906,14 @@ class NextUiController:
                         "search": str(payload.get("search") or ""),
                     }
                 )["products"]
+                if cancel_event.is_set():
+                    update(
+                        status="cancelled",
+                        message="商品刷新已取消，未提交后续读取结果",
+                        errors=errors,
+                        cancel_requested=True,
+                    )
+                    return
                 total = max(len(products), reported_count)
                 update(
                     status="partial" if errors else "completed",
@@ -10653,6 +10930,12 @@ class NextUiController:
                     errors=[str(exc)],
                 )
 
+        def worker() -> None:
+            try:
+                worker_body()
+            finally:
+                self._release_product_store_leases([store.id], lease_id)
+
         threading.Thread(
             target=worker,
             name=f"webui-product-refresh-{store.id}",
@@ -10662,18 +10945,674 @@ class NextUiController:
 
     def _product_refresh_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         job_id = str(payload.get("job_id") or "")
+        if not job_id:
+            raise ValueError("job_id 不能为空")
+        job: dict[str, Any] | None
         with self._product_jobs_lock:
             job = self._product_jobs.get(job_id)
-            if job is None:
+        persisted = job is None
+        if job is None:
+            job = self._load_product_task(job_id)
+            if job is None or job.get("kind") != "refresh":
                 raise ValueError("商品刷新任务不存在")
-            result = {
-                key: value
-                for key, value in job.items()
-                if key != "products"
+        if persisted:
+            self._require_persisted_product_task_owner(job, "商品刷新任务")
+        else:
+            self._require_job_owner(job, "商品刷新任务")
+        terminal = job.get("status") in ACCOUNT_TASK_TERMINAL_STATUSES
+        return self._public_product_task(
+            job,
+            include_products=terminal,
+        )
+
+    def _cancel_product_refresh(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("job_id 不能为空")
+        with self._product_jobs_lock:
+            job = self._product_jobs.get(job_id)
+        if job is None:
+            persisted = self._load_product_task(job_id)
+            if persisted is None or persisted.get("kind") != "refresh":
+                raise ValueError("商品刷新任务不存在")
+            self._require_persisted_product_task_owner(
+                persisted,
+                "商品刷新任务",
+            )
+            return persisted
+        self._require_job_owner(job, "商品刷新任务")
+        if job.get("status") in ACCOUNT_TASK_TERMINAL_STATUSES:
+            return self._public_product_task(job)
+        cancel_event = job.get("_cancel_event")
+        if isinstance(cancel_event, threading.Event):
+            cancel_event.set()
+        with self._product_jobs_lock:
+            job["status"] = "cancelling"
+            job["cancel_requested"] = True
+            job["message"] = (
+                "正在取消商品刷新；当前页签请求结束后停止，"
+                "不会启动后续页签"
+            )
+            self._persist_product_task(job)
+            return self._public_product_task(job)
+
+    def _start_product_batch(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        service = self._require_product_service()
+        action = str(payload.get("action") or "").strip()
+        if action not in {
+            "listing",
+            "delisting",
+            "recycle",
+            "delete",
+            "cancel_audit",
+        }:
+            raise ValueError("不支持的商品批量操作")
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("至少选择一个商品")
+        if len(raw_items) > 5000:
+            raise ValueError("单次商品批量操作不能超过 5000 个商品")
+        normalized: list[dict[str, Any]] = []
+        seen: set[tuple[int, str]] = set()
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                raise ValueError("商品批量操作项格式无效")
+            try:
+                store_id = int(raw.get("store_id"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("商品批量操作项缺少有效店铺") from exc
+            product_id = str(raw.get("product_id") or "").strip()
+            if store_id <= 0 or not product_id:
+                raise ValueError("商品批量操作项缺少有效店铺或商品 ID")
+            key = (store_id, product_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            store = self._require_store(store_id)
+            product = self.db.get_product(store_id, product_id) or {}
+            normalized.append(
+                {
+                    "store_id": store_id,
+                    "store_name": store.name,
+                    "product_id": product_id,
+                    "title": str(product.get("title") or ""),
+                    "status": "queued",
+                    "message": "等待执行",
+                }
+            )
+        labels = {
+            "listing": "批量上架",
+            "delisting": "批量下架",
+            "recycle": "批量移入回收站",
+            "delete": "批量彻底删除",
+            "cancel_audit": "批量撤回审核",
+        }
+        job_id = uuid.uuid4().hex
+        generation = self._current_generation()
+        owner = self._job_owner_fields()
+        cancel_event = threading.Event()
+        store_ids = list(dict.fromkeys(row["store_id"] for row in normalized))
+        lease_id = f"delete:{job_id}"
+        with self._product_batch_jobs_lock:
+            if any(
+                self._job_is_active(job)
+                and int(job.get("store_id") or 0) in store_ids
+                for job in self._product_batch_jobs.values()
+            ):
+                raise ValueError("所选店铺已有商品批量操作正在运行")
+            if action in {"delete", "recycle"}:
+                self._claim_product_store_leases(store_ids, lease_id)
+            else:
+                with self._product_jobs_lock:
+                    if any(
+                        self._job_is_active(job)
+                        and int(job.get("store_id") or 0) in store_ids
+                        for job in self._product_jobs.values()
+                    ):
+                        raise ValueError(
+                            "所选店铺商品正在刷新，请先等待或取消刷新"
+                        )
+            try:
+                self._product_batch_jobs[job_id] = {
+                    "job_id": job_id,
+                    **owner,
+                    "kind": "batch",
+                    "action": action,
+                    "label": labels[action],
+                    "store_id": store_ids[0] if len(store_ids) == 1 else 0,
+                    "store_ids": store_ids,
+                    "status": "starting",
+                    "message": f"正在准备{labels[action]}…",
+                    "current": 0,
+                    "total": len(normalized),
+                    "success": 0,
+                    "failed": 0,
+                    "pending": 0,
+                    "cancelled_count": 0,
+                    "counts": {
+                        "success": 0,
+                        "failed": 0,
+                        "cancelled": 0,
+                        "pending": 0,
+                    },
+                    "items": normalized,
+                    "errors": [],
+                    "cancel_requested": False,
+                    "_cancel_event": cancel_event,
+                }
+                self._persist_product_task(self._product_batch_jobs[job_id])
+                initial = self._public_product_task(
+                    self._product_batch_jobs[job_id]
+                )
+            except Exception:
+                if action in {"delete", "recycle"}:
+                    self._release_product_store_leases(
+                        store_ids,
+                        lease_id,
+                    )
+                raise
+
+        def counts_locked(job: dict[str, Any]) -> dict[str, int]:
+            items = [
+                row
+                for row in job.get("items", [])
+                if isinstance(row, dict)
+            ]
+            counts = {
+                status: sum(
+                    1 for row in items if row.get("status") == status
+                )
+                for status in ("success", "failed", "cancelled", "pending")
             }
-            if job.get("status") in {"completed", "partial"}:
-                result["products"] = list(job.get("products") or [])
-        return result
+            queued = sum(1 for row in items if row.get("status") == "queued")
+            counts["queued"] = queued
+            return counts
+
+        def update(**changes: Any) -> dict[str, Any] | None:
+            with self._product_batch_jobs_lock:
+                if not self._job_update_allowed(generation):
+                    return None
+                job = self._product_batch_jobs.get(job_id)
+                if job is None:
+                    return None
+                if (
+                    job.get("status") == "cancelling"
+                    and changes.get("status") == "running"
+                ):
+                    changes["status"] = "cancelling"
+                prior_current = max(0, int(job.get("current") or 0))
+                job.update(changes)
+                counts = counts_locked(job)
+                job["success"] = counts["success"]
+                job["failed"] = counts["failed"]
+                job["pending"] = counts["pending"]
+                job["cancelled_count"] = counts["cancelled"]
+                job["counts"] = {
+                    key: counts[key]
+                    for key in ("success", "failed", "cancelled", "pending")
+                }
+                completed_count = job["total"] - counts["queued"]
+                requested_current = changes.get("current")
+                job["current"] = (
+                    (
+                        completed_count
+                        if changes.get("status") in ACCOUNT_TASK_TERMINAL_STATUSES
+                        else max(completed_count, prior_current)
+                    )
+                    if requested_current is None
+                    else max(
+                        completed_count,
+                        min(
+                            job["total"],
+                            max(0, int(requested_current)),
+                        ),
+                    )
+                )
+                if changes.get("status") in ACCOUNT_TASK_TERMINAL_STATUSES:
+                    job.setdefault(
+                        "finished_at",
+                        datetime.now().isoformat(timespec="seconds"),
+                    )
+                self._persist_product_task(job)
+                return self._public_product_task(job)
+
+        def set_item(
+            store_id: int,
+            product_id: str,
+            status: str,
+            message: str = "",
+        ) -> None:
+            with self._product_batch_jobs_lock:
+                if not self._job_update_allowed(generation):
+                    return
+                job = self._product_batch_jobs.get(job_id)
+                if job is None:
+                    return
+                for row in job.get("items", []):
+                    if (
+                        int(row.get("store_id") or 0) == store_id
+                        and str(row.get("product_id") or "") == product_id
+                    ):
+                        row["status"] = status
+                        row["message"] = str(message or "")[:1000]
+                        break
+                counts = counts_locked(job)
+                job["success"] = counts["success"]
+                job["failed"] = counts["failed"]
+                job["pending"] = counts["pending"]
+                job["cancelled_count"] = counts["cancelled"]
+                job["counts"] = {
+                    key: counts[key]
+                    for key in ("success", "failed", "cancelled", "pending")
+                }
+                job["current"] = job["total"] - counts["queued"]
+                self._persist_product_task(job)
+
+        def progress(
+            message: str,
+            current: int,
+            total: int,
+            *,
+            store_id: int,
+            group_offset: int,
+        ) -> None:
+            update(
+                status="running",
+                message=message,
+                current=min(
+                    len(normalized),
+                    group_offset + max(0, int(current)),
+                ),
+                total=max(len(normalized), int(total)),
+                _progress_store_id=store_id,
+            )
+
+        def worker_body() -> None:
+            update(status="running", message=f"正在执行{labels[action]}…")
+            grouped: dict[int, list[dict[str, Any]]] = {}
+            for row in normalized:
+                grouped.setdefault(row["store_id"], []).append(row)
+            processed_before = 0
+            cancel_stopped = False
+            try:
+                for store_id, group in grouped.items():
+                    if cancel_event.is_set():
+                        for row in group:
+                            set_item(
+                                store_id,
+                                row["product_id"],
+                                "cancelled",
+                                "已取消，未执行平台写操作",
+                            )
+                        continue
+                    store = self._require_store(store_id)
+                    ids = [row["product_id"] for row in group]
+                    if action in {"recycle", "delete"}:
+                        writer = getattr(
+                            service,
+                            "batch_delete_products",
+                            None,
+                        )
+                        try:
+                            if not callable(writer):
+                                raise RuntimeError(
+                                    "当前商品服务不支持批量删除任务"
+                                )
+                            with self._allow_platform_write(
+                                store,
+                                "product_write",
+                                "product_delete",
+                                "product_web_batch_action",
+                                "product_listing",
+                                "product_delisting",
+                            ):
+                                result = writer(
+                                    store,
+                                    ids,
+                                    progress=lambda message, current, total: progress(
+                                        message,
+                                        current,
+                                        total,
+                                        store_id=store_id,
+                                        group_offset=processed_before,
+                                    ),
+                                    cancel_event=cancel_event,
+                                    use_private_batch=bool(
+                                        self.db.get_web_cookies(store.id)
+                                    ),
+                                    hard_delete=action == "delete",
+                                )
+                        except Exception as exc:
+                            for product_id in ids:
+                                set_item(
+                                    store_id,
+                                    product_id,
+                                    "pending",
+                                    "店铺批量删除未获得明确结果，待核实："
+                                    + str(exc),
+                                )
+                            processed_before += len(ids)
+                            continue
+                        result_items = {
+                            str(row.get("product_id") or ""): row
+                            for row in result.get("items") or []
+                            if isinstance(row, dict)
+                        }
+                        for product_id in ids:
+                            row = result_items.get(product_id, {})
+                            set_item(
+                                store_id,
+                                product_id,
+                                str(row.get("status") or "pending"),
+                                str(row.get("message") or ""),
+                            )
+                        processed_before += len(ids)
+                        if bool(result.get("cancelled")):
+                            cancel_stopped = True
+                        if bool(result.get("cancelled")) or cancel_event.is_set():
+                            cancel_event.set()
+                        continue
+
+                    for index, row in enumerate(group, start=1):
+                        product_id = str(row["product_id"])
+                        if cancel_event.is_set():
+                            set_item(
+                                store_id,
+                                product_id,
+                                "cancelled",
+                                "已取消，未启动后续平台写操作",
+                            )
+                            continue
+                        update(
+                            status="running",
+                            message=(
+                                f"{labels[action]} "
+                                f"{processed_before + index}/{len(normalized)}"
+                            ),
+                            current=processed_before + index - 1,
+                            total=len(normalized),
+                            active_product_id=product_id,
+                        )
+                        try:
+                            if action in {"listing", "delisting"}:
+                                with self._allow_platform_write(
+                                    store,
+                                    "product_write",
+                                    "product_listing",
+                                    "product_delisting",
+                                ):
+                                    result = service.set_products_listing(
+                                        store,
+                                        [product_id],
+                                        action == "listing",
+                                    )
+                                public = self._public_service_result(result)
+                            else:
+                                with self._allow_platform_write(
+                                    store,
+                                    "product_write",
+                                    "product_audit_cancel",
+                                ):
+                                    result = service.product_write(
+                                        store,
+                                        "cancel_audit",
+                                        product_id=product_id,
+                                    )
+                                public = dict(result) if isinstance(result, dict) else {}
+                                self._log_product_operation(
+                                    store,
+                                    product_id,
+                                    str(row.get("title") or ""),
+                                    "撤回审核",
+                                    (
+                                        "pending"
+                                        if public.get("verification_pending")
+                                        else "success"
+                                    ),
+                                    str(public.get("message") or ""),
+                                )
+                        except Exception as exc:
+                            status = (
+                                "pending"
+                                if bool(
+                                    getattr(exc, "verification_pending", False)
+                                )
+                                else "failed"
+                            )
+                            set_item(
+                                store_id,
+                                product_id,
+                                status,
+                                str(exc),
+                            )
+                        else:
+                            if public.get("cancelled"):
+                                status = "cancelled"
+                                message = str(
+                                    public.get("message")
+                                    or "已取消，未确认平台写入"
+                                )
+                            elif (
+                                public.get("verification_pending")
+                                or int(public.get("pending") or 0) > 0
+                            ):
+                                status = "pending"
+                                message = str(
+                                    public.get("message")
+                                    or "平台结果待核实"
+                                )
+                            elif int(public.get("failed") or 0) > 0:
+                                status = "failed"
+                                message = str(
+                                    (public.get("errors") or [""])[0]
+                                    or public.get("message")
+                                    or "平台操作失败"
+                                )
+                            else:
+                                status = "success"
+                                message = str(
+                                    public.get("message") or "平台操作完成"
+                                )
+                            set_item(
+                                store_id,
+                                product_id,
+                                status,
+                                message,
+                            )
+                        if cancel_event.is_set():
+                            for remaining in group[index:]:
+                                set_item(
+                                    store_id,
+                                    str(remaining["product_id"]),
+                                    "cancelled",
+                                    "已取消，未启动后续平台写操作",
+                                )
+                            break
+                    processed_before += len(group)
+                with self._product_batch_jobs_lock:
+                    job = self._product_batch_jobs.get(job_id)
+                    if job is None:
+                        return
+                    for row in job.get("items", []):
+                        if row.get("status") == "queued":
+                            row["status"] = "cancelled"
+                            row["message"] = "已取消，未执行平台写操作"
+                    counts = counts_locked(job)
+                if counts["pending"]:
+                    status = "verification_pending"
+                    message = (
+                        f"{labels[action]}结果待核实：成功 {counts['success']} 个，"
+                        f"失败 {counts['failed']} 个，"
+                        f"待核实 {counts['pending']} 个"
+                    )
+                elif cancel_stopped or counts["cancelled"] > 0:
+                    status = "cancelled"
+                    message = (
+                        f"{labels[action]}已取消：成功 {counts['success']} 个，"
+                        f"失败 {counts['failed']} 个，取消 {counts['cancelled']} 个，"
+                        f"待核实 {counts['pending']} 个"
+                    )
+                elif counts["failed"] and counts["success"]:
+                    status = "partial"
+                    message = (
+                        f"{labels[action]}部分完成：成功 {counts['success']} 个，"
+                        f"失败 {counts['failed']} 个"
+                    )
+                elif counts["failed"]:
+                    status = "failed"
+                    message = (
+                        f"{labels[action]}失败：{counts['failed']} 个商品未完成"
+                    )
+                else:
+                    status = "completed"
+                    message = (
+                        f"{labels[action]}完成：成功 {counts['success']} 个"
+                    )
+                errors = [
+                    f"{row.get('product_id')}: {row.get('message')}"
+                    for row in (
+                        self._product_batch_jobs.get(job_id, {}).get("items")
+                        or []
+                    )
+                    if isinstance(row, dict)
+                    and row.get("status") in {"failed", "pending"}
+                ]
+                update(
+                    status=status,
+                    message=message,
+                    errors=errors[:100],
+                )
+            except Exception as exc:
+                with self._product_batch_jobs_lock:
+                    job = self._product_batch_jobs.get(job_id)
+                    if job is not None:
+                        for row in job.get("items", []):
+                            if row.get("status") == "queued":
+                                row["status"] = "pending"
+                                row["message"] = (
+                                    "前序任务失败，未获得平台执行结论，待核实"
+                                )
+                update(
+                    status="failed",
+                    message=f"{labels[action]}失败：{exc}",
+                    errors=[str(exc)],
+                )
+
+        def worker() -> None:
+            try:
+                worker_body()
+            finally:
+                if action in {"delete", "recycle"}:
+                    self._release_product_store_leases(
+                        store_ids,
+                        lease_id,
+                    )
+
+        threading.Thread(
+            target=worker,
+            name=f"webui-product-batch-{job_id[:8]}",
+            daemon=True,
+        ).start()
+        return initial
+
+    def _product_batch_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("job_id 不能为空")
+        with self._product_batch_jobs_lock:
+            job = self._product_batch_jobs.get(job_id)
+        persisted = job is None
+        if job is None:
+            job = self._load_product_task(job_id)
+            if job is None or job.get("kind") != "batch":
+                raise ValueError("商品批量任务不存在")
+        if persisted:
+            self._require_persisted_product_task_owner(job, "商品批量任务")
+        else:
+            self._require_job_owner(job, "商品批量任务")
+        return self._public_product_task(job)
+
+    def _cancel_product_batch(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("job_id 不能为空")
+        with self._product_batch_jobs_lock:
+            job = self._product_batch_jobs.get(job_id)
+            if job is None:
+                persisted = self._load_product_task(job_id)
+                if persisted is None or persisted.get("kind") != "batch":
+                    raise ValueError("商品批量任务不存在")
+                self._require_persisted_product_task_owner(
+                    persisted,
+                    "商品批量任务",
+                )
+                return persisted
+            self._require_job_owner(job, "商品批量任务")
+            if job.get("status") in ACCOUNT_TASK_TERMINAL_STATUSES:
+                return self._public_product_task(job)
+            cancel_event = job.get("_cancel_event")
+            if isinstance(cancel_event, threading.Event):
+                cancel_event.set()
+            job["status"] = "cancelling"
+            job["cancel_requested"] = True
+            job["message"] = (
+                "正在取消；当前平台请求结束后停止，不会启动后续商品"
+            )
+            self._persist_product_task(job)
+            return self._public_product_task(job)
+
+    def _list_product_tasks(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        store_id = payload.get("store_id")
+        try:
+            store_filter = int(store_id) if store_id not in (None, "") else 0
+        except (TypeError, ValueError) as exc:
+            raise ValueError("store_id 必须是整数") from exc
+        tasks: dict[str, dict[str, Any]] = {}
+        for job_id in self._load_product_task_registry():
+            job = self._load_product_task(job_id)
+            if job is not None:
+                tasks[job_id] = job
+        with self._product_jobs_lock:
+            for job_id, job in self._product_jobs.items():
+                tasks[job_id] = self._public_product_task(job)
+        with self._product_batch_jobs_lock:
+            for job_id, job in self._product_batch_jobs.items():
+                tasks[job_id] = self._public_product_task(job)
+        output: list[dict[str, Any]] = []
+        for job in tasks.values():
+            try:
+                self._require_persisted_product_task_owner(job, "商品任务")
+            except PermissionError:
+                continue
+            job_store_ids = [
+                int(value)
+                for value in job.get("store_ids") or [job.get("store_id")]
+                if str(value or "").isdigit()
+            ]
+            if store_filter and store_filter not in job_store_ids:
+                continue
+            output.append(job)
+        output.sort(
+            key=lambda row: str(
+                row.get("updated_at")
+                or row.get("created_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        return {"tasks": output[:30]}
 
     def _statistics_summary(self, payload: dict[str, Any]) -> dict[str, Any]:
         year = int(payload.get("year") or datetime.now().year)
@@ -14181,37 +15120,41 @@ class NextUiController:
             )
         product = self.db.get_product(store.id, product_id) or {}
         title = str(product.get("title") or "")
-        try:
-            with self._allow_platform_write(
-                store,
-                "product_write",
-                "product_delete",
-                "product_web_batch_action",
-            ):
-                result = dict(
-                    service.product_write(
-                        store,
-                        "delete",
-                        product_id=product_id,
+        with self._product_store_lease(
+            [store.id],
+            f"single-delete:{store.id}:{uuid.uuid4().hex}",
+        ):
+            try:
+                with self._allow_platform_write(
+                    store,
+                    "product_write",
+                    "product_delete",
+                    "product_web_batch_action",
+                ):
+                    result = dict(
+                        service.product_write(
+                            store,
+                            "delete",
+                            product_id=product_id,
+                        )
                     )
+            except Exception as exc:
+                pending = bool(
+                    getattr(exc, "verification_pending", False)
                 )
-        except Exception as exc:
-            pending = bool(
-                getattr(exc, "verification_pending", False)
-            )
-            self._log_product_operation(
-                store,
-                product_id,
-                title,
-                (
-                    "彻底删除"
-                    if int(product.get("status") or -1) == 6
-                    else "移入回收站"
-                ),
-                "pending" if pending else "failed",
-                str(exc),
-            )
-            raise
+                self._log_product_operation(
+                    store,
+                    product_id,
+                    title,
+                    (
+                        "彻底删除"
+                        if int(product.get("status") or -1) == 6
+                        else "移入回收站"
+                    ),
+                    "pending" if pending else "failed",
+                    str(exc),
+                )
+                raise
         delete_mode = str(result.get("delete_mode") or "")
         self._log_product_operation(
             store,
@@ -14248,7 +15191,11 @@ class NextUiController:
                 product_id,
                 title,
                 "撤回审核",
-                "failed",
+                (
+                    "pending"
+                    if getattr(exc, "verification_pending", False)
+                    else "failed"
+                ),
                 str(exc),
             )
             raise
@@ -14301,6 +15248,8 @@ class NextUiController:
             for value in public.get("errors") or []
             if str(value).strip()
         ]
+        pending_count = int(public.get("pending") or 0)
+        failed_count = int(public.get("failed") or 0)
         for product_id in product_ids:
             error = next(
                 (
@@ -14315,7 +15264,13 @@ class NextUiController:
                 product_id,
                 str((self.db.get_product(store.id, product_id) or {}).get("title") or ""),
                 action,
-                "failed" if error else "success",
+                (
+                    "pending"
+                    if error and pending_count and not failed_count
+                    else "failed"
+                    if error
+                    else "success"
+                ),
                 error,
             )
         return public

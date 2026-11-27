@@ -248,6 +248,11 @@ class SyncResult:
     failed: int = 0
     cancelled: bool = False
     errors: list[str] = field(default_factory=list)
+    pending: int = 0
+
+    @property
+    def verification_pending(self) -> bool:
+        return self.pending > 0
 
 
 @dataclass(slots=True)
