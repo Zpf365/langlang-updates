@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from weimi_manager import __display_version__, __version__
+from weimi_manager import (
+    __display_version__,
+    __product_version__,
+    __version__,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -11,7 +15,9 @@ ROOT = Path(__file__).resolve().parent.parent
 class Refactor181Tests(unittest.TestCase):
     def test_release_metadata_uses_requested_name(self) -> None:
         self.assertRegex(__version__, r"^\d+\.\d+\.\d+(?:\.\d+)?$")
-        self.assertEqual(__display_version__, f"重构{__version__}")
+        public_version = ".".join(__version__.split(".")[:3])
+        self.assertEqual(__product_version__, public_version)
+        self.assertEqual(__display_version__, f"重构{public_version}")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn(f'version = "{__version__}"', pyproject)
         self.assertIn("1.6.63 原界面重构版", pyproject)

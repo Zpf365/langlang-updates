@@ -5,6 +5,7 @@ import http.client
 import json
 import msvcrt
 import os
+import base64
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,9 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from weimi_manager import updater as updater_module
 from weimi_manager.ui.app import MainWindow
@@ -29,6 +33,11 @@ from weimi_manager.updater import (
     is_development_preview_version,
     launch_update_installer,
 )
+from weimi_manager.update_protocol import (
+    UpdateProtocolError,
+    sign_manifest,
+)
+from weimi_manager.update_health import update_root_for_install
 
 
 def write_update_package(
@@ -78,6 +87,47 @@ def write_update_package(
 
 
 class UpdaterTests(unittest.TestCase):
+    def test_signed_full_manifest_is_required_when_public_keys_are_configured(
+        self,
+    ) -> None:
+        private_key = Ed25519PrivateKey.generate()
+        public_key = base64.b64encode(
+            private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+        ).decode("ascii")
+        manifest = {
+            "version": "1.9.02",
+            "download_url": "https://example.invalid/LangLang.zip",
+            "sha256": "a" * 64,
+            "channel": "stable",
+            "prerelease": False,
+        }
+        manifest["signature"] = sign_manifest(
+            manifest,
+            private_key,
+            "release-test",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "update_manifest.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            info = check_for_update(
+                str(path),
+                current_version="1.9.01.1",
+                public_keys={"release-test": public_key},
+            )
+            self.assertTrue(info.available)
+
+            manifest["download_url"] = "https://evil.invalid/LangLang.zip"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(UpdateProtocolError):
+                check_for_update(
+                    str(path),
+                    current_version="1.9.01.1",
+                    public_keys={"release-test": public_key},
+                )
+
     def test_internal_four_part_versions_compare_numerically(self) -> None:
         self.assertLess(
             _version_tuple("1.8.93.1"),
@@ -721,6 +771,9 @@ class UpdaterTests(unittest.TestCase):
             self.assertIn("Rollback copy:", script)
             self.assertIn("Verified rollback copy removed", script)
             self.assertIn("restore previous version", script)
+            self.assertIn("健康标记", script)
+            self.assertIn("-HealthPath", captured["command"])
+            self.assertIn("install.lock", script)
             self.assertFalse(
                 captured["flags"]
                 & getattr(subprocess, "DETACHED_PROCESS", 0)
@@ -731,7 +784,10 @@ class UpdaterTests(unittest.TestCase):
             )
             self.assertEqual(
                 Path(captured["cwd"]).resolve(),
-                (root / "local" / "LangLang" / "updates").resolve(),
+                update_root_for_install(
+                    project,
+                    local_app_data=root / "local",
+                ).resolve(),
             )
             self.assertIn('Get-Process -Name "LangLang"', script)
             self.assertIn("Waiting for target processes", script)

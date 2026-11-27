@@ -1,15 +1,17 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const app = readFileSync(new URL("./App.vue", import.meta.url), "utf8");
-const more = readFileSync(
+function readSource(relativeUrl) {
+  return readFileSync(relativeUrl, "utf8").replaceAll("\r\n", "\n");
+}
+
+const app = readSource(new URL("./App.vue", import.meta.url));
+const more = readSource(
   new URL("./pages/MorePage.vue", import.meta.url),
-  "utf8",
 );
-const api = readFileSync(new URL("./api.js", import.meta.url), "utf8");
-const autoRefresh = readFileSync(
+const api = readSource(new URL("./api.js", import.meta.url));
+const autoRefresh = readSource(
   new URL("./autoRefresh.js", import.meta.url),
-  "utf8",
 );
 
 describe("update badge and runtime logging contract", () => {

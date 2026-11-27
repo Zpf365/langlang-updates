@@ -1,4 +1,4 @@
-"""Validated test-machine-only automatic update policy."""
+"""Automatic update policy and the optional canary override."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_TEST_INSTALL_DIR = Path(r"D:\WG\LangLang")
 TEST_POLICY_RELATIVE = Path("_internal") / "test-update-policy.json"
@@ -22,8 +21,28 @@ class TestUpdatePolicy:
     policy_path: Path
 
 
+StableUpdatePolicy = TestUpdatePolicy
+
+
 def _canonical(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
+
+
+def load_stable_update_policy(
+    target: Path,
+    *,
+    trust_enabled: bool,
+) -> StableUpdatePolicy | None:
+    """Every stable installation may check and stage verified updates."""
+    if not trust_enabled:
+        return None
+    install_path = Path(target).resolve()
+    return StableUpdatePolicy(
+        install_path=install_path,
+        channel="stable",
+        allow_prerelease=False,
+        policy_path=install_path / TEST_POLICY_RELATIVE,
+    )
 
 
 def load_test_update_policy(

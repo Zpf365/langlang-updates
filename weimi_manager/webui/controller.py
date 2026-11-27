@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator
 import uuid
 from pathlib import Path
 
-from .. import __version__
+from .. import __product_version__, __version__
 from ..auth_client import AuthError
 from ..db import Database, SHANGHAI_TZ, order_status_text
 from ..models import (
@@ -64,6 +64,7 @@ from ..updater import (
     download_and_stage_update,
     launch_update_installer,
 )
+from ..update_protocol import load_trust_config
 from ..wechat_api import WechatApiError
 from ..activity_renewal import ActivityAutoRenewalManager
 from ..address_parser import address_is_complete, parse_address_text
@@ -1914,9 +1915,17 @@ class NextUiController:
     def _check_update(self, payload: dict[str, Any]) -> dict[str, Any]:
         manual = bool(payload.get("manual", False))
         log_event("update.webui.check_started", manual=manual)
+        internal = self.project_dir / "_internal"
+        resource_dir = (
+            internal
+            if (internal / "assets").is_dir()
+            else self.project_dir
+        )
+        trust = load_trust_config(resource_dir)
         info = check_for_update(
             "",
             self.project_dir,
+            public_keys=trust.public_keys if trust.enabled else None,
         )
         self._last_update_info = info
         log_event(
@@ -1946,6 +1955,15 @@ class NextUiController:
             info = check_for_update(
                 "",
                 self.project_dir,
+                public_keys=(
+                    load_trust_config(
+                        (
+                            self.project_dir / "_internal"
+                            if (self.project_dir / "_internal" / "assets").is_dir()
+                            else self.project_dir
+                        )
+                    ).public_keys
+                ),
             )
             self._last_update_info = info
         if not info.available or not info.download_url:
@@ -2083,6 +2101,14 @@ class NextUiController:
                 for job in self._update_jobs.values()
             )
 
+    def hot_update_busy(self) -> bool:
+        """Keep UI/rules activation away from active account work.
+
+        The account handoff path remains independent from this gate so an
+        update can never disable switch, logout, or session closing.
+        """
+        return bool(self._active_account_tasks())
+
     def _bootstrap(self, _payload: dict[str, Any]) -> dict[str, Any]:
         role, permissions = self._current_member_permissions(
             refresh=True,
@@ -2099,7 +2125,7 @@ class NextUiController:
         account = self._account_public(role)
         self._schedule_upload_category_resume(self._upload_tasks())
         return {
-            "brand": {"name": "澜琅", "version": __version__},
+            "brand": {"name": "澜琅", "version": __product_version__},
             "account_label": self.account_label,
             "account": account,
             "member_role": role,

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from weimi_manager import __version__
+from weimi_manager import __product_version__, __version__
 from weimi_manager.update_notes import build_update_summary
 from weimi_manager.updater import DEFAULT_REQUIRED_UPDATE_FILES
 
@@ -144,6 +144,9 @@ def build_bundle_manifest(
 ) -> dict[str, object]:
     return {
         "version": __version__,
+        "package_version": __version__,
+        "product_version": __product_version__,
+        "kind": "full",
         "download_url": download_url,
         "sha256": "",
         "channel": "stable",
@@ -164,6 +167,9 @@ def build_release_manifest(
 ) -> dict[str, object]:
     return {
         "version": __version__,
+        "package_version": __version__,
+        "product_version": __product_version__,
+        "kind": "full",
         "download_url": download_url,
         "sha256": package_sha256,
         "channel": "stable",

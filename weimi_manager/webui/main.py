@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+from .. import __version__
 from ..config import AppPaths
 from ..db import Database
 from ..models import Order, OrderItem
@@ -20,6 +21,7 @@ from ..runtime_logging import (
     log_event,
 )
 from ..single_instance import SingleInstanceGuard
+from ..update_health import write_update_health
 from .controller import NextUiController
 from .desktop import run_desktop
 
@@ -241,6 +243,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         if service is None:
             raise RuntimeError("发行版账号授权服务未配置。")
+        if getattr(sys, "frozen", False):
+            try:
+                write_update_health(base_paths.project_dir, __version__)
+            except OSError as exc:
+                log_event("update.health.write_failed", error=str(exc))
 
         def run_account_webui(auth_context) -> str:
             paths = base_paths.for_account(auth_context.account_id)

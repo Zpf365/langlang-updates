@@ -11,6 +11,7 @@ from weimi_manager import startup_update
 from weimi_manager.startup_update import run_startup_update
 from weimi_manager.update_policy import (
     TEST_POLICY_SCOPE,
+    load_stable_update_policy,
     load_test_update_policy,
 )
 from weimi_manager.updater import StagedUpdate, UpdateInfo
@@ -72,6 +73,80 @@ def test_policy_requires_exact_test_path_and_explicit_stable_config(
         )
         is None
     )
+
+
+def test_stable_background_policy_is_available_for_every_install_path(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "任意安装目录" / "LangLang"
+    target.mkdir(parents=True)
+
+    policy = load_stable_update_policy(
+        target,
+        trust_enabled=True,
+    )
+
+    assert policy is not None
+    assert policy.install_path == target.resolve()
+    assert policy.channel == "stable"
+    assert policy.allow_prerelease is False
+
+
+def test_stable_background_policy_fails_closed_without_trust(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "LangLang"
+    target.mkdir()
+
+    assert load_stable_update_policy(target, trust_enabled=False) is None
+
+
+def test_stable_update_stages_at_non_test_install_path_when_trusted(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "portable" / "LangLang"
+    trust = target / "_internal" / "assets" / "update_public_keys.json"
+    trust.parent.mkdir(parents=True)
+    trust.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "enabled": True,
+                "keys": [
+                    {
+                        "key_id": "release-test",
+                        "public_key": "test-public-key",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_installed_version(target, "1.8.80")
+    calls: list[str] = []
+    staged = StagedUpdate(
+        version="1.8.82",
+        archive_path=tmp_path / "package.zip",
+        staging_root=tmp_path / "stage",
+        package_root=tmp_path / "stage" / "LangLang",
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        should_exit = run_startup_update(
+            project_dir=target,
+            force=True,
+            allowed_test_install_dir=tmp_path / "not-the-test-machine",
+            check=stable_update,
+            stage=lambda _info, _target: calls.append("stage") or staged,
+            launch=lambda _staged, _target: (
+                calls.append("launch")
+                or tmp_path / "update.log"
+            ),
+        )
+
+    assert should_exit is True
+    assert calls == ["stage", "launch"]
 
 
 def test_enabled_test_policy_auto_stages_and_installs(

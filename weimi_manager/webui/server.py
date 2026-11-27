@@ -8,7 +8,7 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 from .. import __version__
@@ -22,15 +22,23 @@ class FrontendServer:
 
     def __init__(
         self,
-        static_root: Path,
+        static_root: Path | Callable[[], Path],
         controller: NextUiController,
         token: str | None = None,
     ) -> None:
-        self.static_root = Path(static_root).resolve()
+        self._static_root_provider = (
+            static_root
+            if callable(static_root)
+            else lambda: Path(static_root)
+        )
         self.controller = controller
         self.token = token or secrets.token_urlsafe(32)
         self._thread: threading.Thread | None = None
         self._httpd: ThreadingHTTPServer | None = None
+
+    @property
+    def static_root(self) -> Path:
+        return Path(self._static_root_provider()).resolve()
 
     @property
     def base_url(self) -> str:
@@ -88,9 +96,10 @@ class FrontendServer:
                 path = unquote(urlparse(self.path).path)
                 if path in {"", "/"}:
                     path = "/index.html"
-                target = (owner.static_root / path.lstrip("/")).resolve()
+                static_root = owner.static_root
+                target = (static_root / path.lstrip("/")).resolve()
                 try:
-                    target.relative_to(owner.static_root)
+                    target.relative_to(static_root)
                 except ValueError:
                     self._send_json(
                         HTTPStatus.FORBIDDEN,

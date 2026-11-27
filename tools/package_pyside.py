@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from weimi_manager import __version__  # noqa: E402
+from weimi_manager import __product_version__, __version__  # noqa: E402
 from weimi_manager.updater import (  # noqa: E402
     DEFAULT_REQUIRED_UPDATE_FILES,
 )
@@ -320,6 +320,9 @@ def main() -> int:
     summary = summary_from_notes(notes)
     bundle_manifest = {
         "version": __version__,
+        "package_version": __version__,
+        "product_version": __product_version__,
+        "kind": "full",
         "download_url": "",
         "sha256": "",
         "channel": "stable",
@@ -339,6 +342,9 @@ def main() -> int:
     digest = sha256(package)
     manifest = {
         "version": __version__,
+        "package_version": __version__,
+        "product_version": __product_version__,
+        "kind": "full",
         "download_url": (
             ""
             if args.share_only

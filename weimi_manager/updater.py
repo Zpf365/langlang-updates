@@ -12,17 +12,20 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 from urllib.parse import unquote, urljoin, urlsplit
 
 import requests
 
 from . import __version__
+from .hot_update_store import UpdateInstallLock
+from .update_health import update_health_path, update_root_for_install
 from .update_notes import (
     build_update_summary,
     normalize_update_summary,
     release_notes_url_from_download,
 )
+from .update_protocol import load_trust_config, verify_manifest_signature
 
 ProgressCallback = Callable[[str, int, int], None]
 DEFAULT_UPDATE_SOURCE = (
@@ -54,11 +57,7 @@ DEFAULT_REQUIRED_UPDATE_FILES = (
 
 
 def _updates_root(project_dir: Path) -> Path:
-    local_app_data = Path(
-        os.environ.get("LOCALAPPDATA")
-        or (project_dir.parent.parent / "local_app_data")
-    )
-    return local_app_data / "LangLang" / "updates"
+    return update_root_for_install(project_dir)
 
 
 @dataclass(slots=True)
@@ -301,12 +300,17 @@ def check_for_update(
     project_dir: Path | None = None,
     *,
     current_version: str | None = None,
+    public_keys: Mapping[str, str] | None = None,
 ) -> UpdateInfo:
     source = (
         source.strip()
         or os.environ.get("LANGLANG_UPDATE_SOURCE", "").strip()
         or DEFAULT_UPDATE_SOURCE
     )
+    if public_keys is None and project_dir is not None:
+        trust = load_trust_config(project_dir)
+        if trust.enabled:
+            public_keys = trust.public_keys
     payload, resolved_source = _read_manifest(source, project_dir)
     if not payload:
         return UpdateInfo(
@@ -316,6 +320,8 @@ def check_for_update(
             notes="没有配置更新源，当前已是最新本地版本。",
             source=resolved_source,
         )
+    if public_keys:
+        verify_manifest_signature(payload, public_keys)
     latest = str(payload.get("version") or payload.get("latest_version") or "")
     if not latest:
         raise ValueError("更新清单缺少 version")
@@ -752,7 +758,9 @@ param(
     [Parameter(Mandatory=$true)][string]$Target,
     [Parameter(Mandatory=$true)][string]$LogPath,
     [string]$ExpectedVersion = "",
-    [int]$WaitSeconds = 300
+    [int]$WaitSeconds = 300,
+    [string]$HealthPath = "",
+    [int]$HealthSeconds = 120
 )
 $ErrorActionPreference = "Stop"
 function Write-UpdateLog([string]$Message) {
@@ -765,6 +773,7 @@ $targetName = Split-Path -Leaf $Target
 $targetExe = Join-Path $Target "LangLang.exe"
 $updatesRoot = Split-Path -Parent $LogPath
 Set-Location -LiteralPath $updatesRoot
+$lockStream = $null
 function Get-TargetProcessIds {
     @(
         Get-Process -Name "LangLang" -ErrorAction SilentlyContinue |
@@ -820,6 +829,23 @@ function Copy-TreeWithRetry(
     }
 }
 try {
+    $lockPath = Join-Path $updatesRoot "install.lock"
+    for ($lockRetry = 0; $lockRetry -lt 120; $lockRetry++) {
+        try {
+            $lockStream = [IO.File]::Open(
+                $lockPath,
+                [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
+            break
+        } catch {
+            if ($lockRetry -ge 119) {
+                throw "等待全局更新安装锁超时"
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
     $attempts = [Math]::Max(1, $WaitSeconds * 2)
     $loggedWait = $false
     for ($i = 0; $i -lt $attempts; $i++) {
@@ -945,7 +971,36 @@ try {
             [string]$newProcess.ExitCode
         )
     }
-    Write-UpdateLog "New version started"
+    if ($HealthPath) {
+        $healthy = $false
+        $healthAttempts = [Math]::Max(1, $HealthSeconds * 2)
+        for ($healthIndex = 0; $healthIndex -lt $healthAttempts; $healthIndex++) {
+            if ($newProcess -and $newProcess.HasExited) {
+                throw (
+                    "新版在健康标记前退出，退出码 " +
+                    [string]$newProcess.ExitCode
+                )
+            }
+            if (Test-Path -LiteralPath $HealthPath) {
+                try {
+                    $health = Get-Content -LiteralPath $HealthPath -Raw -Encoding UTF8 |
+                        ConvertFrom-Json
+                    if ([string]$health.version -eq $ExpectedVersion) {
+                        $healthy = $true
+                        break
+                    }
+                } catch {
+                }
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (!$healthy) {
+            throw "新版未在限定时间内写入健康标记"
+        }
+        Write-UpdateLog "New version health marker verified"
+    } else {
+        Write-UpdateLog "New version started without health marker"
+    }
     if ($backup -and (Test-Path -LiteralPath $backup)) {
         Invoke-WithRetry {
             Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop
@@ -977,6 +1032,10 @@ try {
             "Target process is still running; not starting another instance"
         )
     }
+} finally {
+    if ($lockStream) {
+        $lockStream.Dispose()
+    }
 }
 """
     script_path.write_text(script, encoding="utf-8-sig")
@@ -984,30 +1043,33 @@ try {
         getattr(subprocess, "CREATE_NO_WINDOW", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     )
-    subprocess.Popen(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(script_path),
-            "-WaitPid",
-            str(os.getpid()),
-            "-Source",
-            str(source),
-            "-Target",
-            str(target),
-            "-LogPath",
-            str(log_path),
-            "-ExpectedVersion",
-            staged.version,
-            "-WaitSeconds",
-            "300",
-        ],
-        cwd=str(updates_root),
-        close_fds=True,
-        creationflags=creation_flags,
-    )
+    with UpdateInstallLock(updates_root):
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+                "-WaitPid",
+                str(os.getpid()),
+                "-Source",
+                str(source),
+                "-Target",
+                str(target),
+                "-LogPath",
+                str(log_path),
+                "-ExpectedVersion",
+                staged.version,
+                "-HealthPath",
+                str(update_health_path(target)),
+                "-WaitSeconds",
+                "300",
+            ],
+            cwd=str(updates_root),
+            close_fds=True,
+            creationflags=creation_flags,
+        )
     return log_path

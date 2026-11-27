@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from weimi_manager.db import Database
+from weimi_manager import __version__
 from weimi_manager.webui.controller import NextUiController
 from weimi_manager.webui.server import FrontendServer
 
@@ -66,6 +67,9 @@ def test_frontend_server_serves_actions_and_static_files(tmp_path: Path) -> None
             payload = json.loads(response.read())
         assert payload["ok"] is True
         assert payload["data"]["brand"]["name"] == "澜琅"
+        assert payload["data"]["brand"]["version"] == ".".join(
+            __version__.split(".")[:3]
+        )
     finally:
         server.stop()
 
@@ -90,6 +94,32 @@ def test_large_static_response_uses_gzip(tmp_path: Path) -> None:
         with urlopen(request, timeout=3) as response:
             assert response.headers.get("Content-Encoding") == "gzip"
             assert gzip.decompress(response.read()) == content
+    finally:
+        server.stop()
+
+
+def test_frontend_server_uses_dynamic_static_root(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "index.html").write_text("<html>first</html>", encoding="utf-8")
+    (second / "index.html").write_text("<html>second</html>", encoding="utf-8")
+    active = {"root": first}
+    server = FrontendServer(
+        lambda: active["root"],
+        NextUiController(Database(tmp_path / "webui.db")),
+        "test-token",
+    )
+    server.start()
+    try:
+        with urlopen(f"{server.base_url}/", timeout=3) as response:
+            assert response.read() == b"<html>first</html>"
+
+        active["root"] = second
+
+        with urlopen(f"{server.base_url}/", timeout=3) as response:
+            assert response.read() == b"<html>second</html>"
     finally:
         server.stop()
 

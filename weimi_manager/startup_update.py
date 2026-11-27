@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 import os
@@ -18,13 +17,16 @@ from typing import Callable
 
 from . import __version__
 from .runtime_logging import log_event
+from .ui.update_progress import UpdateProgressPanel
+from .update_health import update_root_for_install
+from .update_notes import build_update_summary
 from .update_policy import (
     DEFAULT_TEST_INSTALL_DIR,
     TestUpdatePolicy,
+    load_stable_update_policy,
     load_test_update_policy,
 )
-from .ui.update_progress import UpdateProgressPanel
-from .update_notes import build_update_summary
+from .update_protocol import load_trust_config
 from .updater import (
     StagedUpdate,
     UpdateInfo,
@@ -70,14 +72,7 @@ def _installed_version(target: Path) -> str:
 
 
 def _auto_state_path(target: Path) -> Path:
-    local_app_data = Path(
-        os.environ.get("LOCALAPPDATA")
-        or (target.parent.parent / "local_app_data")
-    )
-    key = hashlib.sha256(
-        os.path.normcase(str(target.resolve())).encode("utf-8")
-    ).hexdigest()[:16]
-    return local_app_data / "LangLang" / "updates" / "auto" / key / "state.json"
+    return update_root_for_install(target) / "auto" / "state.json"
 
 
 def _read_auto_state(path: Path) -> dict[str, object]:
@@ -766,10 +761,23 @@ def run_startup_update(
     target = (
         project_dir or Path(sys.executable).resolve().parent
     ).resolve()
-    policy = load_test_update_policy(
+    internal_resource_dir = target / "_internal"
+    resource_dir = (
+        internal_resource_dir
+        if (internal_resource_dir / "assets").is_dir()
+        else target
+    )
+    trust = load_trust_config(resource_dir)
+    policy = load_stable_update_policy(
+        target,
+        trust_enabled=trust.enabled,
+    )
+    test_policy = load_test_update_policy(
         target,
         allowed_install_dir=allowed_test_install_dir,
     )
+    if test_policy is not None:
+        policy = test_policy
     current_version = (
         _installed_version(target)
         or __version__
@@ -778,7 +786,10 @@ def run_startup_update(
         info = (
             check()
             if check is not None
-            else check_for_update(current_version=current_version)
+            else check_for_update(
+                current_version=current_version,
+                public_keys=trust.public_keys if trust.enabled else None,
+            )
         )
     except Exception as exc:
         log_event("update.startup.check_failed", error=str(exc))

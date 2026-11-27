@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "blocker": "正式 Ed25519 私钥托管、签名流程和受控补丁频道尚未由 CTO 建立",
+  "channel_url": "",
+  "keys": []
+}

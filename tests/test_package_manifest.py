@@ -25,6 +25,7 @@ from tools.package_pyside import (
 from tools import verify_share_package as share_module
 from tools.verify_share_package import verify_share
 from weimi_manager import __version__
+from weimi_manager import __product_version__
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -94,8 +95,14 @@ def test_external_manifest_owns_zip_hash_while_bundle_manifest_stays_blank() -> 
     assert external["sha256"] == digest
     assert bundle["channel"] == "stable"
     assert bundle["prerelease"] is False
+    assert bundle["kind"] == "full"
+    assert bundle["product_version"] == __product_version__
+    assert bundle["package_version"] == __version__
     assert external["channel"] == "stable"
     assert external["prerelease"] is False
+    assert external["kind"] == "full"
+    assert external["product_version"] == __product_version__
+    assert external["package_version"] == __version__
     assert "LangLang.exe" in external["required_files"]
     assert "_internal/webui/dist/index.html" in external["required_files"]
 
