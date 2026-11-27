@@ -7,6 +7,7 @@
 - 分支：`hotfix/store-management-1.9.01.1`
 - 店铺候选提交：`9b4ec45`
 - 桥接骨架提交：`24a9206`
+- 独立复审返工 1 提交：`6267132`
 - 当前源码/内部包版本：`1.9.01.1`
 - 用户可见产品版本：`1.9.01`
 - 后续公共桥接版本：`1.9.02`，仍需最终集成 QA 和版本提升
@@ -55,6 +56,31 @@
 - production build：通过，`117 modules transformed`。
 - 新增/改动 Python 文件 Ruff：通过。
 - `git diff --check`：通过。
+
+## 独立复审返工 1/3
+
+复审 REJECT 的五项安全阻断已靶向修复：
+
+- P0-1：staging 回收改为显式 `None`，新增安全清理哨兵，仅删除
+  update root 内且名称符合真实 staging 前缀的临时目录；状态写入失败回归
+  验证不会删除 cwd/update root。
+- P0-2：频道验签/app 兼容解析后、任何下载前先校验 channel sequence；
+  旧签名频道回归验证不会下载、解压或改变 active。
+- P0-3：补丁拆分为 verify/stage 与 activate 两阶段；busy 时只落 staged state，
+  不切换 active pointer，桌面 update timer 在账户任务和关闭状态解除后才激活。
+- P0-4：撤销当前 WebUI 导致 active 变化时设置 reload-pending；busy 时延迟，
+  安全空闲后加载上一健康版本并 reload。
+- P1：完整包安装前清除旧 health、生成唯一 attempt id；安装器只接受
+  版本与 attempt id 同时匹配的健康标记，超时回滚前终止并等待新版进程；
+  登录页构造完成后或 WebUI ready 后才允许写健康标记。
+
+返工验证：
+
+- 更新协议/存储/runtime/health/signing/updater 定向 pytest：
+  `54 passed`。
+- 相关 Python 文件 `py_compile`：通过。
+- Ruff（返工文件）：通过。
+- 本轮未跑全量、未运行 production build、未打包、未发布、未部署。
 
 ## 剩余风险
 
