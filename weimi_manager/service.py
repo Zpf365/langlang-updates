@@ -1054,6 +1054,29 @@ class SyncService:
         refresh_pending: bool = False,
     ) -> dict[str, Any]:
         result = deepcopy(cached)
+        def annotate_legacy_leaves(
+            nodes: list[dict[str, Any]],
+        ) -> None:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if bool(node.get("leaf")) and "selectable" not in node:
+                    effective = node.get("available") is True
+                    node["selectable"] = effective
+                    node["application_state"] = (
+                        "effective" if effective else "unknown"
+                    )
+                    node["application_label"] = (
+                        "已生效" if effective else "状态未知"
+                    )
+                    node["application_reason"] = (
+                        ""
+                        if effective
+                        else "旧类目缓存未包含申请资格，请重新读取"
+                    )
+                annotate_legacy_leaves(node.get("children") or [])
+
+        annotate_legacy_leaves(result.get("roots") or [])
         saved_at = float(result.get("saved_at") or 0)
         age = max(0, int(now_ts - saved_at)) if saved_at else 0
         result.update(
@@ -1162,10 +1185,9 @@ class SyncService:
     ) -> dict[str, Any]:
         """Return a persistent per-store category snapshot.
 
-        Fresh cache is returned without network access. Expired cache is
-        returned immediately while one background refresh is started.
-        Manual refresh is synchronous and falls back to the previous snapshot
-        if the official read fails.
+        Any existing cache is returned without network access, including an
+        expired snapshot. Manual refresh is synchronous and falls back to the
+        previous snapshot if the official read fails.
         """
         client = client or self.client_for(store)
         cached = self._read_upload_category_cache(store)
@@ -1174,18 +1196,11 @@ class SyncService:
                 cached,
                 now_ts=time.time(),
             )
-            if result["stale"]:
-                scheduled = self._schedule_upload_category_refresh(
-                    store,
-                    client,
-                    cached,
+            if cached.get("refresh_error"):
+                result["error"] = (
+                    "类目缓存保留上次刷新错误："
+                    + str(cached.get("refresh_error") or "")
                 )
-                result["refresh_pending"] = scheduled
-                if not scheduled and cached.get("refresh_error"):
-                    result["error"] = (
-                        "类目缓存已过期，后台刷新失败："
-                        + str(cached.get("refresh_error") or "")
-                    )
             return result
         try:
             fresh = self._fetch_upload_category_options(store, client)
@@ -1392,27 +1407,154 @@ class SyncService:
                 return output
 
             roots = materialize(roots_by_id)
-            leaf_count = len(self._category_leaf_index({"roots": roots}))
+            leaf_nodes = self._category_leaf_index({"roots": roots})
+            application_checks: dict[str, dict[str, Any]] = {}
+            checker = getattr(
+                client,
+                "category_application_checks",
+                None,
+            )
+            if callable(checker):
+                try:
+                    application_checks = checker(sorted(leaf_nodes))
+                except Exception as exc:
+                    for category_id in leaf_nodes:
+                        application_checks[category_id] = {
+                            "state": "unknown",
+                            "label": "状态未知",
+                            "reason": str(exc)[:500],
+                            "eligible": False,
+                        }
+            elif isinstance(client, WechatShopClient):
+                try:
+                    private = ShopPrivateClient(self.db, store)
+                    application_checks = (
+                        private.category_application_checks(
+                            sorted(leaf_nodes)
+                        )
+                    )
+                except Exception as exc:
+                    for category_id in leaf_nodes:
+                        application_checks[category_id] = {
+                            "state": "unknown",
+                            "label": "状态未知",
+                            "reason": (
+                                "无法读取类目申请资格："
+                                f"{str(exc)[:500]}"
+                            ),
+                            "eligible": False,
+                        }
+            for category_id, node in leaf_nodes.items():
+                check = application_checks.get(category_id)
+                if not isinstance(check, dict):
+                    check = {
+                        "state": (
+                            "effective"
+                            if category_id in relation_ids
+                            else "unknown"
+                        ),
+                        "label": (
+                            "已生效"
+                            if category_id in relation_ids
+                            else "状态未知"
+                        ),
+                        "reason": (
+                            ""
+                            if category_id in relation_ids
+                            else "无法读取类目申请资格，请重新读取"
+                        ),
+                        "eligible": False,
+                    }
+                state = str(check.get("state") or "unknown")
+                if category_id in relation_ids and state == "unknown":
+                    check = {
+                        **check,
+                        "state": "effective",
+                        "label": "已生效",
+                        "reason": "",
+                        "eligible": False,
+                    }
+                    state = "effective"
+                eligible = bool(check.get("eligible"))
+                node.update(
+                    {
+                        "available": category_id in relation_ids,
+                        "selectable": (
+                            state in {"effective", "pending"}
+                            or (
+                                state == "not_applied"
+                                and eligible
+                            )
+                        ),
+                        "application_state": state,
+                        "application_label": str(
+                            check.get("label")
+                            or {
+                                "effective": "已生效",
+                                "not_applied": "未申请",
+                                "pending": "审核中",
+                            }.get(state)
+                            or "状态未知"
+                        ),
+                        "application_reason": str(
+                            check.get("reason") or ""
+                        ),
+                        "application_eligible": eligible,
+                        "application_required_deposit": (
+                            check.get("required_deposit")
+                        ),
+                        "application_amount_to_pay": (
+                            check.get("amount_to_pay")
+                        ),
+                        "application_operation_required_deposit": (
+                            check.get("operation_required_deposit")
+                        ),
+                        "application_deposit_balance": (
+                            check.get("deposit_balance")
+                        ),
+                        "application_real_deposit_balance": (
+                            check.get("real_deposit_balance")
+                        ),
+                        "application_deposit_shortfall": (
+                            check.get("deposit_shortfall")
+                        ),
+                    }
+                )
+            leaf_count = len(leaf_nodes)
             available_leaf_count = sum(
                 bool(node.get("available"))
-                for node in self._category_leaf_index({"roots": roots}).values()
+                for node in leaf_nodes.values()
+            )
+            selectable_leaf_count = sum(
+                bool(node.get("selectable"))
+                for node in leaf_nodes.values()
             )
             tree_payload = {
                 "roots": roots,
                 "leaf_count": leaf_count,
                 "available_leaf_count": available_leaf_count,
+                "selectable_leaf_count": selectable_leaf_count,
                 "version": version,
                 "cache_key": f"{store.id}:{version}",
-                "source": "微信小店官方类目树 + 本店生效类目权限",
+                "source": (
+                    "微信小店官方类目树 + 本店生效关系 "
+                    "+ 类目申请资格"
+                ),
                 "refreshed_at": datetime.now().isoformat(
                     timespec="seconds"
                 ),
                 "cached": False,
             }
             if not roots:
-                tree_payload["error"] = "店铺暂无生效类目权限"
+                tree_payload["error"] = "官方类目树没有返回可展示类目"
+            elif not selectable_leaf_count:
+                tree_payload["warning"] = (
+                    "类目申请状态读取失败或均不可申请，请重新读取"
+                )
             elif not available_leaf_count:
-                tree_payload["warning"] = "店铺暂无生效类目权限，请先申请类目"
+                tree_payload["warning"] = (
+                    "店铺暂无已生效类目，可选择可申请的未申请类目"
+                )
             self._upload_category_tree_cache[cache_key] = deepcopy(tree_payload)
         return deepcopy(tree_payload)
 
@@ -1479,23 +1621,42 @@ class SyncService:
             refresh=False,
         )
         leaf = self._category_leaf_index(options).get(leaf_id)
-        if leaf is None or leaf.get("available") is not True:
+        if leaf is None or leaf.get("selectable") is not True:
             options = self.upload_category_options(
                 store,
                 client,
                 refresh=True,
             )
             leaf = self._category_leaf_index(options).get(leaf_id)
-        if leaf is None or leaf.get("available") is not True:
+        if leaf is None or leaf.get("selectable") is not True:
             detail = str(
                 options.get("refresh_error")
                 or options.get("error")
                 or ""
             ).strip()
-            suffix = f"；刷新结果：{detail}" if detail else ""
+            application_reason = str(
+                (leaf or {}).get("application_reason") or ""
+            ).strip()
+            application_label = str(
+                (leaf or {}).get("application_label") or ""
+            ).strip()
+            details = [
+                value
+                for value in (
+                    application_label,
+                    application_reason,
+                    detail,
+                )
+                if value
+            ]
+            suffix = (
+                f"；{'；'.join(details)}"
+                if details
+                else ""
+            )
             raise ValueError(
-                f"{store.name} 指定类目 {leaf_id} 已失效、被冻结或不存在，"
-                f"请修改模板{suffix}"
+                f"{store.name} 指定类目 {leaf_id} 当前不可申请或状态未知，"
+                f"请重新读取后再选择{suffix}"
             )
         current_ids = [
             str(value)
@@ -1512,6 +1673,15 @@ class SyncService:
             "path": str(leaf.get("path") or ""),
             "version": str(options.get("version") or ""),
             "cache_key": str(options.get("cache_key") or ""),
+            "application_state": str(
+                leaf.get("application_state") or "unknown"
+            ),
+            "application_label": str(
+                leaf.get("application_label") or "状态未知"
+            ),
+            "application_reason": str(
+                leaf.get("application_reason") or ""
+            ),
         }
 
     def _validate_specified_product_category(

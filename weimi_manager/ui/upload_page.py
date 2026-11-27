@@ -693,7 +693,17 @@ def _is_category_permission_error(exc: Exception) -> bool:
     message = str(exc).casefold()
     return exc.code == 6600145 or (
         "类目" in message
-        and any(word in message for word in ("权限", "开通", "未授权"))
+        and any(
+            word in message
+            for word in (
+                "权限",
+                "开通",
+                "未授权",
+                "冻结",
+                "失效",
+                "不存在",
+            )
+        )
     )
 
 
@@ -837,6 +847,75 @@ def _category_checks(
         }
         for category_id in category_ids
     }
+
+
+def _category_checks_from_options(
+    options: dict[str, Any],
+    category_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    leaves: dict[str, dict[str, Any]] = {}
+
+    def walk(nodes: Any) -> None:
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            category_id = str(node.get("category_id") or "").strip()
+            if category_id:
+                leaves[category_id] = node
+            walk(node.get("children") or [])
+
+    walk(options.get("roots") or [])
+    checks: dict[str, dict[str, Any]] = {}
+    for category_id in dict.fromkeys(category_ids):
+        node = leaves.get(category_id) or {}
+        state = str(node.get("application_state") or "").strip()
+        if not state:
+            state = (
+                "effective"
+                if node.get("available") is True
+                else "unknown"
+            )
+        checks[category_id] = {
+            "state": state,
+            "label": str(
+                node.get("application_label")
+                or {
+                    "effective": "已生效",
+                    "not_applied": "未申请",
+                    "pending": "审核中",
+                    "qualification_required": "缺资质",
+                    "deposit_required": "保证金不足",
+                    "rejected": "平台已拒绝",
+                    "unavailable": "不可申请",
+                    "unknown": "状态未知",
+                }.get(state)
+                or "状态未知"
+            ),
+            "reason": str(
+                node.get("application_reason")
+                or (
+                    "刷新后的类目树未包含目标类目"
+                    if not node
+                    else ""
+                )
+            ),
+            "eligible": bool(node.get("application_eligible")),
+            "required_deposit": node.get("application_required_deposit"),
+            "amount_to_pay": node.get("application_amount_to_pay"),
+            "operation_required_deposit": node.get(
+                "application_operation_required_deposit"
+            ),
+            "deposit_balance": node.get("application_deposit_balance"),
+            "real_deposit_balance": node.get(
+                "application_real_deposit_balance"
+            ),
+            "deposit_shortfall": node.get(
+                "application_deposit_shortfall"
+            ),
+        }
+    return checks
 
 
 def _category_status_labels(checks: dict[str, dict[str, Any]]) -> dict[str, str]:
@@ -1066,6 +1145,7 @@ def _retry_upload_after_category_open(
     progress: Callable[[str], None] | None = None,
     category_ids: list[str] | None = None,
     application: dict[str, Any] | None = None,
+    refresh_categories: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     application = application if application is not None else {}
     saved_ids = application.get("category_ids")
@@ -1385,8 +1465,73 @@ def _retry_upload_after_category_open(
         if progress is not None:
             progress("正在检查并申请目标类目")
         client = resolve_client()
-        online_count_snapshot(client)
-        checks = _category_checks(client, category_ids)
+        if refresh_categories is not None:
+            try:
+                refreshed = refresh_categories()
+            except Exception as refresh_exc:
+                refresh_message = (
+                    "平台类目错误后刷新类目失败，待核实："
+                    + str(refresh_exc)[:500]
+                )
+                checks = {
+                    category_id: {
+                        "state": "unknown",
+                        "label": "刷新失败，待核实",
+                        "reason": refresh_message,
+                        "eligible": False,
+                    }
+                    for category_id in category_ids
+                }
+                raise CategoryApprovalPending(
+                    category_ids,
+                    _category_status_labels(checks),
+                    checks=checks,
+                    submitted=False,
+                    attempts=1,
+                    error=refresh_message,
+                    state="unknown",
+                ) from refresh_exc
+            if not isinstance(refreshed, dict):
+                refreshed = {}
+            refresh_error = str(
+                refreshed.get("refresh_error")
+                or (
+                    refreshed.get("error")
+                    if refreshed.get("manual_refresh_failed")
+                    else ""
+                )
+                or ""
+            ).strip()
+            if refreshed.get("manual_refresh_failed") or refresh_error:
+                refresh_message = (
+                    "平台类目错误后刷新类目失败，待核实："
+                    + (refresh_error or "官方类目未返回有效结果")
+                )
+                checks = {
+                    category_id: {
+                        "state": "unknown",
+                        "label": "刷新失败，待核实",
+                        "reason": refresh_message,
+                        "eligible": False,
+                    }
+                    for category_id in category_ids
+                }
+                raise CategoryApprovalPending(
+                    category_ids,
+                    _category_status_labels(checks),
+                    checks=checks,
+                    submitted=False,
+                    attempts=1,
+                    error=refresh_message,
+                    state="unknown",
+                )
+            checks = _category_checks_from_options(
+                refreshed,
+                category_ids,
+            )
+        else:
+            online_count_snapshot(client)
+            checks = _category_checks(client, category_ids)
         hard_error = _category_hard_failure(checks)
         if hard_error:
             raise CategoryAutoOpenError(
@@ -1396,6 +1541,20 @@ def _retry_upload_after_category_open(
             )
         if _category_checks_all(checks, category_ids, "effective"):
             return retry_after_effective(client)
+        if _category_pending_state(checks) == "deposit_required":
+            online_count = online_count_snapshot(client)
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=1,
+                state="deposit_required",
+                deposit_snapshot=_category_deposit_snapshot(
+                    checks,
+                    online_count,
+                ),
+            )
         eligible = (
             all(category_id in checks for category_id in category_ids)
             and all(

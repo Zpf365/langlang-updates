@@ -139,6 +139,7 @@ CATEGORY_ADD_PATH = (
     "/shop-faas/mmchannelstradecategory/cgi/category/"
     "batchAddCategory"
 )
+CATEGORY_CHECK_BATCH_SIZE = 200
 ORDER_DETAIL_PATH = (
     "/shop-faas/mmchannelstradeorder/detail/cgi/orderDetail"
 )
@@ -2031,46 +2032,68 @@ class ShopPrivateClient:
                 if str(item.get("category_id") or "")
             }
             deposit_by_id: dict[str, dict[str, Any]] = {}
-            deposit_result = self._post(
-                CATEGORY_DEPOSIT_PATH,
-                {
-                    "categoryList": [
-                        {"categoryId": category_id}
-                        for category_id in requested
-                    ],
-                    "businessType": normalized_business_type,
-                },
-            )
-            for item in deposit_result.get("categoryDepositList") or []:
-                if not isinstance(item, dict):
-                    continue
-                category_id = str(
-                    (item.get("category") or {}).get("categoryId") or ""
+            deposit_balance = 0
+            real_deposit_balance = 0
+            operation_required_deposit: int | None = None
+            qualification_ids: set[str] = set()
+            for start in range(
+                0,
+                len(requested),
+                CATEGORY_CHECK_BATCH_SIZE,
+            ):
+                chunk = requested[
+                    start : start + CATEGORY_CHECK_BATCH_SIZE
+                ]
+                deposit_result = self._post(
+                    CATEGORY_DEPOSIT_PATH,
+                    {
+                        "categoryList": [
+                            {"categoryId": category_id}
+                            for category_id in chunk
+                        ],
+                        "businessType": normalized_business_type,
+                    },
                 )
-                if category_id:
-                    deposit_by_id[category_id] = item
-            deposit_balance = _as_int(
-                deposit_result.get("depositBalance")
-            )
-            real_deposit_balance = _as_int(
-                deposit_result.get("realDepositBalance"),
-                deposit_balance,
-            )
-            operation_required_deposit = _as_int(
-                deposit_result.get("operationRequiredDeposit"),
-                None,
-            )
-            requirement_result = self._post(
-                CATEGORY_REQUIREMENT_PATH,
-                {"categoryIds": [int(value) for value in requested]},
-            )
-            requirement_data = self._data(requirement_result)
-            qualification_ids = {
-                str(value)
-                for value in requirement_data.get(
-                    "needQualificationIdList"
-                ) or []
-            }
+                for item in deposit_result.get(
+                    "categoryDepositList"
+                ) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    category_id = str(
+                        (item.get("category") or {}).get(
+                            "categoryId"
+                        )
+                        or ""
+                    )
+                    if category_id:
+                        deposit_by_id[category_id] = item
+                deposit_balance = _as_int(
+                    deposit_result.get("depositBalance"),
+                    deposit_balance,
+                )
+                real_deposit_balance = _as_int(
+                    deposit_result.get("realDepositBalance"),
+                    deposit_balance,
+                )
+                operation_required_deposit = _as_int(
+                    deposit_result.get("operationRequiredDeposit"),
+                    operation_required_deposit,
+                )
+                requirement_result = self._post(
+                    CATEGORY_REQUIREMENT_PATH,
+                    {
+                        "categoryIds": [
+                            int(value) for value in chunk
+                        ]
+                    },
+                )
+                requirement_data = self._data(requirement_result)
+                qualification_ids.update(
+                    str(value)
+                    for value in requirement_data.get(
+                        "needQualificationIdList"
+                    ) or []
+                )
         except Exception as exc:
             for check in checks.values():
                 check["reason"] = str(exc)[:500]
@@ -2189,6 +2212,21 @@ class ShopPrivateClient:
                     state="unknown",
                     label="状态未知",
                     reason="保证金接口未返回该类目信息",
+                )
+                continue
+            if deposit_fields["deposit_shortfall"] > 0:
+                check.update(
+                    state="deposit_required",
+                    label="保证金不足",
+                    reason=(
+                        "当前保证金余额 "
+                        f"{category_deposit_balance} 分，"
+                        "至少还需补缴 "
+                        f"{deposit_fields['deposit_shortfall']} 分；"
+                        "软件不会自动充值或支付"
+                    ),
+                    eligible=False,
+                    **deposit_fields,
                 )
                 continue
             check.update(

@@ -29,6 +29,13 @@ from ...ui.upload_page import (
     CategoryApprovalPending,
     CategoryAutoOpenError,
     TemplateRuleSkip,
+    _category_checks_all,
+    _category_checks_from_options,
+    _category_deposit_snapshot,
+    _category_hard_failure,
+    _category_hard_state,
+    _category_pending_state,
+    _category_status_labels,
     _definitive_upload_failure_message,
     _is_duplicate_upload,
     _json_rows,
@@ -168,6 +175,39 @@ class UploadRunner:
         jobs: list[tuple[dict, dict]],
         errors: list[str],
     ) -> None:
+        category_refresh: dict[str, Any] = {
+            "attempted": False,
+            "options": None,
+            "error": None,
+        }
+        catalog_refresh = getattr(
+            self.service,
+            "upload_category_options",
+            None,
+        )
+        refresh_categories = None
+        if callable(catalog_refresh):
+            def refresh_categories() -> dict[str, Any]:
+                if not category_refresh["attempted"]:
+                    category_refresh["attempted"] = True
+                    try:
+                        refreshed = catalog_refresh(
+                            store,
+                            refresh=True,
+                        )
+                        category_refresh["options"] = (
+                            refreshed
+                            if isinstance(refreshed, dict)
+                            else {}
+                        )
+                    except Exception as exc:
+                        category_refresh["error"] = exc
+                error = category_refresh["error"]
+                if isinstance(error, Exception):
+                    raise error
+                options = category_refresh["options"]
+                return options if isinstance(options, dict) else {}
+
         for task, item in jobs:
             if self.cancelled.is_set():
                 item["status"] = "cancelled"
@@ -238,11 +278,21 @@ class UploadRunner:
                 payload.pop("category_hint", None)
                 payload.pop("auto_category", None)
                 listing_mode = _normalize_listing_mode(template)
+                if category_refresh["attempted"]:
+                    self._raise_if_category_snapshot_blocks(
+                        category_refresh["options"],
+                        category_refresh["error"],
+                        category_ids,
+                    )
             except TemplateRuleSkip as exc:
                 self._set_item(task, item, "skipped", str(exc))
                 continue
             except CategoryApprovalPending as exc:
                 now = datetime.now()
+                self._copy_category_pending_to_snapshot(
+                    category_refresh["options"],
+                    exc,
+                )
                 with self.lock:
                     item["category_state"] = str(
                         exc.state or "waiting"
@@ -413,6 +463,7 @@ class UploadRunner:
                     progress=update_category_progress,
                     category_ids=category_ids,
                     application=item,
+                    refresh_categories=refresh_categories,
                 )
                 product_id = str(result.get("product_id") or payload.get("product_id") or "")
                 if not product_id:
@@ -453,6 +504,10 @@ class UploadRunner:
                     )
             except CategoryApprovalPending as exc:
                 now = datetime.now()
+                self._copy_category_pending_to_snapshot(
+                    category_refresh["options"],
+                    exc,
+                )
                 with self.lock:
                     item["category_state"] = str(
                         exc.state or "waiting"
@@ -589,6 +644,144 @@ class UploadRunner:
                         completed,
                         total,
                     )
+
+    @staticmethod
+    def _copy_category_pending_to_snapshot(
+        options: Any,
+        pending: CategoryApprovalPending,
+    ) -> None:
+        if not isinstance(options, dict):
+            return
+        category_ids = set(pending.category_ids)
+
+        def walk(nodes: Any) -> None:
+            if not isinstance(nodes, list):
+                return
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                category_id = str(
+                    node.get("category_id") or ""
+                ).strip()
+                if category_id in category_ids:
+                    node["application_state"] = str(
+                        pending.state or "unknown"
+                    )
+                    node["application_label"] = str(
+                        pending.statuses.get(category_id)
+                        or pending.state
+                        or "状态未知"
+                    )
+                    node["application_reason"] = str(
+                        pending.error or ""
+                    )[:500]
+                    node["application_eligible"] = False
+                walk(node.get("children") or [])
+
+        walk(options.get("roots") or [])
+
+    @staticmethod
+    def _raise_if_category_snapshot_blocks(
+        options: Any,
+        refresh_error: Any,
+        category_ids: list[str],
+    ) -> None:
+        if isinstance(refresh_error, Exception):
+            message = (
+                "平台类目错误后刷新类目失败，待核实："
+                + str(refresh_error)[:500]
+            )
+            checks = {
+                category_id: {
+                    "state": "unknown",
+                    "label": "刷新失败，待核实",
+                    "reason": message,
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=1,
+                error=message,
+                state="unknown",
+            )
+        if not isinstance(options, dict) or not options:
+            return
+        refresh_error_text = str(
+            options.get("refresh_error")
+            or (
+                options.get("error")
+                if options.get("manual_refresh_failed")
+                else ""
+            )
+            or ""
+        ).strip()
+        if options.get("manual_refresh_failed") or refresh_error_text:
+            message = (
+                "平台类目错误后刷新类目失败，待核实："
+                + (refresh_error_text or "官方类目未返回有效结果")
+            )
+            checks = {
+                category_id: {
+                    "state": "unknown",
+                    "label": "刷新失败，待核实",
+                    "reason": message,
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=1,
+                error=message,
+                state="unknown",
+            )
+
+        checks = _category_checks_from_options(options, category_ids)
+        hard_error = _category_hard_failure(checks)
+        if hard_error:
+            raise CategoryAutoOpenError(
+                "类目不可自动开通：" + hard_error,
+                state=(
+                    _category_hard_state(checks)
+                    or "failed_category"
+                ),
+            )
+        if _category_checks_all(checks, category_ids, "effective"):
+            return
+        state = _category_pending_state(checks)
+        if state == "deposit_required":
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=1,
+                state="deposit_required",
+                deposit_snapshot=_category_deposit_snapshot(checks),
+            )
+        if state == "not_applied" and all(
+            category_id in checks
+            and checks[category_id].get("state") == "not_applied"
+            and bool(checks[category_id].get("eligible"))
+            for category_id in category_ids
+        ):
+            return
+        raise CategoryApprovalPending(
+            category_ids,
+            _category_status_labels(checks),
+            checks=checks,
+            submitted=state == "pending",
+            attempts=1,
+            state=state,
+        )
 
     def _set_item(
         self,
