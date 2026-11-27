@@ -80,6 +80,7 @@ class UploadRunner:
         tasks: list[dict[str, Any]],
         *,
         progress: Callable[[str, int, int], None] | None = None,
+        external_stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.workspace = workspace
         self.db = workspace.db
@@ -89,6 +90,7 @@ class UploadRunner:
         self.paused = threading.Event()
         self.cancelled = threading.Event()
         self.progress = progress
+        self.external_stop_requested = external_stop_requested
         self._jobs_total = 0
         self._jobs_completed = 0
         self.adapter = _PayloadAdapter(self.db)
@@ -193,6 +195,11 @@ class UploadRunner:
                 return "cancelled"
             if self.paused.is_set():
                 return "paused"
+            if (
+                callable(self.external_stop_requested)
+                and self.external_stop_requested()
+            ):
+                return "external"
             return None
 
         refresh_categories = None
@@ -748,8 +755,34 @@ class UploadRunner:
                 error=message,
                 state="unknown",
             )
-        if not isinstance(options, dict) or not options:
-            return
+        if (
+            not isinstance(options, dict)
+            or not options
+            or not isinstance(options.get("roots"), list)
+            or not options.get("roots")
+        ):
+            message = (
+                "平台类目错误后刷新结果无效，待核实："
+                "未返回有效的官方类目根节点"
+            )
+            checks = {
+                category_id: {
+                    "state": "unknown",
+                    "label": "刷新结果无效，待核实",
+                    "reason": message,
+                    "eligible": False,
+                }
+                for category_id in category_ids
+            }
+            raise CategoryApprovalPending(
+                category_ids,
+                _category_status_labels(checks),
+                checks=checks,
+                submitted=False,
+                attempts=1,
+                error=message,
+                state="unknown",
+            )
         refresh_error_text = str(
             options.get("refresh_error")
             or (

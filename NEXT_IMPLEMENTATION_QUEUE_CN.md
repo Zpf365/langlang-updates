@@ -27,7 +27,7 @@
 
 ### TASK-20261127-024 WebUI 类目错误按需刷新独立修复
 
-状态：`VERIFY`；第一次独立审查返工 `1/3`，等待复审。
+状态：`VERIFY`；第二次独立审查集中返工 `2/3`，之后只等待最终复审。
 
 - 基线：`f96a6f0` / `v1.9.01`；独立分支
   `hotfix/upload-category-refresh-1.9.01.1`。
@@ -54,6 +54,16 @@
 - 返工 1/3 证据：pytest `145 passed, 2 skipped, 9 subtests passed`；Vitest
   `5 files / 27 tests passed`；Python 修改文件和定向测试 `py_compile`
   通过。按 CTO 边界本轮未 build。
+- 返工 2/3：类目申请发出后结果未知时优先持久化
+  `waiting_category / category_state=unknown / category_apply_submitted=true`，
+  即使同时取消或暂停也不会被覆盖；恢复只复查，不自动重提。明确平台拒绝
+  仍为失败。WebUI controller 将启动 generation 的
+  `_job_update_allowed(generation)` 接入 Runner 外部停止检查；空、非对象、
+  缺少合法 roots 或无法解析目标类目的刷新快照统一 fail-closed。
+- 返工 2/3 证据：真实 `UploadRunner` 定向 pytest `30 passed`；
+  `upload_page.py`、`pages/upload.py`、`controller.py` 与
+  `tests/test_pyside_upload.py` 的 `py_compile` 通过。按 CTO 边界未运行
+  全量、Vitest、build、发布或部署。
 - 未验证边界：未用真实店铺触发平台类目冻结/失效错误，未执行真实类目申请、
   审核等待或恢复，也未验证真实资质/保证金不足响应；未部署或启动候选界面。
 

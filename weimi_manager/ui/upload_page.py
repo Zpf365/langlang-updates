@@ -1201,6 +1201,12 @@ def _retry_upload_after_category_open(
                 category_ids=category_ids,
                 category_applied=category_applied,
             )
+        if reason == "external":
+            raise UploadPaused(
+                "账户或任务代次已变化，停止后续类目操作和商品写入",
+                category_ids=category_ids,
+                category_applied=category_applied,
+            )
 
     def resolve_client() -> Any:
         try:
@@ -1307,9 +1313,9 @@ def _retry_upload_after_category_open(
         client: Any,
         exc: Exception,
     ) -> dict[str, Any]:
-        ensure_not_stopped()
         exc_text = str(exc)
         if "保证金" in exc_text:
+            application["category_apply_inflight"] = False
             checks = _category_checks(client, category_ids)
             online_count = _stock_int(
                 (
@@ -1331,22 +1337,24 @@ def _retry_upload_after_category_open(
                 ),
             ) from exc
         if _category_apply_hard_rejection(exc):
+            application["category_apply_inflight"] = False
+            application["category_apply_submitted"] = False
             raise CategoryAutoOpenError(
                 "类目开通申请失败：" + exc_text,
                 state="application_error",
             ) from exc
-        if progress is not None:
-            progress("类目申请结果待确认，正在复查")
-        checks = _category_checks(client, category_ids)
-        hard_error = _category_hard_failure(checks)
-        if hard_error:
-            raise CategoryAutoOpenError(
-                "类目申请被平台拒绝：" + hard_error,
-                state=_category_hard_state(checks)
-                or "failed_category",
-            ) from exc
-        if _category_checks_all(checks, category_ids, "effective"):
-            return retry_after_effective(client)
+        application["category_apply_inflight"] = True
+        application["category_apply_submitted"] = True
+        application["category_state"] = "unknown"
+        checks = {
+            category_id: {
+                "state": "unknown",
+                "label": "申请结果未知",
+                "reason": exc_text[:500],
+                "eligible": False,
+            }
+            for category_id in category_ids
+        }
         raise CategoryApprovalPending(
             category_ids,
             _category_status_labels(checks),
@@ -1354,6 +1362,7 @@ def _retry_upload_after_category_open(
             submitted=True,
             attempts=1,
             error=str(exc),
+            state="unknown",
         ) from exc
 
     if saved_application:
@@ -1419,11 +1428,14 @@ def _retry_upload_after_category_open(
             ensure_not_stopped()
             if progress is not None:
                 progress("正在提交类目开通申请")
+            application["category_apply_inflight"] = True
+            application["category_apply_submitted"] = True
             try:
                 client.batch_add_categories(category_ids)
             except Exception as exc:
-                ensure_not_stopped()
                 return recover_apply_exception(client, exc)
+            application["category_apply_inflight"] = False
+            application["category_apply_submitted"] = True
             ensure_not_stopped(category_applied=True)
             submitted = True
             checks = _category_checks(client, category_ids)
@@ -1620,11 +1632,14 @@ def _retry_upload_after_category_open(
         if progress is not None:
             progress("正在提交类目开通申请")
         ensure_not_stopped()
+        application["category_apply_inflight"] = True
+        application["category_apply_submitted"] = True
         try:
             client.batch_add_categories(category_ids)
         except Exception as apply_exc:
-            ensure_not_stopped()
             return recover_apply_exception(client, apply_exc)
+        application["category_apply_inflight"] = False
+        application["category_apply_submitted"] = True
         ensure_not_stopped(category_applied=True)
         checks = _category_checks(client, category_ids)
         ensure_not_stopped(category_applied=True)
@@ -2920,6 +2935,8 @@ class CategoryApprovalPending(RuntimeError):
         )
         if self.state == "deposit_required":
             prefix = "类目需先补缴保证金，补齐后自动复查"
+        elif self.state == "unknown" and submitted:
+            prefix = "类目申请已发出，结果待确认"
         elif self.state == "pending" or submitted:
             prefix = "类目已申请，等待审核生效"
         else:

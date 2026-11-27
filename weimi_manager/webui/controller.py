@@ -18270,6 +18270,9 @@ class NextUiController:
                     ),
                     tasks,
                     progress=progress,
+                    external_stop_requested=lambda: (
+                        not self._job_update_allowed(generation)
+                    ),
                 )
                 with self._upload_jobs_lock:
                     job = self._upload_jobs.get(job_id)
