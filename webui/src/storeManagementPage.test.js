@@ -34,12 +34,14 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("result.settle = completeSum(");
     expect(source).not.toContain("请打开资金账户刷新");
     expect(source).toContain(':colspan="STORE_TABLE_COLUMN_COUNT"');
-    expect(source.match(/<col style="width: \d+px" \/>/g)).toHaveLength(33);
-    expect(source).toContain('<col :style="{ width: `${appIdColumnWidth}px` }" />');
-    expect(source).toContain('<col :style="{ width: `${secretColumnWidth}px` }" />');
-    expect(source).toContain("table-layout: fixed;");
-    expect(source).toContain("width: 2538px;");
-    expect(source).toContain("2538");
+    expect(source).not.toContain("appIdColumnWidth");
+    expect(source).not.toContain("secretColumnWidth");
+    expect(source).not.toContain("storeTableWidth");
+    expect(source).not.toContain("table-layout: fixed;");
+    expect(source).toContain("table-layout: auto;");
+    expect(source).toContain("width: max-content;");
+    expect(source).toContain("min-width: 100%;");
+    expect(source).toContain("overflow-x: auto;");
   });
 
   it("masks AppID by default and auto-collapses after 60 seconds", () => {
@@ -56,7 +58,9 @@ describe("store management score and deposit presentation", () => {
 
   it("renders grouped exposure, online products and today new observation", () => {
     expect(source).toContain('<h4>商品曝光（人数/次数）</h4>');
-    expect(source).toContain('<th colspan="3" class="exposure-group-head">商品曝光（人数/次数）</th>');
+    expect(source).toContain(
+      '<th colspan="3" class="exposure-group-head">商品曝光（人数/次数）</th>',
+    );
     expect(source).toContain("<th class=\"count-cell\">今日</th>");
     expect(source).toContain("<th class=\"count-cell\">昨日</th>");
     expect(source).toContain("<th class=\"count-cell\">7日</th>");
@@ -120,6 +124,9 @@ describe("store management score and deposit presentation", () => {
     expect(newToday.title).toContain("不代表平台商品创建时间");
     expect(unseen.text).toBe("—");
     expect(stalePreviousDay.text).toBe("—");
+    expect(source).toContain(
+      '<StoreExposureValue :display="exposureDisplayFor(store, key)" />',
+    );
     expect(stalePreviousDay.title).toContain("今日尚未完成商品目录扫描");
   });
 
@@ -330,13 +337,16 @@ describe("store management score and deposit presentation", () => {
     expect(fullLogin).toBeLessThan(fullOperation);
   });
 
-  it("defaults to a no-horizontal-scroll overview with expandable details", () => {
+  it("uses one display contract for scrollable overview and full tables", () => {
     expect(source).toContain('const storeViewMode = ref(STORE_VIEW_OVERVIEW)');
     expect(source).toContain('v-if="storeViewMode === STORE_VIEW_OVERVIEW"');
     expect(source).toContain('v-else class="card data-card store-table-card"');
     expect(source).toContain('class="table-scroll overview-table-scroll"');
-    expect(source).toContain("overflow-x: hidden;");
-    expect(source).toContain("销售 / 退款（金额 / 单量）");
+    expect(source).not.toContain("overflow-x: hidden;");
+    expect(source).toContain("overflow-x: auto;");
+    expect(source).toContain("销售/退款（金额/单量）");
+    expect(source).toContain("绿色：销售额/单量");
+    expect(source).toContain("红色：退款金额/单量");
     expect(source).toContain(':aria-expanded="isStoreExpanded(store.id)"');
     expect(source).toContain('class="store-detail-grid"');
     expect(source).toContain("商品曝光（人数/次数）");
@@ -345,8 +355,7 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("result[`${summaryKey}_orders`]");
     expect(source).toContain("result[`refund_${summaryKey}`]");
     expect(source).toContain("summaryCount(summary.refund_today_orders)");
-    expect(source).toContain('v-if="salesPresentation(store, key).showRefund"');
-    expect(source).toContain("class=\"sales-lines\"");
+    expect(source).toContain('<StoreSalesValue :display="salesDisplayFor(store, key)" />');
     expect(source).toContain("isRefundVisible(summary.refund_today");
     expect(source).toContain("store.web_status_detail || store.web_status");
   });
@@ -355,17 +364,25 @@ describe("store management score and deposit presentation", () => {
     expect(source).toContain("--store-table-heading-font-size: 11px;");
     expect(source).toContain("--store-table-data-font-size: 11px;");
     expect(source).toContain("--store-table-secondary-font-size: 10px;");
-    expect(source).toContain("--store-table-sales-font-size: 12px;");
+    expect(source).toContain("--store-table-sales-single-font-size: 13px;");
+    expect(source).toContain("--store-table-sales-double-font-size: 11px;");
     expect(source).toContain("--store-table-heading-font-size: 13px;");
     expect(source).toContain("--store-table-data-font-size: 13px;");
     expect(source).toContain("--store-table-secondary-font-size: 12px;");
-    expect(source).toContain("--store-table-sales-font-size: 13px;");
-    expect(source).toContain(
-      "font-size: var(--store-table-sales-font-size);",
-    );
+    expect(source).toContain("--store-table-sales-single-font-size: 14px;");
+    expect(source).toContain("--store-table-sales-double-font-size: 11px;");
+    expect(source).toContain("white-space: nowrap;");
     expect(source).toContain(
       "font-size: var(--store-table-secondary-font-size);",
     );
+  });
+
+  it("removes currency in table and detail without changing summary money", () => {
+    expect(source).toContain("return plainMoneyText(value);");
+    expect(source).toContain("depositDisplayFor(store).text");
+    expect(source.match(/moneyMetric\(store, "(?:cash|settle)"\)/g)).toHaveLength(4);
+    expect(source).toContain("summaryMoney(summary.today)");
+    expect(source).toContain("summaryMoney(summary.refund_today)");
   });
 
   it("shows refund rows only for real refund data or unknown values", () => {

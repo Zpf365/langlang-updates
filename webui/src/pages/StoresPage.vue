@@ -13,6 +13,8 @@ import { useAutoRefresh } from "../autoRefresh";
 import { copyText } from "../clipboard";
 import Icon from "../components/Icon.vue";
 import ModalDialog from "../components/ModalDialog.vue";
+import StoreExposureValue from "../components/StoreExposureValue.vue";
+import StoreSalesValue from "../components/StoreSalesValue.vue";
 import {
   getStoreInteractionState,
   pollStoreRefreshJob,
@@ -47,9 +49,22 @@ import {
   storeViewStorageKey as makeStoreViewStorageKey,
   writeStoreViewMode,
 } from "../storeViewMode";
+import {
+  depositDisplay,
+  exposureDisplay,
+  plainMoneyText,
+  salesDisplay,
+} from "../storeTableDisplay";
 
 const STORE_TABLE_COLUMN_COUNT = 23;
 const STORE_OVERVIEW_COLUMN_COUNT = 12;
+const SALES_PERIODS = [
+  { key: "today", label: "今日" },
+  { key: "yesterday", label: "昨日" },
+  { key: "seven_days", label: "7日" },
+  { key: "thirty_days", label: "30日" },
+];
+const EXPOSURE_PERIODS = SALES_PERIODS.slice(0, 3);
 const stores = ref([]);
 const groups = ref([]);
 const loading = ref(false);
@@ -143,25 +158,6 @@ const secretLoading = reactive({});
 const secretTimers = new Map();
 const revealedAppIds = reactive({});
 const appIdTimers = new Map();
-const appIdColumnWidth = computed(() => {
-  if (!Object.keys(revealedAppIds).length) return 190;
-  const longest = Math.max(
-    0,
-    ...stores.value.map((store) => String(store.app_id || "").length),
-  );
-  return Math.max(190, Math.min(250, 80 + longest * 8));
-});
-const secretColumnWidth = computed(() => {
-  const revealedValues = Object.values(revealedSecrets);
-  if (!revealedValues.length) return 165;
-  const longest = Math.max(0, ...revealedValues.map((value) => String(value || "").length));
-  return Math.max(340, Math.min(560, 80 + longest * 8));
-});
-const storeTableWidth = computed(() => (
-  2538
-  + appIdColumnWidth.value - 190
-  + secretColumnWidth.value - 165
-));
 const newGroupName = ref("");
 const groupBusy = ref(false);
 let liveStoreSyncStop = null;
@@ -567,11 +563,7 @@ function metricNumber(store, primary, fallback) {
 
 function moneyMetric(store, primary, fallback) {
   const value = metricNumber(store, primary, fallback);
-  if (value === null) return "—";
-  if (primary === "cash" || primary === "settle") {
-    return fundPresentation(store, primary).text;
-  }
-  return formatMoney(value);
+  return plainMoneyText(value);
 }
 
 function moneyMetricTitle(store, primary, fallback) {
@@ -581,6 +573,29 @@ function moneyMetricTitle(store, primary, fallback) {
   return metricNumber(store, primary, fallback) === null
     ? "数据不可用"
     : "";
+}
+
+function exposureDisplayFor(store, key) {
+  return exposureDisplay(
+    store,
+    key,
+    exposurePresentation(store, key),
+  );
+}
+
+function salesDisplayFor(store, key) {
+  return salesDisplay(salesPresentation(store, key));
+}
+
+function depositDisplayFor(store) {
+  const display = depositDisplay(store);
+  const presentation = depositPresentation(store);
+  return {
+    ...display,
+    title: [display.title, presentation.statusTitle]
+      .filter(Boolean)
+      .join(" · "),
+  };
 }
 
 function resetForm(store = null) {
@@ -1456,23 +1471,14 @@ onBeforeUnmount(() => {
       </span>
     </div>
 
+    <div class="store-table-legend" aria-label="销售退款颜色图例">
+      <span class="legend-sales">绿色：销售额/单量</span>
+      <span class="legend-refund">红色：退款金额/单量</span>
+    </div>
+
     <div v-if="storeViewMode === STORE_VIEW_OVERVIEW" class="card data-card store-overview-card">
       <div class="table-scroll overview-table-scroll">
         <table class="store-overview-table" @contextmenu.prevent.stop>
-          <colgroup>
-            <col style="width: 34px" />
-            <col style="width: 38px" />
-            <col style="width: 150px" />
-            <col style="width: 98px" />
-            <col style="width: 112px" />
-            <col style="width: 112px" />
-            <col style="width: 112px" />
-            <col style="width: 112px" />
-            <col style="width: 112px" />
-            <col style="width: 108px" />
-            <col style="width: 74px" />
-            <col style="width: 70px" />
-          </colgroup>
           <thead>
             <tr>
               <th rowspan="2" class="selection-column sticky-select sticky-column">
@@ -1486,7 +1492,7 @@ onBeforeUnmount(() => {
               <th rowspan="2" class="sticky-index sticky-column">序号</th>
               <th rowspan="2" class="sticky-name sticky-column">店铺</th>
               <th rowspan="2">商品</th>
-              <th colspan="4" class="overview-group-head">销售 / 退款（金额 / 单量）</th>
+              <th colspan="4" class="overview-group-head">销售/退款（金额/单量）</th>
               <th colspan="3" class="overview-group-head">凭据与登录</th>
               <th rowspan="2">操作</th>
             </tr>
@@ -1531,16 +1537,7 @@ onBeforeUnmount(() => {
                   class="overview-sales-cell"
                   :data-label="{ today: '今日', yesterday: '昨日', seven_days: '7日', thirty_days: '30日' }[key]"
                 >
-                  <div
-                    class="sales-lines"
-                    :class="{ 'sales-lines-single': !salesPresentation(store, key).showRefund }"
-                  >
-                    <span class="sale-line" :title="salesPresentation(store, key).title">{{ salesPresentation(store, key).salesText }}</span>
-                    <span
-                      v-if="salesPresentation(store, key).showRefund"
-                      class="refund-line"
-                    >{{ salesPresentation(store, key).refundText }}</span>
-                  </div>
+                  <StoreSalesValue :display="salesDisplayFor(store, key)" />
                 </td>
                 <td class="overview-credential-cell" data-label="AppID">
                   <div class="overview-credential">
@@ -1585,9 +1582,16 @@ onBeforeUnmount(() => {
                   <div class="store-detail-grid">
                     <section>
                       <h4>商品曝光（人数/次数）</h4>
-                      <div v-for="key in ['today', 'yesterday', 'seven_days']" :key="key" class="detail-line">
-                        <span>{{ { today: '今日', yesterday: '昨日', seven_days: '7日' }[key] }}</span>
-                        <strong :title="exposurePresentation(store, key).title">{{ exposurePresentation(store, key).text }}</strong>
+                      <div v-for="period in EXPOSURE_PERIODS" :key="period.key" class="detail-line">
+                        <span>{{ period.label }}</span>
+                        <StoreExposureValue :display="exposureDisplayFor(store, period.key)" />
+                      </div>
+                    </section>
+                    <section class="store-detail-sales">
+                      <h4>销售/退款（金额/单量）</h4>
+                      <div v-for="period in SALES_PERIODS" :key="period.key" class="detail-line">
+                        <span>{{ period.label }}</span>
+                        <StoreSalesValue :display="salesDisplayFor(store, period.key)" />
                       </div>
                     </section>
                     <section>
@@ -1596,7 +1600,7 @@ onBeforeUnmount(() => {
                       <div class="detail-line"><span>待结算</span><strong :title="moneyMetricTitle(store, 'settle')">{{ moneyMetric(store, "settle") }}</strong></div>
                       <div class="detail-line">
                         <span>保证金</span>
-                        <strong :title="depositPresentation(store).detail">{{ depositPresentation(store).valueText }}</strong>
+                        <strong :title="depositDisplayFor(store).title">{{ depositDisplayFor(store).text }}</strong>
                       </div>
                     </section>
                     <section>
@@ -1644,34 +1648,8 @@ onBeforeUnmount(() => {
       <div class="table-scroll">
         <table
           class="data-table store-table"
-          :style="{ width: `${storeTableWidth}px`, minWidth: `${storeTableWidth}px` }"
           @contextmenu.prevent.stop
         >
-          <colgroup>
-            <col style="width: 44px" />
-            <col style="width: 54px" />
-            <col style="width: 150px" />
-            <col style="width: 112px" />
-            <col style="width: 112px" />
-            <col style="width: 112px" />
-            <col style="width: 85px" />
-            <col style="width: 72px" />
-            <col style="width: 124px" />
-            <col style="width: 124px" />
-            <col style="width: 124px" />
-            <col style="width: 124px" />
-            <col style="width: 96px" />
-            <col style="width: 96px" />
-            <col style="width: 88px" />
-            <col style="width: 88px" />
-            <col style="width: 88px" />
-            <col style="width: 88px" />
-            <col style="width: 100px" />
-            <col :style="{ width: `${appIdColumnWidth}px` }" />
-            <col :style="{ width: `${secretColumnWidth}px` }" />
-            <col style="width: 72px" />
-            <col style="width: 230px" />
-          </colgroup>
           <thead>
             <tr>
               <th class="selection-column sticky-select sticky-column" rowspan="2">
@@ -1687,7 +1665,7 @@ onBeforeUnmount(() => {
               <th colspan="3" class="exposure-group-head">商品曝光（人数/次数）</th>
               <th rowspan="2">在线商品数</th>
               <th rowspan="2">今日上新</th>
-              <th colspan="4" class="sales-group-head">销售 / 退款（金额 / 单量）</th>
+              <th colspan="4" class="sales-group-head">销售/退款（金额/单量）</th>
               <th rowspan="2">可提现余额</th>
               <th rowspan="2">待结算余额</th>
               <th rowspan="2">体验分</th>
@@ -1730,7 +1708,7 @@ onBeforeUnmount(() => {
                 {{ store.name }}
               </td>
               <td v-for="key in ['today', 'yesterday', 'seven_days']" :key="key" class="count-cell">
-                <span :title="exposurePresentation(store, key).title">{{ exposurePresentation(store, key).text }}</span>
+                <StoreExposureValue :display="exposureDisplayFor(store, key)" />
               </td>
               <td class="online-product-cell" :title="onlineProductsPresentation(store).title">
                 {{ onlineProductsPresentation(store).text }}
@@ -1739,16 +1717,7 @@ onBeforeUnmount(() => {
                 {{ newProductsTodayPresentation(store).text }}
               </td>
               <td v-for="key in ['today', 'yesterday', 'seven_days', 'thirty_days']" :key="key" class="money full-sales-cell">
-                <div
-                  class="sales-lines"
-                  :class="{ 'sales-lines-single': !salesPresentation(store, key).showRefund }"
-                >
-                  <span class="sale-line" :title="salesPresentation(store, key).title">{{ salesPresentation(store, key).salesText }}</span>
-                  <span
-                    v-if="salesPresentation(store, key).showRefund"
-                    class="refund-line"
-                  >{{ salesPresentation(store, key).refundText }}</span>
-                </div>
+                <StoreSalesValue :display="salesDisplayFor(store, key)" />
               </td>
               <td class="money" :title="moneyMetricTitle(store, 'cash')">{{ moneyMetric(store, "cash") }}</td>
               <td class="money" :title="moneyMetricTitle(store, 'settle')">{{ moneyMetric(store, "settle") }}</td>
@@ -1765,8 +1734,8 @@ onBeforeUnmount(() => {
                 >{{ scorePresentation(store, key).statusLabel }}</em>
               </td>
               <td class="deposit-cell">
-                <span :title="`${depositPresentation(store).detail}${depositPresentation(store).statusTitle ? ` · ${depositPresentation(store).statusTitle}` : ''}`">
-                  {{ depositPresentation(store).valueText }}
+                <span :title="depositDisplayFor(store).title">
+                  {{ depositDisplayFor(store).text }}
                 </span>
               </td>
               <td class="app-id-cell">
@@ -2313,6 +2282,27 @@ onBeforeUnmount(() => {
    font-size: 9px !important;
  }
 
+ .store-table-legend {
+   min-height: 32px;
+   padding: 0 12px;
+   display: flex;
+   align-items: center;
+   justify-content: flex-end;
+   gap: 16px;
+   border-bottom: 1px solid #e3e9ed;
+   background: #fbfcfd;
+   font-size: 11px;
+   white-space: nowrap;
+ }
+
+ .legend-sales {
+   color: var(--store-sales-color);
+ }
+
+ .legend-refund {
+   color: var(--store-refund-color);
+ }
+
  .store-overview-card {
    flex: 1;
    min-height: 0;
@@ -2324,17 +2314,18 @@ onBeforeUnmount(() => {
  .overview-table-scroll {
    width: 100%;
    min-width: 0;
-   overflow-x: hidden;
+   overflow-x: auto;
  }
 
  .store-overview-table {
    --store-table-heading-font-size: 11px;
    --store-table-data-font-size: 11px;
    --store-table-secondary-font-size: 10px;
-   --store-table-sales-font-size: 12px;
-   width: 100%;
-   min-width: 0;
-   table-layout: fixed;
+   --store-table-sales-single-font-size: 13px;
+   --store-table-sales-double-font-size: 11px;
+   width: max-content;
+   min-width: 100%;
+   table-layout: auto;
    border-collapse: separate;
    border-spacing: 0;
  }
@@ -2392,20 +2383,49 @@ onBeforeUnmount(() => {
    vertical-align: middle;
  }
 
+ .store-overview-table th,
+ .store-overview-table td {
+   white-space: nowrap;
+ }
+
+ .store-overview-table .selection-column {
+   width: 34px;
+   min-width: 34px;
+ }
+
+ .store-overview-table .sticky-index {
+   width: 38px;
+   min-width: 38px;
+ }
+
+ .store-overview-table .sticky-name {
+   min-width: 150px;
+ }
+
+ .store-overview-table .overview-product-cell {
+   min-width: 112px;
+ }
+
+ .store-overview-table .overview-sales-cell {
+   min-width: 124px;
+ }
+
+ .store-overview-table .overview-credential-cell {
+   min-width: 118px;
+ }
+
  .overview-main-row.selected td {
    background: #edf7ff;
  }
 
  .overview-store-cell {
-   text-align: left !important;
+   text-align: center !important;
  }
 
  .overview-store-cell strong,
  .overview-store-cell small,
  .overview-product-cell span {
    display: block;
-   overflow: hidden;
-   text-overflow: ellipsis;
    white-space: nowrap;
  }
 
@@ -2429,49 +2449,17 @@ onBeforeUnmount(() => {
    line-height: 1.45;
  }
 
- .sales-lines {
-   min-height: 38px;
-   display: flex;
-   flex-direction: column;
-   align-items: center;
-   justify-content: center;
-   gap: 2px;
-   line-height: 1.35;
- }
-
- .sales-lines-single .sale-line {
-   transform: translateY(1px);
- }
-
- .sale-line,
- .refund-line {
-   display: block;
-   overflow: hidden;
-   text-overflow: ellipsis;
-   white-space: nowrap;
-   font-size: var(--store-table-sales-font-size);
-   line-height: 1.35;
- }
-
- .sale-line {
-   color: #1b5f45;
-   font-weight: 600;
- }
-
- .refund-line {
-   color: #a24b55;
- }
-
  .overview-credential {
    min-width: 0;
    display: flex;
    align-items: center;
    gap: 4px;
+   justify-content: center;
  }
 
  .overview-code {
    min-width: 0;
-   overflow-wrap: anywhere;
+   white-space: nowrap;
    color: #657682;
    font-family: "Cascadia Code", Consolas, monospace;
    font-size: var(--store-table-secondary-font-size);
@@ -2497,7 +2485,7 @@ onBeforeUnmount(() => {
  .store-detail-grid {
    padding: 12px 14px 14px;
    display: grid;
-   grid-template-columns: repeat(4, minmax(0, 1fr));
+   grid-template-columns: repeat(5, minmax(180px, 1fr));
    gap: 10px;
    border-bottom: 1px solid #dbe4eb;
  }
@@ -2526,6 +2514,11 @@ onBeforeUnmount(() => {
    border-bottom: 1px solid #f0f3f5;
    color: #758491;
    font-size: var(--store-table-secondary-font-size);
+   white-space: nowrap;
+ }
+
+ .store-detail-sales .detail-line {
+   min-height: 45px;
  }
 
  .detail-line:last-child { border-bottom: 0; }
@@ -2716,6 +2709,9 @@ onBeforeUnmount(() => {
 }
 
 .store-page {
+   --store-sales-color: #466d5c;
+   --store-refund-color: #8a5058;
+   --store-table-unknown-color: #929aa2;
   height: 100%;
   min-height: 0;
   display: flex;
@@ -2742,10 +2738,11 @@ onBeforeUnmount(() => {
    --store-table-heading-font-size: 13px;
    --store-table-data-font-size: 13px;
    --store-table-secondary-font-size: 12px;
-   --store-table-sales-font-size: 13px;
-   width: 2538px;
-   min-width: 2538px;
-  table-layout: fixed;
+   --store-table-sales-single-font-size: 14px;
+   --store-table-sales-double-font-size: 11px;
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
 }
 
 .store-table th {
@@ -2758,6 +2755,7 @@ onBeforeUnmount(() => {
   font-size: var(--store-table-heading-font-size);
   background: #f7f9fa;
   text-align: center;
+  white-space: nowrap;
 }
 
 .store-table th.sticky-column,
@@ -2793,18 +2791,30 @@ onBeforeUnmount(() => {
 }
 
 .store-table td {
-  height: 46px;
-  padding: 0 6px;
+  height: 58px;
+  padding: 5px 10px;
   box-sizing: border-box;
-  overflow: hidden;
   font-size: var(--store-table-data-font-size);
   line-height: 1.3;
   text-align: center;
+  white-space: nowrap;
 }
 
 .store-table td:nth-child(3) {
-  min-width: 120px;
+  min-width: 150px;
   white-space: nowrap;
+}
+
+.store-table th:first-child,
+.store-table td:first-child {
+  width: 44px;
+  min-width: 44px;
+}
+
+.store-table th:nth-child(2),
+.store-table td:nth-child(2) {
+  width: 54px;
+  min-width: 54px;
 }
 
 .store-table tbody tr.selected {
@@ -2824,8 +2834,8 @@ onBeforeUnmount(() => {
 .app-id-placeholder {
   display: block;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
   vertical-align: middle;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   color: #65717c;
@@ -2888,8 +2898,8 @@ onBeforeUnmount(() => {
 .secret-placeholder {
   display: block;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
   white-space: nowrap;
   color: #8a949e;
 }
@@ -2905,7 +2915,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  justify-content: flex-start;
+  justify-content: center;
+  white-space: nowrap;
 }
 
 .secret-reveal > button {
@@ -3510,10 +3521,6 @@ onBeforeUnmount(() => {
  @media (max-width: 1180px) {
    .store-view-switch {
      margin-left: 0;
-   }
-
-   .overview-table-scroll {
-     overflow-x: hidden;
    }
 
    .store-overview-table,
