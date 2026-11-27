@@ -41,6 +41,10 @@
 - 定向证据：商品相关 pytest `35 passed / 8 subtests`，WebUI controller
   `10 passed`，network parity `3 passed`，Vitest `12 passed`，
   `py_compile` 和 production build 通过。
+- 最终靶向返工 3/3：单件彻底删除增加平台回收站前置回读；回收站为空或
+  回读失败时不调用 real、不删缓存并保持待核实。单件删除与刷新共用同店租约，
+  双向冲突在进入 service 前拒绝。定向 pytest `32 passed`，`py_compile`
+  通过；按要求本轮未运行全量测试和 build。
 - 真实平台批量删除、彻底删除、撤回审核和刷新取消尚未验证；未发布、未部署。
 
 - 统筹总工负责任务拆分、文件锁、跨模块共享逻辑、回归、版本、候选包和发布签收。

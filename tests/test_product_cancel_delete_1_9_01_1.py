@@ -1174,3 +1174,130 @@ def test_manual_refresh_first_blocks_delete_for_same_store(
         release.set()
         worker.join(3)
     assert not errors
+
+
+def test_single_delete_first_blocks_refresh_for_same_store(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "single-delete-first-lease.db")
+    store_id = database.add_store(
+        "单件删除租约店铺",
+        "wx-single-delete-lease",
+        "secret",
+    )
+    started_wait = threading.Event()
+    release = threading.Event()
+
+    class BlockingSingleDeleteService:
+        def __init__(self) -> None:
+            self.platform_write_authorizer = None
+            self.refresh_calls = 0
+
+        def product_write(
+            self,
+            _store,
+            action,
+            *,
+            product_id="",
+            **_kwargs,
+        ):
+            assert action == "delete"
+            assert product_id == "single-delete-product"
+            started_wait.set()
+            assert release.wait(3)
+            return {"errcode": 0, "delete_mode": "recycle"}
+
+        def refresh_product_tab(self, *_args, **_kwargs):
+            self.refresh_calls += 1
+            return SyncResult("product_query", 0, "刷新不应执行", success=0)
+
+    service = BlockingSingleDeleteService()
+    controller = NextUiController(database, product_service=service)
+    errors: list[BaseException] = []
+
+    def run_delete() -> None:
+        try:
+            controller.dispatch(
+                "products.delete",
+                {
+                    "store_id": store_id,
+                    "product_id": "single-delete-product",
+                },
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_delete, daemon=True)
+    worker.start()
+    assert started_wait.wait(3)
+    try:
+        with pytest.raises(ValueError, match="正在执行"):
+            controller.dispatch(
+                "products.refresh.start",
+                {"store_id": store_id},
+            )
+        with pytest.raises(ValueError, match="正在执行"):
+            controller.dispatch(
+                "products.refresh",
+                {"store_id": store_id},
+            )
+    finally:
+        release.set()
+        worker.join(3)
+    assert not errors
+    assert service.refresh_calls == 0
+
+
+def test_refresh_first_blocks_single_delete_before_service(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "single-delete-refresh-first.db")
+    store_id = database.add_store(
+        "单件删除刷新先店铺",
+        "wx-single-refresh-first",
+        "secret",
+    )
+    started_wait = threading.Event()
+    release = threading.Event()
+
+    class BlockingRefreshService:
+        def __init__(self) -> None:
+            self.platform_write_authorizer = None
+            self.delete_calls = 0
+
+        def refresh_product_tab(
+            self,
+            _store,
+            _tab,
+            *,
+            cancel_event=None,
+            **_kwargs,
+        ):
+            assert cancel_event is not None
+            started_wait.set()
+            assert release.wait(3)
+            return SyncResult("product_query", 0, "刷新结束", success=0)
+
+        def product_write(self, *_args, **_kwargs):
+            self.delete_calls += 1
+            return {"errcode": 0, "delete_mode": "recycle"}
+
+    service = BlockingRefreshService()
+    controller = NextUiController(database, product_service=service)
+    controller.dispatch(
+        "products.refresh.start",
+        {"store_id": store_id},
+    )
+    assert started_wait.wait(3)
+    try:
+        with pytest.raises(ValueError, match="正在执行"):
+            controller.dispatch(
+                "products.delete",
+                {
+                    "store_id": store_id,
+                    "product_id": "single-delete-product",
+                },
+            )
+    finally:
+        release.set()
+    assert service.delete_calls == 0

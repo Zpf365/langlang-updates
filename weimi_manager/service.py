@@ -2751,6 +2751,21 @@ class SyncService:
 
         result: dict[str, Any]
         if delete_mode == "real":
+            in_recycle, pre_read_source = self._remote_recycle_presence(
+                store,
+                product_id,
+                official_client,
+            )
+            if in_recycle is not True:
+                detail = (
+                    pre_read_source
+                    or "平台回收站未找到商品"
+                )
+                raise ProductDeleteUncertainError(
+                    "缓存标记为回收站，但删除前未确认商品实际在平台回收站；"
+                    "未调用彻底删除，缓存已保留，待核实："
+                    + detail
+                )
             try:
                 result = self.private_batch_product_action(
                     store,
@@ -2815,6 +2830,11 @@ class SyncService:
                 "delete_mode": delete_mode,
                 "remote_verified": True,
                 "verification_source": source,
+                "pre_read_source": (
+                    pre_read_source
+                    if delete_mode == "real"
+                    else ""
+                ),
             }
         )
         return result

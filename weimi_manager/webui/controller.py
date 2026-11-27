@@ -15092,37 +15092,41 @@ class NextUiController:
             )
         product = self.db.get_product(store.id, product_id) or {}
         title = str(product.get("title") or "")
-        try:
-            with self._allow_platform_write(
-                store,
-                "product_write",
-                "product_delete",
-                "product_web_batch_action",
-            ):
-                result = dict(
-                    service.product_write(
-                        store,
-                        "delete",
-                        product_id=product_id,
+        with self._product_store_lease(
+            [store.id],
+            f"single-delete:{store.id}:{uuid.uuid4().hex}",
+        ):
+            try:
+                with self._allow_platform_write(
+                    store,
+                    "product_write",
+                    "product_delete",
+                    "product_web_batch_action",
+                ):
+                    result = dict(
+                        service.product_write(
+                            store,
+                            "delete",
+                            product_id=product_id,
+                        )
                     )
+            except Exception as exc:
+                pending = bool(
+                    getattr(exc, "verification_pending", False)
                 )
-        except Exception as exc:
-            pending = bool(
-                getattr(exc, "verification_pending", False)
-            )
-            self._log_product_operation(
-                store,
-                product_id,
-                title,
-                (
-                    "彻底删除"
-                    if int(product.get("status") or -1) == 6
-                    else "移入回收站"
-                ),
-                "pending" if pending else "failed",
-                str(exc),
-            )
-            raise
+                self._log_product_operation(
+                    store,
+                    product_id,
+                    title,
+                    (
+                        "彻底删除"
+                        if int(product.get("status") or -1) == 6
+                        else "移入回收站"
+                    ),
+                    "pending" if pending else "failed",
+                    str(exc),
+                )
+                raise
         delete_mode = str(result.get("delete_mode") or "")
         self._log_product_operation(
             store,
